@@ -11,6 +11,9 @@
 #include "retdec/llvmir2hll/support/smart_ptr.h"
 
 namespace retdec {
+namespace config {
+class Config;
+}
 namespace llvmir2hll {
 
 /**
@@ -45,6 +48,7 @@ public:
 	/// @{
 	static UPtr<JSONConfig> fromFile(const std::string &path);
 	static UPtr<JSONConfig> fromString(const std::string &str);
+	static UPtr<JSONConfig> fromConfig(const retdec::config::Config &source);
 	static UPtr<JSONConfig> empty();
 
 	virtual void saveTo(const std::string &path) override;

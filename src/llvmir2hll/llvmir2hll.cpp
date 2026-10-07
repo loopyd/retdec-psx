@@ -478,9 +478,7 @@ bool LlvmIr2Hll::loadConfig()
 	Log::phase("loading the input config", Log::SubPhase);
 	try
 	{
-		config = llvmir2hll::JSONConfig::fromString(
-				globalConfig->generateJsonString()
-		);
+		config = llvmir2hll::JSONConfig::fromConfig(*globalConfig);
 		return true;
 	}
 	catch (const llvmir2hll::ConfigError &ex)

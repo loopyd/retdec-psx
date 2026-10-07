@@ -142,6 +142,12 @@ UPtr<JSONConfig> JSONConfig::fromString(const std::string &str) {
 	return config;
 }
 
+UPtr<JSONConfig> JSONConfig::fromConfig(const retdec::config::Config &source) {
+	auto config = empty();
+	config->impl->config = source;
+	return config;
+}
+
 /**
 * @brief Returns an empty config.
 */
