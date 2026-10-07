@@ -145,25 +145,27 @@ void LlvmIr2Hll::getAnalysisUsage(llvm::AnalysisUsage &au) const
 {
 	au.addRequired<llvm::LoopInfoWrapperPass>();
 	au.addRequired<llvm::ScalarEvolutionWrapperPass>();
-	au.setPreservesAll();
+	if (globalConfig && globalConfig->parameters.isOriginalOnlyReturnRecovery()) au.setPreservesCFG();
+	else au.setPreservesAll();
 }
 
 bool LlvmIr2Hll::runOnModule(llvm::Module &m)
 {
+	const bool originalOnly = globalConfig && globalConfig->parameters.isOriginalOnlyReturnRecovery();
 	Log::phase("initialization");
 
 	bool decompilationShouldContinue = initialize(m);
 	if (!decompilationShouldContinue)
 	{
-		return false;
+		return originalOnly;
 	}
 
-	llvmir2hll::recoverPointerExpressions(m, *globalConfig);
+	if (!originalOnly) llvmir2hll::recoverPointerExpressions(m, *globalConfig);
 	Log::phase("conversion of LLVM IR into BIR");
 	decompilationShouldContinue = convertLLVMIRToBIR();
 	if (!decompilationShouldContinue)
 	{
-		return false;
+		return originalOnly;
 	}
 
 	if (!globalConfig->parameters.isBackendKeepLibraryFuncs())
@@ -248,7 +250,7 @@ bool LlvmIr2Hll::runOnModule(llvm::Module &m)
 	Log::phase("cleanup");
 	cleanup();
 
-	return false;
+	return originalOnly;
 }
 
 /**
@@ -260,6 +262,8 @@ bool LlvmIr2Hll::runOnModule(llvm::Module &m)
 bool LlvmIr2Hll::initialize(llvm::Module &m)
 {
 	llvmModule = &m;
+	if (globalConfig && globalConfig->parameters.isOriginalOnlyReturnRecovery())
+		llvmir2hll::recoverPointerExpressions(m, *globalConfig);
 
 	bool configLoaded = loadConfig();
 	if (!configLoaded)

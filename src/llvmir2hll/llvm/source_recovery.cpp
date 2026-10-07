@@ -7,6 +7,9 @@
 #include <llvm/IR/Operator.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <set>
+#include <algorithm>
+#include <optional>
+#include <stdexcept>
 #include "retdec/config/config.h"
 #include "retdec/llvmir2hll/ir/function.h"
 #include "retdec/llvmir2hll/ir/int_type.h"
@@ -37,6 +40,160 @@
 namespace retdec {
 namespace llvmir2hll {
 namespace {
+namespace original_expression {
+using Expression = common::OriginalSourceExpression;
+using Disposition = common::ReturnDisposition;
+template<typename T, typename Predicate>
+inline const T* unique(const std::vector<T>& rows, Predicate matches) {
+	const T* result = nullptr;
+	for (const auto& row : rows) if (matches(row)) {
+		if (result) return nullptr;
+		result = &row;
+	}
+	return result;
+}
+
+inline std::optional<Expression> bind(const common::Function& function, uint64_t rightPc) {
+	if (!function.returnDisposition || !function.originalCallSummary
+			|| function.returnDisposition->kind != Disposition::Kind::Value
+			|| !function.originalCallSummary->declaration.isComplete()) return {};
+	const auto& evidence = function.returnDisposition->evidence;
+	if (!evidence.decodeComplete || !evidence.analysisComplete
+			|| evidence.symbol != function.getName()) return {};
+	auto instruction = [&](uint64_t pc) {
+		return unique(evidence.instructions, [&](const auto& row) { return row.pc == pc; });
+	};
+	const auto* right = instruction(rightPc);
+	if (!right || right->word >> 26 || ((right->word >> 21) & 31)
+			|| (right->word & 63) != 3) return {};
+	unsigned shift = (right->word >> 6) & 31;
+	if (shift != 16 && shift != 24) return {};
+	const auto* rightDef = unique(evidence.definitions, [&](const auto& row) {
+		return row.pc == rightPc && row.reg == ((right->word >> 11) & 31);
+	});
+	if (!rightDef || rightDef->inputs.size() != 1) return {};
+	const auto* leftDef = unique(evidence.definitions, [&](const auto& row) {
+		return row.id == rightDef->inputs.front();
+	});
+	if (!leftDef || leftDef->pc >= rightPc || leftDef->pc < evidence.start
+			|| rightPc >= evidence.end) return {};
+	const auto* left = instruction(leftDef->pc);
+	if (!left || left->word >> 26 || ((left->word >> 21) & 31)
+			|| (left->word & 63) || ((left->word >> 6) & 31) != shift
+			|| ((left->word >> 11) & 31) != leftDef->reg
+			|| ((right->word >> 16) & 31) != leftDef->reg
+			|| !leftDef->reg || !rightDef->reg) return {};
+	unsigned entry = (left->word >> 16) & 31;
+	if (entry < 4 || entry > 7 || !leftDef->inputs.empty()
+			|| leftDef->entries != std::vector<unsigned>{entry}
+			|| leftDef->formals != std::vector<unsigned>{entry}
+			|| rightDef->entries != leftDef->entries || rightDef->formals != leftDef->formals
+			|| std::count(function.originalCallSummary->parameterRegisters.begin(),
+				function.originalCallSummary->parameterRegisters.end(), entry) != 1) return {};
+	for (const auto* definition : {leftDef, rightDef})
+		if (definition->width != 32 || definition->delayed || !definition->bad.empty()
+				|| definition->origin != "instruction" || definition->operation != "shift-immediate") return {};
+	for (const auto* row : {left, right}) {
+		unsigned destination = (row->word >> 11) & 31;
+		if (row->owner != evidence.symbol || row->bytes != 4 || !row->mapped || row->undef
+				|| std::find(row->fullWidthRegisters.begin(), row->fullWidthRegisters.end(), destination)
+					== row->fullWidthRegisters.end()) return {};
+	}
+	for (uint64_t pc = left->pc; pc < rightPc; pc += 4) {
+		const auto* edge = unique(evidence.edges, [&](const auto& row) { return row.from == pc; });
+		if (!edge || edge->to != pc + 4 || edge->delayOwner || edge->kind != "fallthrough") return {};
+	}
+	for (const auto& edge : evidence.edges)
+		if (left->pc <= edge.to && edge.to <= rightPc
+				&& (edge.delayOwner || (edge.to > left->pc && edge.from + 4 != edge.to))) return {};
+	for (const auto& call : evidence.calls)
+		if (left->pc <= call.pc && call.pc <= rightPc) return {};
+	return Expression{left->pc, rightPc, leftDef->id, rightDef->id, entry, 32 - shift};
+}
+
+
+bool hasPc(const llvm::Instruction& instruction, uint64_t pc) {
+	auto* node = instruction.getMetadata("insn.addr");
+	auto* value = node && node->getNumOperands() == 1
+		? llvm::mdconst::dyn_extract<llvm::ConstantInt>(node->getOperand(0)) : nullptr;
+	return value && value->getType()->isIntegerTy(64) && value->getZExtValue() == pc;
+}
+
+llvm::Argument* entryFor(llvm::Instruction& root, const Expression& expression,
+		const common::Function& source) {
+	if (!root.getType()->isIntegerTy(32) || !hasPc(root, expression.rightPc)) return nullptr;
+	llvm::Value* input = nullptr;
+	if (auto* extend = llvm::dyn_cast<llvm::SExtInst>(&root)) {
+		auto* trunc = llvm::dyn_cast<llvm::TruncInst>(extend->getOperand(0));
+		if (trunc && trunc->getType()->isIntegerTy(expression.viewWidth)
+				&& trunc->getFunction() == root.getFunction()) input = trunc->getOperand(0);
+	} else if (auto* right = llvm::dyn_cast<llvm::BinaryOperator>(&root)) {
+		unsigned amount = 32 - expression.viewWidth;
+		auto* count = llvm::dyn_cast<llvm::ConstantInt>(right->getOperand(1));
+		auto* left = llvm::dyn_cast<llvm::BinaryOperator>(right->getOperand(0));
+		if (right->getOpcode() != llvm::Instruction::AShr || !count
+				|| count->getZExtValue() != amount || !left || !left->getType()->isIntegerTy(32)
+				|| left->getFunction() != root.getFunction()
+				|| (left->getOpcode() != llvm::Instruction::Shl && left->getOpcode() != llvm::Instruction::Mul)
+				|| left->hasNoSignedWrap() || left->hasNoUnsignedWrap()) return nullptr;
+		if (left->getOpcode() == llvm::Instruction::Shl) {
+			auto* shift = llvm::dyn_cast<llvm::ConstantInt>(left->getOperand(1));
+			if (shift && shift->getZExtValue() == amount) input = left->getOperand(0);
+		} else if (left->getOpcode() == llvm::Instruction::Mul) {
+			for (unsigned i = 0; i < 2; ++i)
+				if (auto* factor = llvm::dyn_cast<llvm::ConstantInt>(left->getOperand(i)))
+					if (factor->getZExtValue() == (uint64_t(1) << amount)) input = left->getOperand(1 - i);
+		}
+	}
+	auto* entry = llvm::dyn_cast_or_null<llvm::Argument>(input);
+	if (!entry || !entry->getType()->isIntegerTy(32) || entry->getParent() != root.getFunction()) return nullptr;
+	const auto& registers = source.originalCallSummary->parameterRegisters;
+	return registers.size() == entry->getParent()->arg_size() && entry->getArgNo() < registers.size()
+		&& registers[entry->getArgNo()] == expression.entryRegister ? entry : nullptr;
+}
+
+void recover(llvm::Function& function, common::Function& source) {
+	source.originalSourceExpressions.clear();
+	if (!source.returnDisposition || !source.originalCallSummary) return;
+	auto& evidence = source.returnDisposition->evidence;
+	auto& obligations = evidence.obligations;
+	obligations.erase(std::remove_if(obligations.begin(), obligations.end(), [](const auto& row) {
+		return row.domain == "source-expression" && row.reason == "applied-sign-extraction-origin-unresolved";
+	}), obligations.end());
+	for (const auto& row : evidence.instructions) {
+		auto expression = bind(source, row.pc);
+		if (!expression) continue;
+		llvm::Instruction* root = nullptr;
+		llvm::Argument* entry = nullptr;
+		unsigned matches = 0;
+		for (auto& block : function) for (auto& instruction : block)
+			if (auto* argument = entryFor(instruction, *expression, source)) {
+				root = &instruction;
+				entry = argument;
+				++matches;
+			}
+		if (matches == 1) {
+			if (!llvm::isa<llvm::SExtInst>(root)) {
+				auto* trunc = new llvm::TruncInst(entry,
+					llvm::IntegerType::get(function.getContext(), expression->viewWidth), "", root);
+				auto* extend = new llvm::SExtInst(trunc, root->getType(), "", root);
+				extend->setMetadata("insn.addr", root->getMetadata("insn.addr"));
+				if (entryFor(*extend, *expression, source) != entry)
+					throw std::runtime_error("original-expression-replacement-unbound");
+				root->replaceAllUsesWith(extend);
+				root->eraseFromParent();
+			}
+			source.originalSourceExpressions.push_back(*expression);
+		} else {
+			if (obligations.size() >= Disposition::RowLimit)
+				throw std::runtime_error("original-expression-obligations-exhausted");
+			obligations.push_back({expression->rightPc, "source-expression",
+				"applied-sign-extraction-origin-unresolved"});
+		}
+	}
+}
+}
+
 bool fixedStackOffset(llvm::Value *value, llvm::AllocaInst *frame,
 		const llvm::DataLayout &layout, int64_t &offset) {
 	if (value == frame) { offset = 0; return true; }
@@ -376,7 +533,13 @@ bool onlyLowBitsUsed(const llvm::Argument &arg, unsigned bits) {
 }
 }
 
-void recoverPointerExpressions(llvm::Module &module, const config::Config &config) {
+void recoverPointerExpressions(llvm::Module &module, config::Config &config) {
+	if (config.parameters.isOriginalOnlyReturnRecovery()) {
+		for (auto& function : module)
+			if (auto* source = config.functions.getFunctionByName(function.getName().str()))
+				original_expression::recover(function, const_cast<common::Function&>(*source));
+		return;
+	}
 	if (config.architecture.isMipsOrPic32()) {
 		bin2llvmir::counter_provenance::validate(module);
 		bin2llvmir::counter_provenance::restoreTestedValue(module);

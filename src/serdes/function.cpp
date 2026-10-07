@@ -399,6 +399,19 @@ void serialize(Writer& writer, const common::Function& f)
     bool concreteReturn = !f.returnDisposition || f.returnDisposition->kind == common::ReturnDisposition::Kind::Value;
     if (f.returnDisposition) disposition(writer, *f.returnDisposition);
     if (f.originalCallSummary) summary(writer, *f.originalCallSummary);
+	if (!f.originalSourceExpressions.empty()) {
+		writer.Key("originalSourceExpressions"); writer.StartArray();
+		for (const auto& expression : f.originalSourceExpressions) {
+			writer.StartObject(); writer.Key("relation"); writer.String("sign-extend-low-bits");
+			writer.Key("machineWidth"); writer.Uint(32);
+			writer.Key("viewWidth"); writer.Uint(expression.viewWidth);
+			writer.Key("entryRegister"); writer.Uint(expression.entryRegister);
+			numbers(writer, "pcs", std::vector<uint64_t>{expression.leftPc, expression.rightPc});
+			numbers(writer, "definitions", std::vector<unsigned>{expression.leftDefinition, expression.rightDefinition});
+			writer.EndObject();
+		}
+		writer.EndArray();
+	}
 	serialize(writer, JSON_returnStorage, f.returnStorage, concreteReturn && f.returnStorage.isDefined());
 	serialize(writer, JSON_fbStorage, f.frameBaseStorage, f.frameBaseStorage.isDefined());
 	serialize(writer, JSON_returnType, f.returnType, concreteReturn && f.returnType.isDefined());
@@ -456,6 +469,8 @@ void deserialize(const rapidjson::Value& val, common::Function& f)
 	deserialize(val, JSON_returnType, f.returnType);
     f.originalCallSummary.reset();
     if (val.HasMember("originalCallSummary")) throw std::runtime_error("original-call-summary-is-invocation-output-only");
+	f.originalSourceExpressions.clear();
+	if (val.HasMember("originalSourceExpressions")) throw std::runtime_error("original-source-expressions-is-invocation-output-only");
     f.returnDisposition.reset();
     auto nativeReturn = val.FindMember("returnDisposition");
     if (nativeReturn != val.MemberEnd()) {

@@ -201,6 +201,12 @@ struct ReturnDisposition
 	Evidence evidence;
 };
 
+struct OriginalSourceExpression {
+	uint64_t leftPc = 0, rightPc = 0;
+	unsigned leftDefinition = 0, rightDefinition = 0;
+	unsigned entryRegister = 0, viewWidth = 0;
+};
+
 /**
  * Represents function.
  *
@@ -317,6 +323,7 @@ class Function : public retdec::common::AddressRange
 		common::Type returnType;
 		std::optional<ReturnDisposition> returnDisposition;
 		std::optional<OriginalFunctionSummary> originalCallSummary;
+		std::vector<OriginalSourceExpression> originalSourceExpressions;
 		common::ObjectSequentialContainer parameters;
 		common::ObjectSetContainer locals;
 		std::set<std::string> usedCryptoConstants;

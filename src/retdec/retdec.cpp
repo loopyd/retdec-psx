@@ -492,7 +492,6 @@ bool decompile(retdec::config::Config& config, std::string* outString)
 		if (auto* info = passRegistry.getPassInfo(p))
 		{
 			auto* pass = info->createPass();
-			addPass(pm, pass, info);
 
 			if (info->getTypeInfo() == &bin2llvmir::ProviderInitialization::ID)
 			{
@@ -505,6 +504,7 @@ bool decompile(retdec::config::Config& config, std::string* outString)
 				p->setConfig(&config);
 				p->setOutputString(outString);
 			}
+			addPass(pm, pass, info);
 		}
 		else
 		{
