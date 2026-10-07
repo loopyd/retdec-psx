@@ -32,14 +32,14 @@ std::string getVersionTag()
 
 std::string getVersionStringLong()
 {
-	return  "RetDec version :  " + getVersionTag() + "\n"
+	return  "retdec-psx " RETDEC_VERSION "\n"
 			"Commit hash    :  " + getCommitHash() + "\n"
 			"Build date     :  " + getBuildDate();
 }
 
 std::string getVersionStringShort()
 {
-	return  "RetDec " + getVersionTag() +
+	return  "retdec-psx " RETDEC_VERSION "@" + getShortCommitHash() +
 			" built on " + getBuildDate();
 }
 

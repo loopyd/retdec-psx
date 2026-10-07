@@ -52,7 +52,7 @@ TEST_F(VersionTests, getVersionStringLongContainsEverything)
 	EXPECT_THAT(v, HasSubstr(getCommitHash()));
 	EXPECT_THAT(v, HasSubstr(getShortCommitHash()));
 	EXPECT_THAT(v, HasSubstr(getBuildDate()));
-	EXPECT_THAT(v, HasSubstr(getVersionTag()));
+	EXPECT_THAT(v, HasSubstr("retdec-psx 5.0"));
 }
 
 TEST_F(VersionTests, getVersionStringShortContainsEverything)
@@ -60,7 +60,7 @@ TEST_F(VersionTests, getVersionStringShortContainsEverything)
 	auto v = getVersionStringShort();
 
 	EXPECT_THAT(v, HasSubstr(getBuildDate()));
-	EXPECT_THAT(v, HasSubstr(getVersionTag()));
+	EXPECT_THAT(v, HasSubstr("retdec-psx 5.0@" + getShortCommitHash()));
 }
 
 } // namespace tests

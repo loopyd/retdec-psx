@@ -23,6 +23,7 @@ add_library(retdec::utils ALIAS utils)
 target_compile_features(utils PUBLIC cxx_std_17)
 
 target_compile_definitions(utils PRIVATE
+	RETDEC_VERSION="${PROJECT_VERSION}"
 	RETDEC_GIT_COMMIT_HASH="${RETDEC_GIT_COMMIT_HASH}"
 	RETDEC_BUILD_DATE="${RETDEC_BUILD_DATE}"
 	RETDEC_GIT_VERSION_TAG="${RETDEC_GIT_VERSION_TAG}"

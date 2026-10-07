@@ -16,6 +16,7 @@ git_describe(
 	"--tags"
 )
 string(TIMESTAMP RETDEC_BUILD_DATE UTC)
+message(STATUS "retdec-psx ${PROJECT_VERSION} built from commit ${RETDEC_GIT_COMMIT_HASH}")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -202,7 +203,7 @@ install(
 # Install commit id file.
 file(WRITE
 	"${CMAKE_CURRENT_BINARY_DIR}/BUILD-ID"
-	"RetDec ${RETDEC_GIT_VERSION_TAG} built from commit ${RETDEC_GIT_COMMIT_HASH} on ${RETDEC_BUILD_DATE} (UTC).\n"
+	"retdec-psx ${PROJECT_VERSION} built from commit ${RETDEC_GIT_COMMIT_HASH} on ${RETDEC_BUILD_DATE} (UTC).\n"
 )
 install(
 	FILES
