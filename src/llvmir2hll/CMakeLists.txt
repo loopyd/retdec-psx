@@ -1,5 +1,6 @@
 
 add_library(llvmir2hll STATIC
+	llvm/source_recovery.cpp
 	analysis/alias_analysis/alias_analyses/basic_alias_analysis.cpp
 	analysis/alias_analysis/alias_analyses/simple_alias_analysis.cpp
 	analysis/alias_analysis/alias_analysis.cpp

@@ -177,6 +177,16 @@ const std::vector<std::string>& CallableEntry::argNames() const
 //=============================================================================
 //
 
+void FunctionEntry::setReturnDisposition(common::ReturnDisposition disposition)
+{
+	_returnDisposition = std::move(disposition);
+}
+
+const std::optional<common::ReturnDisposition>& FunctionEntry::getReturnDisposition() const
+{
+	return _returnDisposition;
+}
+
 bool FunctionEntry::isVariadic() const
 {
 	return _variadic;

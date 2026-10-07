@@ -14,6 +14,7 @@
 #include <rapidjson/writer.h>
 
 #include "retdec/common/address.h"
+#include "retdec/common/function.h"
 
 namespace retdec {
 namespace config {
@@ -30,6 +31,9 @@ class Parameters
 		bool isVerboseOutput() const;
 		bool isKeepAllFunctions() const;
 		bool isSelectedDecodeOnly() const;
+		bool isOriginalOnlyReturnRecovery() const;
+		void setOriginalCallScope(common::OriginalCallScope scope);
+		const std::optional<common::OriginalCallScope>& getOriginalCallScope() const { return _originalCallScope; }
 		bool isDetectStaticCode() const;
 		bool isTimeout() const;
 		bool isMaxMemoryLimitHalfRam() const;
@@ -49,6 +53,7 @@ class Parameters
 		void setIsVerboseOutput(bool b);
 		void setIsKeepAllFunctions(bool b);
 		void setIsSelectedDecodeOnly(bool b);
+		void setIsOriginalOnlyReturnRecovery(bool b);
 		void setOrdinalNumbersDirectory(const std::string& n);
 		void setInputFile(const std::string& file);
 		void setInputPdbFile(const std::string& file);
@@ -149,6 +154,8 @@ class Parameters
 		/// This speeds up decompilation, but usually produces lower-quality
 		/// results.
 		bool _selectedDecodeOnly = false;
+		bool _originalOnlyReturnRecovery = false;
+		std::optional<common::OriginalCallScope> _originalCallScope;
 
 		std::string _ordinalNumbersDirectory;
 		std::string _inputFile;

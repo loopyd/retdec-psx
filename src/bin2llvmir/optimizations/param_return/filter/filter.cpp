@@ -31,6 +31,15 @@ Filter::Filter(
 
 void Filter::estimateRetValue(DataFlowEntry* de) const
 {
+	if (de->getReturnDisposition())
+	{
+		if (de->getReturnDisposition()->kind == common::ReturnDisposition::Kind::Unknown)
+		{
+			de->setRetType(nullptr);
+			de->setRetValue(nullptr);
+		}
+		return;
+	}
 	auto retValue = de->getRetValue();
 	auto retType = de->getRetType();
 

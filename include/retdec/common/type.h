@@ -34,6 +34,22 @@ class Type
 		/// @{
 		void setLlvmIr(const std::string& t);
 		void setIsWideString(bool b);
+		void setCType(const std::string& t) { _cType = t; }
+		const std::string& getCType() const { return _cType; }
+		void setIsVolatile(bool b) { _volatile = b; }
+		bool isVolatile() const { return _volatile; }
+		/// @}
+
+		/// @name Supplied source spelling queries.
+		///
+		/// The C spelling can carry information the signless LLVM/register type
+		/// cannot, e.g. the signedness of the base type. Only scalar integer base
+		/// spellings are supported.
+		/// @{
+		/// Width in bits of the spelling's base type, or 0 when unsupported.
+		unsigned getCBaseTypeWidth() const;
+		/// True when the spelling's base type is unsigned.
+		bool hasUnsignedBaseType() const;
 		/// @}
 
 		/// @name Type get methods.
@@ -49,6 +65,8 @@ class Type
 		/// LLVM IR string representation.
 		/// Unique ID.
 		std::string _llvmIr = "i32";
+		std::string _cType;
+		bool _volatile = false;
 		/// Wide strings are in LLVM IR represented as int arrays.
 		/// This flag can be use to distinguish them from ordinary int arrays.
 		bool _wideString = false;

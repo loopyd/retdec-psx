@@ -16,119 +16,157 @@ PlainOutputManager::PlainOutputManager(llvm::raw_ostream& out) :
 
 }
 
+void PlainOutputManager::finalize()
+{
+	finishCommentModifier();
+}
+
 void PlainOutputManager::newLine()
 {
+	finishCommentModifier();
 	_out << "\n";
 }
 
 void PlainOutputManager::space(const std::string& space)
 {
-	_out << space;
+	writeFragment(space);
 }
 
 void PlainOutputManager::punctuation(char p)
 {
-	_out << p;
+	writeFragment(std::string(1, p));
 }
 
 void PlainOutputManager::operatorX(const std::string& op)
 {
-	_out << op;
+	writeFragment(op);
 }
 
 void PlainOutputManager::globalVariableId(const std::string& id)
 {
-	_out << id;
+	writeFragment(id);
 }
 
 void PlainOutputManager::localVariableId(const std::string& id)
 {
-	_out << id;
+	writeFragment(id);
 }
 
 void PlainOutputManager::memberId(const std::string& id)
 {
-	_out << id;
+	writeFragment(id);
 }
 
 void PlainOutputManager::labelId(const std::string& id)
 {
-	_out << id;
+	writeFragment(id);
 }
 
 void PlainOutputManager::functionId(const std::string& id)
 {
-	_out << id;
+	writeFragment(id);
 }
 
 void PlainOutputManager::parameterId(const std::string& id)
 {
-	_out << id;
+	writeFragment(id);
 }
 
 void PlainOutputManager::keyword(const std::string& k)
 
 {
-	_out << k;
+	writeFragment(k);
 }
 
 void PlainOutputManager::dataType(const std::string& t)
 {
-	_out << t;
+	writeFragment(t);
 }
 
 void PlainOutputManager::preprocessor(const std::string& p)
 {
-	_out << p;
+	writeFragment(p);
 }
 
 void PlainOutputManager::include(const std::string& i)
 {
-	_out << "<" << i << ">";
+	writeFragment("<" + i + ">");
 }
 
 void PlainOutputManager::constantBool(const std::string& c)
 {
-	_out << c;
+	writeFragment(c);
 }
 
 void PlainOutputManager::constantInt(const std::string& c)
 {
-	_out << c;
+	writeFragment(c);
 }
 
 void PlainOutputManager::constantFloat(const std::string& c)
 {
-	_out << c;
+	writeFragment(c);
 }
 
 void PlainOutputManager::constantString(const std::string& c)
 {
-	_out << c;
+	writeFragment(c);
 }
 
 void PlainOutputManager::constantSymbol(const std::string& c)
 {
-	_out << c;
+	writeFragment(c);
 }
 
 void PlainOutputManager::constantPointer(const std::string& c)
 {
-	_out << c;
+	writeFragment(c);
 }
 
 void PlainOutputManager::comment(const std::string& c)
 {
-	_out << getCommentPrefix();
-	if (!c.empty())
+	if (_commentModifierOn)
 	{
-		_out << " " << utils::replaceCharsWithStrings(c, '\n', " ");
+		_runningComment += " " + c;
+		return;
 	}
+	_out << renderComment(c);
 }
 
 void PlainOutputManager::commentModifier()
 {
+	if (_commentModifierOn)
+	{
+		return;
+	}
+	if (getOutputLanguage() == "C")
+	{
+		_commentModifierOn = true;
+		return;
+	}
 	_out << getCommentPrefix() << " ";
+}
+
+void PlainOutputManager::writeFragment(const std::string& text)
+{
+	if (_commentModifierOn)
+	{
+		_runningComment += text;
+	}
+	else
+	{
+		_out << text;
+	}
+}
+
+void PlainOutputManager::finishCommentModifier()
+{
+	if (_commentModifierOn)
+	{
+		_out << renderComment(_runningComment);
+		_commentModifierOn = false;
+		_runningComment.clear();
+	}
 }
 
 void PlainOutputManager::addressPush(Address a)

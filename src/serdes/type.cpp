@@ -15,6 +15,7 @@ namespace {
 
 const std::string JSON_llvmIr     = "llvmIr";
 const std::string JSON_wideString = "isWideString";
+const std::string JSON_volatile   = "isVolatile";
 
 } // anonymous namespace
 
@@ -27,6 +28,8 @@ void serialize(Writer& writer, const common::Type& t)
 	writer.StartObject();
 
 	serializeString(writer, JSON_llvmIr, t.getLlvmIr(), t.isDefined());
+	serializeString(writer, "cType", t.getCType(), !t.getCType().empty());
+	serializeBool(writer, JSON_volatile, t.isVolatile(), t.isDefined() && t.isVolatile());
 	serializeBool(writer, JSON_wideString, t.isWideString(), t.isDefined() && t.isWideString());
 
 	writer.EndObject();
@@ -41,6 +44,8 @@ void deserialize(const rapidjson::Value& val, common::Type& t)
 	}
 
 	t.setLlvmIr(deserializeString(val, JSON_llvmIr));
+	t.setCType(deserializeString(val, "cType"));
+	t.setIsVolatile(deserializeBool(val, JSON_volatile));
 	t.setIsWideString(deserializeBool(val, JSON_wideString));
 }
 

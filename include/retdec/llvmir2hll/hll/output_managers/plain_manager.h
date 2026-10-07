@@ -20,6 +20,7 @@ class PlainOutputManager : public OutputManager
 		PlainOutputManager(llvm::raw_ostream& out);
 
 	public:
+		virtual void finalize() override;
 		virtual void newLine() override;
 		virtual void space(const std::string& space = " ") override;
 		virtual void punctuation(char p) override;
@@ -48,7 +49,12 @@ class PlainOutputManager : public OutputManager
 		virtual void addressPop() override;
 
 	private:
+		void writeFragment(const std::string& text);
+		void finishCommentModifier();
+
 		llvm::raw_ostream& _out;
+		bool _commentModifierOn = false;
+		std::string _runningComment;
 };
 
 } // namespace llvmir2hll

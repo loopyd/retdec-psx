@@ -4,7 +4,11 @@
 * @copyright (c) 2017 Avast Software, licensed under the MIT license
 */
 
+#include <algorithm>
+#include <vector>
+
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
@@ -69,6 +73,8 @@ bool StackAnalysis::run()
 		return false;
 	}
 
+	_indexedStackFunctions.clear();
+	_toRemove.clear();
 	ReachingDefinitionsAnalysis RDA;
 	RDA.runOnModule(*_module, _abi);
 
@@ -124,6 +130,10 @@ bool StackAnalysis::run()
 	}
 
 	IrModifier::eraseUnusedInstructionsRecursive(_toRemove);
+	for (auto* function : _indexedStackFunctions)
+	{
+		coalesceIndexedStack(*function);
+	}
 
 	return false;
 }
@@ -158,25 +168,23 @@ void StackAnalysis::handleInstruction(
 		}
 	}
 
-	auto* debugSv = getDebugStackVariable(inst->getFunction(), root);
-	auto* configSv = getConfigStackVariable(inst->getFunction(), root);
-
 	root.simplifyNode();
 	LOG << root << std::endl;
 
-	if (debugSv == nullptr)
-	{
-		debugSv = getDebugStackVariable(inst->getFunction(), root);
-	}
-
-	if (configSv == nullptr)
-	{
-		configSv = getConfigStackVariable(inst->getFunction(), root);
-	}
+	auto* debugSv = getDebugStackVariable(inst->getFunction(), root);
+	auto* configSv = getConfigStackVariable(inst->getFunction(), root);
 
 	auto* ci = dyn_cast_or_null<ConstantInt>(root.value);
 	if (ci == nullptr)
 	{
+		auto* load = dyn_cast<LoadInst>(inst);
+		auto* store = dyn_cast<StoreInst>(inst);
+		if (_config->getConfig().architecture.isMipsOrPic32()
+				&& ((load && load->getPointerOperand() == val)
+					|| (store && store->getPointerOperand() == val)))
+		{
+			_indexedStackFunctions.insert(inst->getFunction());
+		}
 		return;
 	}
 
@@ -253,6 +261,55 @@ void StackAnalysis::handleInstruction(
 		auto* conv = IrModifier::convertValueToType(a, val->getType(), inst);
 		_toRemove.insert(val);
 		inst->replaceUsesOfWith(val, conv);
+	}
+}
+
+void StackAnalysis::coalesceIndexedStack(llvm::Function& function)
+{
+	std::vector<std::pair<AllocaInst*, int64_t>> slots;
+	int64_t begin = 0;
+	int64_t end = 0;
+	const auto& layout = _module->getDataLayout();
+	for (auto& inst : function.getEntryBlock())
+	{
+		auto* slot = dyn_cast<AllocaInst>(&inst);
+		auto offset = slot ? _config->getStackVariableOffset(slot) : std::nullopt;
+		if (!offset || !slot->getAllocatedType()->isSized())
+		{
+			continue;
+		}
+		auto* count = dyn_cast<ConstantInt>(slot->getArraySize());
+		if (!count || !count->isOne())
+		{
+			return;
+		}
+		const int64_t size = layout.getTypeAllocSize(slot->getAllocatedType());
+		begin = std::min(begin, static_cast<int64_t>(*offset));
+		end = std::max(end, static_cast<int64_t>(*offset) + size);
+		slots.emplace_back(slot, *offset);
+	}
+	if (slots.empty() || end <= begin || end - begin > 1024 * 1024)
+	{
+		return;
+	}
+
+	// A byte array preserves overlapping and differently-sized accesses.
+	// GEPs are deliberately not inbounds: the recovered range is not proof
+	// that every runtime index stays within the statically observed frame.
+	IRBuilder<> builder(&*function.getEntryBlock().getFirstInsertionPt());
+	auto* bytes = ArrayType::get(builder.getInt8Ty(), end - begin);
+	auto* frame = builder.CreateAlloca(bytes, nullptr, "indexed_stack_frame");
+	frame->setAlignment(1);
+	for (auto& entry : slots)
+	{
+		auto* pointer = builder.CreateGEP(frame,
+				{builder.getInt32(0), builder.getInt32(entry.second - begin)});
+		auto* typed = builder.CreateBitCast(pointer, entry.first->getType());
+		entry.first->replaceAllUsesWith(typed);
+	}
+	for (auto& entry : slots)
+	{
+		entry.first->eraseFromParent();
 	}
 }
 

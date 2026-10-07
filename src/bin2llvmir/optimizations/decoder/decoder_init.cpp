@@ -343,6 +343,8 @@ void Decoder::initAllowedRangesWithConfig()
 	for (auto &p : _config->getConfig().parameters.selectedRanges)
 	{
 		_ranges.addPrimary(p);
+		if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery())
+			_originalExtents.emplace(p.getStart().getValue(), p.getEnd().getValue());
 		LOG << "\t" << "[+] selected range @ " << p << std::endl;
 
 		if (auto* jt = _jumpTargets.push(

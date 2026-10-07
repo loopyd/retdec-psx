@@ -72,6 +72,16 @@ JsonOutputManager<Writer>::JsonOutputManager(llvm::raw_ostream& out) :
 template <typename Writer>
 void JsonOutputManager<Writer>::finalize()
 {
+	if (getOutputLanguage() == "C" && _commentModifierOn)
+	{
+		_commentModifierOn = false;
+		if (!_runningComment.empty())
+		{
+			comment(_runningComment);
+			_runningComment.clear();
+		}
+	}
+
 	writer.EndArray();
 
 	writer.String(JSON_KEY_LANGUAGE);
@@ -237,12 +247,7 @@ template <typename Writer>
 void JsonOutputManager<Writer>::comment(const std::string& c)
 {
 	HANDLE_COMMENT_MODIFIER(" " + c);
-	std::string str = getCommentPrefix();
-	if (!c.empty())
-	{
-		str += " " + utils::replaceCharsWithStrings(c, '\n', " ");
-	}
-	jsonToken(JSON_TOKEN_COMMENT, str);
+	jsonToken(JSON_TOKEN_COMMENT, renderComment(c));
 }
 
 template <typename Writer>

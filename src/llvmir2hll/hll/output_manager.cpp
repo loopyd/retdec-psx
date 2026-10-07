@@ -5,6 +5,7 @@
 */
 
 #include "retdec/llvmir2hll/hll/output_manager.h"
+#include "retdec/utils/string.h"
 
 namespace retdec {
 namespace llvmir2hll {
@@ -37,6 +38,31 @@ void OutputManager::setOutputLanguage(const std::string& lang)
 const std::string& OutputManager::getOutputLanguage() const
 {
 	return _outLanguage;
+}
+
+std::string OutputManager::renderComment(const std::string& c) const
+{
+	if (getOutputLanguage() != "C")
+	{
+		std::string rendered = getCommentPrefix();
+		if (!c.empty())
+		{
+			rendered += " " + utils::replaceCharsWithStrings(c, '\n', " ");
+		}
+		return rendered;
+	}
+
+	std::string rendered = "/* ";
+	for (std::string::size_type i = 0; i < c.size(); ++i)
+	{
+		if (i > 0 && ((c[i - 1] == '/' && c[i] == '*')
+				|| (c[i - 1] == '*' && c[i] == '/')))
+		{
+			rendered += ' ';
+		}
+		rendered += (c[i] == '\r' || c[i] == '\n') ? ' ' : c[i];
+	}
+	return rendered + " */";
 }
 
 void OutputManager::operatorX(

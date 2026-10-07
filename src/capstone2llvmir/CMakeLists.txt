@@ -6,6 +6,7 @@ add_library(capstone2llvmir STATIC
 	arm64/arm64.cpp
 	mips/mips_init.cpp
 	mips/mips.cpp
+	mips/stateful.cpp
 	powerpc/powerpc_init.cpp
 	powerpc/powerpc.cpp
 	x86/x86_init.cpp
@@ -16,6 +17,10 @@ add_library(capstone2llvmir STATIC
 	llvmir_utils.cpp
 )
 add_library(retdec::capstone2llvmir ALIAS capstone2llvmir)
+
+add_executable(retdec-mips-stateful EXCLUDE_FROM_ALL mips/stateful_main.cpp)
+target_link_libraries(retdec-mips-stateful PRIVATE retdec::capstone2llvmir
+	-Wl,--whole-archive retdec::llvmir2hll -Wl,--no-whole-archive)
 
 target_compile_features(capstone2llvmir PUBLIC cxx_std_17)
 

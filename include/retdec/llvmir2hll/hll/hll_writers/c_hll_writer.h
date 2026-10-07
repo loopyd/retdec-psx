@@ -164,6 +164,8 @@ private:
 	void emitReturnType(ShPtr<FunctionType> funcType);
 	void emitNameOfVarIfExists(ShPtr<Variable> var);
 	void emitAssignment(ShPtr<Expression> lhs, ShPtr<Expression> rhs);
+	void emitWrappingArithmetic(const std::string &op, ShPtr<BinaryOpExpr> expr);
+	void emitBitPatternEquality(const std::string &op, ShPtr<BinaryOpExpr> expr);
 	void emitInitVarDefWhenNeeded(ShPtr<UForLoopStmt> loop);
 	void emitConstStruct(ShPtr<ConstStruct> constant, bool emitCast = true);
 	void emitStructDeclaration(ShPtr<StructType> structType,

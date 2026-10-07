@@ -112,6 +112,9 @@ class OutputManager
 			const std::string& t1,
 			const std::string& t2);
 
+	protected:
+		std::string renderComment(const std::string& comment) const;
+
 	// Data.
 	//
 	private:

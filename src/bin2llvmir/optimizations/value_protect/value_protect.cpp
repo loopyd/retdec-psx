@@ -14,6 +14,7 @@
 #include "retdec/bin2llvmir/providers/names.h"
 #include "retdec/bin2llvmir/utils/ir_modifier.h"
 #include "retdec/bin2llvmir/utils/llvm.h"
+#include "retdec/bin2llvmir/utils/counter_provenance.h"
 
 using namespace retdec::utils;
 using namespace llvm;
@@ -323,6 +324,8 @@ bool ValueProtect::protect()
 	changed |= protectStack();
 	changed |= protectRegisters();
 	changed |= protectLoadStores();
+	if (_config->getConfig().architecture.isMipsOrPic32())
+		changed |= counter_provenance::capture(*_module);
 
 	return changed;
 }

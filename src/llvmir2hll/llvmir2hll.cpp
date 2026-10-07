@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "retdec/llvmir2hll/llvmir2hll.h"
+#include "retdec/llvmir2hll/llvm/source_recovery.h"
 #include "retdec/utils/io/log.h"
 
 using namespace llvm;
@@ -157,6 +158,7 @@ bool LlvmIr2Hll::runOnModule(llvm::Module &m)
 		return false;
 	}
 
+	llvmir2hll::recoverPointerExpressions(m, *globalConfig);
 	Log::phase("conversion of LLVM IR into BIR");
 	decompilationShouldContinue = convertLLVMIRToBIR();
 	if (!decompilationShouldContinue)
@@ -235,6 +237,8 @@ bool LlvmIr2Hll::runOnModule(llvm::Module &m)
 		emitCG();
 	}
 
+	llvmir2hll::applyDeclaredAccessQualifiers(resModule, *globalConfig);
+	llvmir2hll::recoverSourceSignatures(resModule, *globalConfig);
 	Log::phase("emission of the target code [" + hllWriter->getId() + "]");
 	emitTargetHLLCode();
 
@@ -595,10 +599,16 @@ void LlvmIr2Hll::initAliasAnalysis()
 */
 void LlvmIr2Hll::runOptimizations()
 {
+	auto disabledOpts = parseListOfOpts(globalConfig->parameters.getBackendDisabledOpts());
+	if (globalConfig->architecture.isMipsOrPic32() && hllWriter->getId() == "c") {
+		disabledOpts.insert("VarDefStmt");
+		disabledOpts.insert("VarDefForLoop");
+		disabledOpts.insert("BitShift");
+	}
 	ShPtr<llvmir2hll::OptimizerManager> optManager(
 			new llvmir2hll::OptimizerManager(
 					parseListOfOpts(globalConfig->parameters.getBackendEnabledOpts()),
-					parseListOfOpts(globalConfig->parameters.getBackendDisabledOpts()),
+					disabledOpts,
 					hllWriter,
 					llvmir2hll::ValueAnalysis::create(aliasAnalysis, true),
 					cio,

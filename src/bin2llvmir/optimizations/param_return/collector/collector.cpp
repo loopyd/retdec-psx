@@ -99,7 +99,7 @@ void Collector::collectDefRets(DataFlowEntry* dataflow) const
 		if (auto* r = dyn_cast<ReturnInst>(&*it))
 		{
 			ReturnEntry* re = dataflow->createRetEntry(r);
-			collectRetStores(re);
+			if (!dataflow->getReturnDisposition()) collectRetStores(re);
 		}
 	}
 }

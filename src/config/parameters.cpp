@@ -4,6 +4,8 @@
  * @copyright (c) 2017 Avast Software, licensed under the MIT license
  */
 
+#include <stdexcept>
+#include <algorithm>
 #include <rapidjson/prettywriter.h>
 #include <rapidjson/stringbuffer.h>
 
@@ -17,6 +19,7 @@ namespace {
 const std::string JSON_verboseOut               = "verboseOut";
 const std::string JSON_keepAllFuncs             = "keepAllFuncs";
 const std::string JSON_selectedDecodeOnly       = "selectedDecodeOnly";
+const std::string JSON_originalOnlyReturnRecovery = "originalOnlyReturnRecovery";
 const std::string JSON_ordinalNumDir            = "ordinalNumDirectory";
 const std::string JSON_userStaticSigPaths       = "userStaticSignPaths";
 const std::string JSON_staticSigPaths           = "staticSignPaths";
@@ -67,6 +70,27 @@ const std::string JSON_maxMemoryLimitHalfRam    = "maxMemoryLimitHalfRam";
 namespace retdec {
 namespace config {
 
+void Parameters::setOriginalCallScope(common::OriginalCallScope scope)
+{
+	if (!isOriginalOnlyReturnRecovery() || scope.requestHash.size() != 64
+		|| scope.configurationHash.size() != 64 || scope.payloadHash.size() != 64
+		|| scope.problemHash.size() != 64 || scope.callees.size() > 117)
+		throw std::runtime_error("invalid-original-call-scope");
+	std::vector<common::ReviewedOriginalFunction> functions{scope.root};
+	functions.insert(functions.end(), scope.callees.begin(), scope.callees.end());
+	std::set<std::string> keys;
+	for (const auto& f : functions) {
+		if (f.key.empty() || !keys.insert(f.key).second || f.target != scope.root.target
+			|| f.imageId != scope.root.imageId || f.rangeHash.size() != 64
+			|| f.start % 4 || f.end % 4 || f.start >= f.end || f.end > (uint64_t(1) << 32))
+			throw std::runtime_error("invalid-original-call-member");
+	}
+	std::sort(functions.begin(), functions.end(), [](const auto& a, const auto& b) { return a.start < b.start; });
+	for (std::size_t i = 1; i < functions.size(); ++i)
+		if (functions[i - 1].end > functions[i].start) throw std::runtime_error("overlapping-original-call-members");
+	_originalCallScope = std::move(scope);
+}
+
 /**
  * @return Decompilation will verbosely inform about the decompilation process.
  */
@@ -90,6 +114,8 @@ bool Parameters::isKeepAllFunctions() const
  * This speeds up decompilation, but usually produces lower-quality results.
  */
 bool Parameters::isSelectedDecodeOnly() const { return _selectedDecodeOnly; }
+bool Parameters::isOriginalOnlyReturnRecovery() const { return _originalOnlyReturnRecovery; }
+void Parameters::setIsOriginalOnlyReturnRecovery(bool b) { _originalOnlyReturnRecovery = b; }
 
 /**
  * Find out if some functions or ranges were selected in selective decompilation.
@@ -485,6 +511,24 @@ void Parameters::serialize(Writer& writer) const
 	serdes::serializeBool(writer, JSON_verboseOut, isVerboseOutput());
 	serdes::serializeBool(writer, JSON_keepAllFuncs, isKeepAllFunctions());
 	serdes::serializeBool(writer, JSON_selectedDecodeOnly, isSelectedDecodeOnly());
+	serdes::serializeBool(writer, JSON_originalOnlyReturnRecovery, isOriginalOnlyReturnRecovery(), false);
+	if (_originalCallScope) {
+		const auto& scope = *_originalCallScope;
+		writer.Key("originalCallScope"); writer.StartObject();
+		writer.Key("request_sha256"); writer.String(scope.requestHash);
+		writer.Key("configuration_sha256"); writer.String(scope.configurationHash);
+		writer.Key("payload_sha256"); writer.String(scope.payloadHash);
+		writer.Key("problem_sha256"); writer.String(scope.problemHash);
+		auto member = [&](const auto& f) {
+			writer.StartObject(); writer.Key("key"); writer.String(f.key);
+			writer.Key("target"); writer.String(f.target); writer.Key("image_id"); writer.String(f.imageId);
+			writer.Key("start"); writer.Uint64(f.start); writer.Key("end"); writer.Uint64(f.end);
+			writer.Key("range_sha256"); writer.String(f.rangeHash); writer.EndObject();
+		};
+		writer.Key("root"); member(scope.root); writer.Key("callees"); writer.StartArray();
+		for (const auto& f : scope.callees) member(f);
+		writer.EndArray(); writer.EndObject();
+	}
 	serdes::serializeString(writer, JSON_ordinalNumDir, getOrdinalNumbersDirectory());
 
 	serdes::serializeString(writer, JSON_inputFile, getInputFile());
@@ -545,6 +589,9 @@ template void Parameters::serialize(
  */
 void Parameters::deserialize(const rapidjson::Value& val)
 {
+	_originalCallScope.reset();
+	if (val.IsObject() && val.HasMember("originalCallScope"))
+		throw std::runtime_error("original-call-scope-requires-validated-command");
 	if ( val.IsNull() || !val.IsObject() )
 	{
 		return;
@@ -553,6 +600,10 @@ void Parameters::deserialize(const rapidjson::Value& val)
 	setIsVerboseOutput( serdes::deserializeBool(val, JSON_verboseOut, false) );
 	setIsKeepAllFunctions( serdes::deserializeBool(val, JSON_keepAllFuncs) );
 	setIsSelectedDecodeOnly( serdes::deserializeBool(val, JSON_selectedDecodeOnly) );
+	auto strict = val.FindMember(JSON_originalOnlyReturnRecovery);
+	if (strict != val.MemberEnd() && !strict->value.IsBool())
+		throw std::runtime_error("originalOnlyReturnRecovery must be Boolean");
+	setIsOriginalOnlyReturnRecovery(strict != val.MemberEnd() && strict->value.GetBool());
 	setOrdinalNumbersDirectory( serdes::deserializeString(val, JSON_ordinalNumDir) );
 
 	setInputFile( serdes::deserializeString(val, JSON_inputFile) );

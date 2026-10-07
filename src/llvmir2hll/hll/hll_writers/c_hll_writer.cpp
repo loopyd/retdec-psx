@@ -5,6 +5,7 @@
 */
 
 #include <cctype>
+#include <llvm/IR/Module.h>
 #include <set>
 #include <sstream>
 
@@ -304,6 +305,10 @@ bool CHLLWriter::emitFileHeader() {
 		headerFiles.insert("stdlib.h");
 	}
 
+	if (module->getFuncByName("__retdec_mips_break")) {
+		headerFiles.insert("retdec/runtime/mips_exception.h");
+	}
+
 	// Include headers for linked functions.
 	addToSet(HeadersForDeclaredFuncs::getHeaders(module), headerFiles);
 
@@ -488,8 +493,12 @@ bool CHLLWriter::emitFunctionPrototypes() {
 }
 
 bool CHLLWriter::emitExternalFunction(ShPtr<Function> func) {
-	out->addressPush(func->getStartAddress());
 	auto funcDeclString = module->getDeclarationStringForFunc(func);
+	if (funcDeclString.empty() && module->isMainFunc(func) &&
+			!IndirectFuncRefAnalysis::isIndirectlyReferenced(module, func)) {
+		return false;
+	}
+	out->addressPush(func->getStartAddress());
 	if (!funcDeclString.empty()) {
 			out->commentLine(funcDeclString, getCurrentIndent());
 	} else {
@@ -507,10 +516,31 @@ void CHLLWriter::visit(ShPtr<GlobalVarDef> varDef) {
 
 	out->addressPush(varDef->getAddress());
 	out->space(getCurrentIndent());
-	emitVarWithType(var);
+	auto *machine = module->getLLVMModule();
+	auto *global = machine ? machine->getGlobalVariable(var->getInitialName()) : nullptr;
+	if (!global && machine) global = machine->getGlobalVariable(var->getName());
+	auto *array = global ? llvm::dyn_cast<llvm::ArrayType>(global->getValueType()) : nullptr;
+	bool incomplete = array && array->getNumElements() == 0 && global->isDeclaration();
+	bool externalObject = !incomplete && global && global->isDeclaration()
+		&& var->isVolatile();
 
-	// Initializer.
-	if (init) {
+	if (incomplete) {
+		out->keyword("extern");
+		out->space();
+		cast<ArrayType>(var->getType())->getContainedType()->accept(this);
+		out->space();
+		var->accept(this);
+		out->punctuation('[');
+		out->punctuation(']');
+	} else if (externalObject) {
+		out->keyword("extern");
+		out->space();
+		emitVarWithType(var);
+	} else {
+		emitVarWithType(var);
+	}
+
+	if (init && !incomplete && !externalObject) {
 		emitConstantsInStructuredWay = true;
 		if (ShPtr<ConstArray> constArrayInit = cast<ConstArray>(init)) {
 			if (constArrayInit->isInitialized()) {
@@ -623,12 +653,42 @@ void CHLLWriter::visit(ShPtr<NegOpExpr> expr) {
 	emitUnaryOpExpr("-", expr);
 }
 
+void CHLLWriter::emitBitPatternEquality(const std::string &op, ShPtr<BinaryOpExpr> expr) {
+	auto operandType = [](ShPtr<Expression> operand) {
+		if (auto deref = cast<DerefOpExpr>(operand)) {
+			if (auto pointer = cast<PointerType>(deref->getOperand()->getType()))
+				return cast<IntType>(pointer->getContainedType());
+		}
+		return cast<IntType>(operand->getType());
+	};
+	auto lhs = operandType(expr->getFirstOperand());
+	auto rhs = operandType(expr->getSecondOperand());
+	if (!lhs || !rhs || lhs->getSize() != rhs->getSize()
+			|| lhs->isSigned() != rhs->isSigned()
+			|| (lhs->getSize() != 8 && lhs->getSize() != 16)) {
+		emitBinaryOpExpr(op, expr);
+		return;
+	}
+	auto type = IntType::create(lhs->getSize(), false);
+	out->punctuation('(');
+	for (unsigned i = 0; i < 2; ++i) {
+		if (i) out->operatorX(op, true, true);
+		out->punctuation('(');
+		type->accept(this);
+		out->punctuation(')');
+		out->punctuation('(');
+		(i ? expr->getSecondOperand() : expr->getFirstOperand())->accept(this);
+		out->punctuation(')');
+	}
+	out->punctuation(')');
+}
+
 void CHLLWriter::visit(ShPtr<EqOpExpr> expr) {
-	emitBinaryOpExpr("==", expr);
+	emitBitPatternEquality("==", expr);
 }
 
 void CHLLWriter::visit(ShPtr<NeqOpExpr> expr) {
-	emitBinaryOpExpr("!=", expr);
+	emitBitPatternEquality("!=", expr);
 }
 
 void CHLLWriter::visit(ShPtr<LtOpExpr> expr) {
@@ -662,16 +722,58 @@ void CHLLWriter::visit(ShPtr<TernaryOpExpr> expr) {
 	}
 }
 
+void CHLLWriter::emitWrappingArithmetic(const std::string &op, ShPtr<BinaryOpExpr> expr) {
+	auto type = cast<IntType>(expr->getType());
+	if (!type || (type->getSize() != 8 && type->getSize() != 16
+			&& type->getSize() != 32 && type->getSize() != 64)) {
+		emitBinaryOpExpr(op, expr);
+		return;
+	}
+
+	// C already gives unsigned 32/64-bit operands modular arithmetic.
+	// Narrow unsigned operands still undergo signed integer promotion.
+	auto lhsType = cast<IntType>(expr->getFirstOperand()->getType());
+	auto rhsType = cast<IntType>(expr->getSecondOperand()->getType());
+	if (type->isUnsigned() && type->getSize() >= 32 && lhsType && rhsType
+			&& lhsType->isUnsigned() && rhsType->isUnsigned()
+			&& lhsType->getSize() == type->getSize()
+			&& rhsType->getSize() == type->getSize()) {
+		emitBinaryOpExpr(op, expr);
+		return;
+	}
+
+	// LLVM integer arithmetic computes a bit pattern. Signedness inferred
+	// later must not introduce C signed overflow. Convert both operands before
+	// the operation, then restore the result width and interpretation.
+	auto unsignedType = IntType::create(type->getSize() < 32 ? 32 : type->getSize(), false);
+	out->punctuation('(');
+	out->punctuation('(');
+	type->accept(this);
+	out->punctuation(')');
+	out->punctuation('(');
+	for (unsigned index = 0; index != 2; ++index) {
+		if (index) out->operatorX(op, true, true);
+		out->punctuation('(');
+		unsignedType->accept(this);
+		out->punctuation(')');
+		out->punctuation('(');
+		(index ? expr->getSecondOperand() : expr->getFirstOperand())->accept(this);
+		out->punctuation(')');
+	}
+	out->punctuation(')');
+	out->punctuation(')');
+}
+
 void CHLLWriter::visit(ShPtr<AddOpExpr> expr) {
-	emitBinaryOpExpr("+", expr);
+	emitWrappingArithmetic("+", expr);
 }
 
 void CHLLWriter::visit(ShPtr<SubOpExpr> expr) {
-	emitBinaryOpExpr("-", expr);
+	emitWrappingArithmetic("-", expr);
 }
 
 void CHLLWriter::visit(ShPtr<MulOpExpr> expr) {
-	emitBinaryOpExpr("*", expr);
+	emitWrappingArithmetic("*", expr);
 }
 
 void CHLLWriter::visit(ShPtr<ModOpExpr> expr) {
@@ -679,7 +781,31 @@ void CHLLWriter::visit(ShPtr<ModOpExpr> expr) {
 }
 
 void CHLLWriter::visit(ShPtr<DivOpExpr> expr) {
-	emitBinaryOpExpr("/", expr);
+	ShPtr<IntType> types[2];
+	for (unsigned i = 0; i < 2; ++i) {
+		auto operand = i ? expr->getSecondOperand() : expr->getFirstOperand();
+		auto operandType = operand->getType();
+		if (auto deref = cast<DerefOpExpr>(operand)) {
+			if (auto pointer = cast<PointerType>(deref->getOperand()->getType()))
+				operandType = pointer->getContainedType();
+		}
+		types[i] = cast<IntType>(operandType);
+	}
+	if (expr->getVariant() != DivOpExpr::Variant::UDiv || !types[0] || !types[1]) {
+		emitBinaryOpExpr("/", expr);
+		return;
+	}
+	// Unsigned IR division must not inherit a recovered signed C type.
+	out->punctuation('(');
+	for (unsigned i = 0; i < 2; ++i) {
+		auto unsignedType = IntType::create(types[i]->getSize(), false);
+		if (i) out->operatorX("/", true, true);
+		out->punctuation('('); out->punctuation('(');
+		unsignedType->accept(this); out->punctuation(')'); out->punctuation('(');
+		(i ? expr->getSecondOperand() : expr->getFirstOperand())->accept(this);
+		out->punctuation(')'); out->punctuation(')');
+	}
+	out->punctuation(')');
 }
 
 void CHLLWriter::visit(ShPtr<AndOpExpr> expr) {
@@ -703,14 +829,78 @@ void CHLLWriter::visit(ShPtr<BitXorOpExpr> expr) {
 }
 
 void CHLLWriter::visit(ShPtr<BitShlOpExpr> expr) {
-	emitBinaryOpExpr("<<", expr);
+	auto operand = expr->getFirstOperand();
+	auto operandType = operand->getType();
+	if (auto deref = cast<DerefOpExpr>(operand)) {
+		if (auto pointer = cast<PointerType>(deref->getOperand()->getType())) {
+			operandType = pointer->getContainedType();
+		}
+	}
+	auto type = cast<IntType>(operandType);
+	if (!type || (type->getSize() != 8 && type->getSize() != 16
+			&& type->getSize() != 32 && type->getSize() != 64)) {
+		emitBinaryOpExpr("<<", expr);
+		return;
+	}
+
+	// Shift bits, not signed C values. Use at least unsigned 32 bits so
+	// integer promotions cannot turn an 8/16-bit operand back into int.
+	// Restore the operand's width and signedness before enclosing operations.
+	out->punctuation('(');
+	out->punctuation('(');
+	type->accept(this);
+	out->punctuation(')');
+	out->punctuation('(');
+	out->punctuation('(');
+	IntType::create(type->getSize() < 32 ? 32 : type->getSize(), false)->accept(this);
+	out->punctuation(')');
+	out->punctuation('(');
+	operand->accept(this);
+	out->punctuation(')');
+	out->operatorX("<<", true, true);
+	out->punctuation('(');
+	expr->getSecondOperand()->accept(this);
+	out->punctuation(')');
+	out->punctuation(')');
+	out->punctuation(')');
 }
 
 void CHLLWriter::visit(ShPtr<BitShrOpExpr> expr) {
-	// TODO Distinguish between logical and arithmetical shifts (recall that if
-	// the first operand is of a signed type with a negative value, it is
-	// implementation-defined whether >> is logical or arithmetical).
-	emitBinaryOpExpr(">>", expr);
+	auto operand = expr->getFirstOperand();
+	auto operandType = operand->getType();
+	if (auto deref = cast<DerefOpExpr>(operand)) {
+		if (auto pointer = cast<PointerType>(deref->getOperand()->getType())) {
+			operandType = pointer->getContainedType();
+		}
+	}
+	auto type = cast<IntType>(operandType);
+	if (!type || (type->getSize() != 8 && type->getSize() != 16
+			&& type->getSize() != 32 && type->getSize() != 64)) {
+		emitBinaryOpExpr(">>", expr);
+		return;
+	}
+
+	// The LLVM opcode, not the recovered variable type, defines the shift.
+	// Cast at the original width before C promotions, including loaded values.
+	// Arithmetic shifts rely on the target compiler's signed right shift.
+	auto shiftType = IntType::create(type->getSize(), expr->isArithmetical());
+	out->punctuation('(');
+	out->punctuation('(');
+	shiftType->accept(this);
+	out->punctuation(')');
+	out->punctuation('(');
+	out->punctuation('(');
+	shiftType->accept(this);
+	out->punctuation(')');
+	out->punctuation('(');
+	operand->accept(this);
+	out->punctuation(')');
+	out->operatorX(">>", true, true);
+	out->punctuation('(');
+	expr->getSecondOperand()->accept(this);
+	out->punctuation(')');
+	out->punctuation(')');
+	out->punctuation(')');
 }
 
 void CHLLWriter::visit(ShPtr<CallExpr> expr) {
@@ -732,6 +922,29 @@ void CHLLWriter::visit(ShPtr<BitCastExpr> expr) {
 }
 
 void CHLLWriter::visit(ShPtr<ExtCastExpr> expr) {
+	auto sourceType = expr->getOperand()->getType();
+	if (auto deref = cast<DerefOpExpr>(expr->getOperand())) {
+		if (auto pointer = cast<PointerType>(deref->getOperand()->getType())) {
+			sourceType = pointer->getContainedType();
+		}
+	}
+	auto source = cast<IntType>(sourceType);
+	if (source && !source->isBool()
+			&& expr->getVariant() != ExtCastExpr::Variant::FPExt) {
+		// LLVM integer types carry no signedness. The extension opcode,
+		// not a recovered variable type, defines how the source bits widen.
+		out->punctuation('(');
+		expr->getType()->accept(this);
+		out->punctuation(')');
+		out->punctuation('(');
+		IntType::create(source->getSize(),
+			expr->getVariant() == ExtCastExpr::Variant::SExt)->accept(this);
+		out->punctuation(')');
+		out->punctuation('(');
+		expr->getOperand()->accept(this);
+		out->punctuation(')');
+		return;
+	}
 	emitCastInStandardWay(expr);
 }
 
@@ -854,7 +1067,10 @@ void CHLLWriter::visit(ShPtr<AssignStmt> stmt) {
 */
 void CHLLWriter::emitAssignment(ShPtr<Expression> lhs, ShPtr<Expression> rhs) {
 	CompoundOpManager::CompoundOp compoundOp(
-		compoundOpManager->tryOptimizeToCompoundOp(lhs, rhs));
+		(isa<BitShlOpExpr>(rhs) || isa<BitShrOpExpr>(rhs)
+			|| isa<AddOpExpr>(rhs) || isa<SubOpExpr>(rhs) || isa<MulOpExpr>(rhs))
+		? CompoundOpManager::CompoundOp("=", rhs)
+		: compoundOpManager->tryOptimizeToCompoundOp(lhs, rhs));
 	lhs->accept(this);
 	if (compoundOp.isUnaryOperator()) {
 		// ++ or --
@@ -986,7 +1202,28 @@ void CHLLWriter::visit(ShPtr<SwitchStmt> stmt) {
 	out->space();
 	out->punctuation('(');
 
-	stmt->getControlExpr()->accept(this);
+	// LLVM switches compare bit patterns. For a narrow truncation and
+	// nonnegative cases, unsigned C avoids an artificial sign-extension.
+	auto control = stmt->getControlExpr();
+	auto trunc = cast<TruncCastExpr>(control);
+	auto integer = trunc ? cast<IntType>(trunc->getType()) : nullptr;
+	bool unsignedSelector = integer && !integer->isBool();
+	for (auto i = stmt->clause_begin(); i != stmt->clause_end(); ++i) {
+		if (i->first) {
+			auto value = cast<ConstInt>(i->first);
+			if (!value || value->getValue().isNegative()) unsignedSelector = false;
+		}
+	}
+	if (unsignedSelector) {
+		out->punctuation('(');
+		IntType::create(integer->getSize(), false)->accept(this);
+		out->punctuation(')');
+		out->punctuation('(');
+		trunc->getOperand()->accept(this);
+		out->punctuation(')');
+	} else {
+		control->accept(this);
+	}
 
 	out->punctuation(')');
 	out->space();
@@ -1036,8 +1273,23 @@ void CHLLWriter::visit(ShPtr<ForLoopStmt> stmt) {
 	out->keyword("for");
 	out->space();
 	out->punctuation('(');
-	stmt->getIndVar()->getType()->accept(this);
-	out->space();
+	bool declaredAtEntry = false;
+	if (currFunc) {
+		for (auto s = currFunc->getBody(); s; s = s->getSuccessor()) {
+			if (auto definition = cast<VarDefStmt>(s)) {
+				if (definition->getVar() == stmt->getIndVar()) {
+					declaredAtEntry = true;
+					break;
+				}
+			} else if (!isa<EmptyStmt>(s)) {
+				break;
+			}
+		}
+	}
+	if (!declaredAtEntry) {
+		stmt->getIndVar()->getType()->accept(this);
+		out->space();
+	}
 	stmt->getIndVar()->accept(this);
 	out->operatorX("=", true, true);
 	stmt->getStartValue()->accept(this);
@@ -1144,14 +1396,9 @@ void CHLLWriter::visit(ShPtr<IntType> type) {
 		return;
 	}
 
-	// Emit 8-bit integers as chars, not as int8_t/uint8_t, because char is
-	// more readable.
-	if (type->getSize() == 8) {
-		type->isUnsigned()
-			? out->dataType("unsigned char")
-			: out->dataType("char");
-		return;
-	}
+	// Integer signedness is semantic, including at eight bits. Plain char
+	// depends on compiler flags and can turn an inferred signed load into
+	// an unsigned one. String/character emission is handled separately.
 
 	out->dataType((type->isUnsigned() ? std::string("u") : std::string("")) + "int"
 		+ std::to_string(type->getSize()) + "_t");
@@ -1564,6 +1811,10 @@ void CHLLWriter::emitVarWithType(ShPtr<Variable> var) {
 
 	varType->accept(this);
 	out->space();
+	if (var->isVolatile()) {
+		out->keyword("volatile");
+		out->space();
+	}
 	var->accept(this);
 
 	// For an array, emit its dimensions.

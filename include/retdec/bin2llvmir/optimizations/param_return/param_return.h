@@ -45,6 +45,19 @@ class ParamReturn : public llvm::ModulePass
 
 	private:
 		bool run();
+		void validateStrictProfile() const;
+		struct OriginalContractGraph {
+			std::map<uint64_t, DataFlowEntry*> functions;
+			std::map<uint64_t, common::ReviewedOriginalFunction> identities;
+			std::set<uint64_t> unavailable;
+		};
+		void qualifyReturns();
+		void qualifyOriginalFunction(DataFlowEntry&, OriginalContractGraph&);
+		void retainSelectedDefinitionOnly();
+		void projectOriginalParameters();
+		void publishReturnDispositions() const;
+		void requireSelectedContracts() const;
+		void invalidatePreviousNativeReturnEvidence() const;
 		void dumpInfo() const;
 		void dumpInfo(const DataFlowEntry& de) const;
 		void dumpInfo(const CallEntry& ce) const;

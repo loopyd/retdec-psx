@@ -112,16 +112,12 @@ llvm::SwitchInst* Decoder::transformToSwitch(
 	auto* insn = dyn_cast<Instruction>(val);
 	if (insn && insn->getType())
 	{
-		auto* gv = new GlobalVariable(
-				*insn->getModule(),
-				insn->getType(),
-				false,
-				GlobalValue::ExternalLinkage,
-				nullptr);
-		auto* s = new StoreInst(insn, gv);
+		IRBuilder<> entry(&*pseudo->getFunction()->getEntryBlock().getFirstInsertionPt());
+		auto* selector = entry.CreateAlloca(insn->getType(), nullptr, "switch_selector");
+		auto* s = new StoreInst(insn, selector);
 		s->insertAfter(insn);
 
-		val = new LoadInst(gv, "", pseudo);
+		val = new LoadInst(selector, "", pseudo);
 	}
 
 	auto* term = pseudo->getParent()->getTerminator();

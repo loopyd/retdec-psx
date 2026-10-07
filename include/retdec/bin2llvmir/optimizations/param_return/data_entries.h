@@ -8,6 +8,7 @@
 #define RETDEC_BIN2LLVMIR_OPTIMIZATIONS_PARAM_RETURN_DATA_ENTRIES_H
 
 #include <vector>
+#include "retdec/common/function.h"
 
 #include "retdec/bin2llvmir/providers/calling_convention/calling_convention.h"
 
@@ -85,6 +86,8 @@ class FunctionEntry : public CallableEntry
 		void setWrappedCall(llvm::CallInst* wrap);
 		void setRetType(llvm::Type* type);
 		void setRetValue(llvm::Value* val);
+		void setReturnDisposition(common::ReturnDisposition disposition);
+		const std::optional<common::ReturnDisposition>& getReturnDisposition() const;
 		void setCallingConvention(const CallingConvention::ID& cc);
 
 	public:
@@ -100,6 +103,7 @@ class FunctionEntry : public CallableEntry
 		llvm::CallInst* _wrap = nullptr;
 		llvm::Type* _retType = nullptr;
 		llvm::Value* _retVal = nullptr;
+		std::optional<common::ReturnDisposition> _returnDisposition;
 		bool _variadic = false;
 		CallingConvention::ID _callconv = CallingConvention::ID::CC_UNKNOWN;
 

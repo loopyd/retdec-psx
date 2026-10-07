@@ -655,7 +655,7 @@ ShPtr<Expression> LLVMInstructionConverter::convertGetElementPtrToExpression(
 		auto index = getConverter()->convertValueToExpression(it.getOperand());
 		auto cInt = cast<ConstInt>(index);
 		if (cInt && cInt->isZero()) {
-			base = getConverter()->convertValueToExpressionDirectly(pointedValue);
+			base = getConverter()->convertValueToDerefExpression(pointedValue);
 			++it;
 		} else {
 			base = getConverter()->convertValueToExpression(pointedValue);

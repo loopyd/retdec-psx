@@ -20,6 +20,8 @@ add_library(bin2llvmir STATIC
 	optimizations/decoder/ir_modifications.cpp
 	optimizations/decoder/jump_targets.cpp
 	optimizations/decoder/mips.cpp
+	optimizations/decoder/mips_call_effects.cpp
+	optimizations/decoder/mips_guard_proof.cpp
 	optimizations/decoder/patterns.cpp
 	optimizations/decoder/powerpc.cpp
 	optimizations/decoder/x86.cpp

@@ -35,6 +35,7 @@ class StackAnalysis : public llvm::ModulePass
 
 	private:
 		bool run();
+		void coalesceIndexedStack(llvm::Function& function);
 		void handleInstruction(
 				ReachingDefinitionsAnalysis& RDA,
 				llvm::Instruction* inst,
@@ -56,6 +57,7 @@ class StackAnalysis : public llvm::ModulePass
 		DebugFormat* _dbgf = nullptr;
 
 		std::unordered_set<llvm::Value*> _toRemove;
+		std::unordered_set<llvm::Function*> _indexedStackFunctions;
 };
 
 } // namespace bin2llvmir

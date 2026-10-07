@@ -18,7 +18,8 @@ namespace llvmir2hll {
 * See create() for more information.
 */
 Variable::Variable(const std::string &name, ShPtr<Type> type, Address a):
-	initialName(name), name(name), type(type), internal(true), address(a) {}
+	initialName(name), name(name), type(type), internal(true),
+	volatileObject(false), address(a) {}
 
 ShPtr<Value> Variable::clone() {
 	// Variables are not cloned (see the description of Value::clone()).
@@ -31,7 +32,8 @@ bool Variable::isEqualTo(ShPtr<Value> otherValue) const {
 		return initialName == otherVariable->initialName &&
 			name == otherVariable->name &&
 			type->isEqualTo(otherVariable->type) &&
-			internal == otherVariable->internal;
+			internal == otherVariable->internal &&
+			volatileObject == otherVariable->volatileObject;
 	}
 	return false;
 }
@@ -107,6 +109,18 @@ bool Variable::isExternal() const {
 }
 
 /**
+* @brief Returns @c true if the variable denotes a volatile object, @c false
+*        otherwise.
+*
+* Volatility qualifies the object, not the access: every use of a volatile
+* object is a volatile access, so the qualification is kept on the variable and
+* emitted once at its declaration.
+*/
+bool Variable::isVolatile() const {
+	return volatileObject;
+}
+
+/**
 * @brief Returns a copy of this variable.
 *
 * Since clone() does not clone variables (see the description of
@@ -117,6 +131,7 @@ ShPtr<Variable> Variable::copy() const {
 	ShPtr<Variable> varCopy(Variable::create(initialName, type));
 	varCopy->setName(name);
 	varCopy->internal = internal;
+	varCopy->volatileObject = volatileObject;
 	return varCopy;
 }
 
@@ -161,6 +176,13 @@ void Variable::markAsInternal() {
 */
 void Variable::markAsExternal() {
 	internal = false;
+}
+
+/**
+* @brief Sets the variable as a volatile object.
+*/
+void Variable::markAsVolatile() {
+	volatileObject = true;
 }
 
 /**

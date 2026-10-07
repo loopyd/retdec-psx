@@ -765,50 +765,15 @@ void Capstone2LlvmIrTranslatorMips_impl::translateCondBranchBinary(cs_insn* i, c
  */
 void Capstone2LlvmIrTranslatorMips_impl::translateBreak(cs_insn* i, cs_mips* mi, llvm::IRBuilder<>& irb)
 {
-	// TODO: Modeled as empty instruction in the original semantics.
-	// Causes problems in some integration tests
-	// (e.g. break 0,7 in gcd.mips.pspgcc-4.3.5.O0.g.elf)
-	// because it is sometimes used in the bodies of decompiled functions.
-	// Right now, we disable it here, but use a better solution in future --
-	// it should be translated, and if decompiler wants it can remove it later.
-	// Unit tests were also disabled, re-enable when fixed.
-	//
-	return;
-
-	EXPECT_IS_EXPR(i, mi, irb, (mi->op_count < 3));
-
-	if (mi->op_count == 0)
-	{
-		op0 = llvm::ConstantInt::get(getDefaultType(), 0);
-	}
-	else if (mi->op_count == 1)
-	{
-		op0 = loadOpUnary(mi, irb);
-	}
-	else if (mi->op_count == 2)
-	{
-		std::tie(op0, op1) = loadOpBinary(mi, irb);
-	}
-
-	op0 = irb.CreateZExtOrTrunc(op0, getDefaultType());
-	if (op1)
-	{
-		op1 = irb.CreateZExtOrTrunc(op1, getDefaultType());
-
-		llvm::Function* fnc = getPseudoAsmFunction(
-				i,
-				irb.getVoidTy(),
-				llvm::ArrayRef<llvm::Type*>{op0->getType(), op1->getType()});
-		irb.CreateCall(fnc, llvm::ArrayRef<llvm::Value*>{op0, op1});
-	}
-	else
-	{
-		llvm::Function* fnc = getPseudoAsmFunction(
-				i,
-				irb.getVoidTy(),
-				llvm::ArrayRef<llvm::Type*>{op0->getType()});
-		irb.CreateCall(fnc, llvm::ArrayRef<llvm::Value*>{op0});
-	}
+	auto* word = getDefaultType();
+	auto* fnc = getPseudoAsmFunction(i, irb.getVoidTy(),
+			llvm::ArrayRef<llvm::Type*>{word, word, word, word},
+			"__retdec_mips_break");
+	fnc->addFnAttr(llvm::Attribute::NoReturn);
+	irb.CreateCall(fnc, llvm::ArrayRef<llvm::Value*>{
+			llvm::ConstantInt::get(word, i->address),
+			llvm::ConstantInt::get(word, 0),
+			loadRegister(MIPS_REG_HI, irb), loadRegister(MIPS_REG_LO, irb)});
 }
 
 /**
@@ -929,6 +894,39 @@ void Capstone2LlvmIrTranslatorMips_impl::translateClz(cs_insn* i, cs_mips* mi, l
 	storeOp(mi->operands[0], ctlz, irb);
 }
 
+void Capstone2LlvmIrTranslatorMips_impl::translateMergeMemory(cs_insn* i, cs_mips* mi, llvm::IRBuilder<>& irb)
+{
+	EXPECT_IS_BINARY(i, mi, irb);
+	if (getDefaultType()->getIntegerBitWidth() != 32
+			|| mi->operands[0].type != MIPS_OP_REG || mi->operands[1].type != MIPS_OP_MEM)
+		throw GenericError("word merge requires a 32-bit MIPS register/memory operand");
+	auto* address = loadOp(mi->operands[1], irb, nullptr, true);
+	auto* byte = irb.CreateAnd(address, irb.getInt32(3));
+	if (_module->getDataLayout().isBigEndian())
+		byte = irb.CreateXor(byte, irb.getInt32(3));
+	bool left = i->id == MIPS_INS_LWL || i->id == MIPS_INS_SWL;
+	bool load = i->id == MIPS_INS_LWL || i->id == MIPS_INS_LWR;
+	auto* shift = irb.CreateShl(left ? irb.CreateSub(irb.getInt32(3), byte) : byte, irb.getInt32(3));
+	auto* aligned = irb.CreateAnd(address, irb.getInt32(0xfffffffc));
+	auto* pointer = irb.CreateIntToPtr(aligned, irb.getInt32Ty()->getPointerTo());
+	auto* memory = irb.CreateLoad(pointer);
+	auto* value = loadRegister(mi->operands[0].reg, irb);
+	if (load) {
+		if (auto* merge = llvm::dyn_cast<llvm::LoadInst>(value))
+			merge->setMetadata("retdec.mips.merge", llvm::MDNode::get(_module->getContext(), {}));
+		auto* mask = left ? irb.CreateShl(irb.getInt32(0xffffffff), shift)
+				: irb.CreateLShr(irb.getInt32(0xffffffff), shift);
+		auto* incoming = left ? irb.CreateShl(memory, shift) : irb.CreateLShr(memory, shift);
+		storeRegister(mi->operands[0].reg,
+				irb.CreateOr(incoming, irb.CreateAnd(value, irb.CreateNot(mask))), irb);
+	} else {
+		auto* mask = left ? irb.CreateLShr(irb.getInt32(0xffffffff), shift)
+				: irb.CreateShl(irb.getInt32(0xffffffff), shift);
+		auto* incoming = left ? irb.CreateLShr(value, shift) : irb.CreateShl(value, shift);
+		irb.CreateStore(irb.CreateOr(incoming, irb.CreateAnd(memory, irb.CreateNot(mask))), pointer);
+	}
+}
+
 /**
  * MIPS_INS_DIV
  */
@@ -948,10 +946,22 @@ void Capstone2LlvmIrTranslatorMips_impl::translateDiv(cs_insn* i, cs_mips* mi, l
 
 		std::tie(op0, op1) = loadOpBinary(mi, irb, eOpConv::SEXT_TRUNC_OR_BITCAST);
 
-		auto* div = irb.CreateSDiv(op0, op1);
-		storeRegister(MIPS_REG_LO, div, irb);
-		auto* rem = irb.CreateSRem(op0, op1);
-		storeRegister(MIPS_REG_HI, rem, irb);
+		// R3000 DIV defines LO/HI even for zero divisors and INT_MIN / -1.
+		// Make the LLVM operation safe before selecting the architectural result.
+		auto* zero = llvm::ConstantInt::get(op0->getType(), 0);
+		auto* one = llvm::ConstantInt::get(op0->getType(), 1);
+		auto* minusOne = llvm::ConstantInt::getSigned(op0->getType(), -1);
+		auto* minimum = llvm::ConstantInt::get(op0->getType(),
+				llvm::APInt::getSignedMinValue(op0->getType()->getIntegerBitWidth()));
+		auto* isZero = irb.CreateICmpEQ(op1, zero);
+		auto* overflow = irb.CreateAnd(irb.CreateICmpEQ(op0, minimum),
+				irb.CreateICmpEQ(op1, minusOne));
+		auto* safeDivisor = irb.CreateSelect(irb.CreateOr(isZero, overflow), one, op1);
+		auto* quotient = irb.CreateSDiv(op0, safeDivisor);
+		auto* remainder = irb.CreateSRem(op0, safeDivisor);
+		auto* zeroQuotient = irb.CreateSelect(irb.CreateICmpSLT(op0, zero), one, minusOne);
+		storeRegister(MIPS_REG_LO, irb.CreateSelect(isZero, zeroQuotient, quotient), irb);
+		storeRegister(MIPS_REG_HI, irb.CreateSelect(isZero, op0, remainder), irb);
 	}
 }
 
@@ -963,10 +973,15 @@ void Capstone2LlvmIrTranslatorMips_impl::translateDivu(cs_insn* i, cs_mips* mi, 
 	EXPECT_IS_BINARY(i, mi, irb);
 
 	std::tie(op0, op1) = loadOpBinary(mi, irb, eOpConv::SEXT_TRUNC_OR_BITCAST);
-	auto* div = irb.CreateUDiv(op0, op1);
-	storeRegister(MIPS_REG_LO, div, irb);
-	auto* rem = irb.CreateURem(op0, op1);
-	storeRegister(MIPS_REG_HI, rem, irb);
+	auto* zero = llvm::ConstantInt::get(op0->getType(), 0);
+	auto* one = llvm::ConstantInt::get(op0->getType(), 1);
+	auto* isZero = irb.CreateICmpEQ(op1, zero);
+	auto* safeDivisor = irb.CreateSelect(isZero, one, op1);
+	auto* quotient = irb.CreateUDiv(op0, safeDivisor);
+	auto* remainder = irb.CreateURem(op0, safeDivisor);
+	storeRegister(MIPS_REG_LO, irb.CreateSelect(isZero,
+			llvm::ConstantInt::getSigned(op0->getType(), -1), quotient), irb);
+	storeRegister(MIPS_REG_HI, irb.CreateSelect(isZero, op0, remainder), irb);
 }
 
 /**
@@ -1680,6 +1695,12 @@ void Capstone2LlvmIrTranslatorMips_impl::translateSll(cs_insn* i, cs_mips* mi, l
 	EXPECT_IS_BINARY_OR_TERNARY(i, mi, irb);
 
 	std::tie(op1, op2) = loadOpBinaryOrTernaryOp1Op2(mi, irb, eOpConv::ZEXT_TRUNC_OR_BITCAST);
+	// Word variable shifts use only the low five count bits. LLVM shifts
+	// by the operand width or more are poison, not MIPS wraparound shifts.
+	if (i->id == MIPS_INS_SLLV && op1->getType()->isIntegerTy(32))
+	{
+		op2 = irb.CreateAnd(op2, llvm::ConstantInt::get(op2->getType(), 31));
+	}
 	auto* shl = irb.CreateShl(op1, op2);
 	storeOp(mi->operands[0], shl, irb);
 }
@@ -1718,6 +1739,10 @@ void Capstone2LlvmIrTranslatorMips_impl::translateSra(cs_insn* i, cs_mips* mi, l
 	EXPECT_IS_BINARY_OR_TERNARY(i, mi, irb);
 
 	std::tie(op1, op2) = loadOpBinaryOrTernaryOp1Op2(mi, irb, eOpConv::ZEXT_TRUNC_OR_BITCAST);
+	if (i->id == MIPS_INS_SRAV && op1->getType()->isIntegerTy(32))
+	{
+		op2 = irb.CreateAnd(op2, llvm::ConstantInt::get(op2->getType(), 31));
+	}
 	auto* sra = irb.CreateAShr(op1, op2);
 	storeOp(mi->operands[0], sra, irb);
 }
@@ -1730,6 +1755,10 @@ void Capstone2LlvmIrTranslatorMips_impl::translateSrl(cs_insn* i, cs_mips* mi, l
 	EXPECT_IS_BINARY_OR_TERNARY(i, mi, irb);
 
 	std::tie(op1, op2) = loadOpBinaryOrTernaryOp1Op2(mi, irb, eOpConv::ZEXT_TRUNC_OR_BITCAST);
+	if (i->id == MIPS_INS_SRLV && op1->getType()->isIntegerTy(32))
+	{
+		op2 = irb.CreateAnd(op2, llvm::ConstantInt::get(op2->getType(), 31));
+	}
 	auto* shr = irb.CreateLShr(op1, op2);
 	storeOp(mi->operands[0], shr, irb);
 }

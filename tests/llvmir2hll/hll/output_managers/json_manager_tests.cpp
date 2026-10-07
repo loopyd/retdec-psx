@@ -203,7 +203,7 @@ TEST_F(JsonOutputManagerTests, token_constantPointer)
 TEST_F(JsonOutputManagerTests, token_comment)
 {
 	manager->comment("hello world");
-	EXPECT_EQ(R"({"kind":"cmnt","val":"// hello world"})", emitSingleToken());
+	EXPECT_EQ(R"({"kind":"cmnt","val":"/* hello world */"})", emitSingleToken());
 }
 
 //
@@ -223,7 +223,7 @@ TEST_F(JsonOutputManagerTests, commentModifier_creates_comment_until_end_of_line
 	manager->functionId("f");
 
 	EXPECT_EQ(
-		R"({"kind":"cmnt","val":"// hello = 1234;"},{"kind":"nl","val":"\n"},{"kind":"i_fnc","val":"f"})",
+		R"({"kind":"cmnt","val":"/* hello = 1234; */"},{"kind":"nl","val":"\n"},{"kind":"i_fnc","val":"f"})",
 		emitSingleToken());
 }
 

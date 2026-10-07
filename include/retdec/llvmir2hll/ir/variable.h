@@ -43,6 +43,7 @@ public:
 	bool hasName() const;
 	bool isInternal() const;
 	bool isExternal() const;
+	bool isVolatile() const;
 	ShPtr<Variable> copy() const;
 
 	void setName(const std::string &newName);
@@ -50,6 +51,7 @@ public:
 	void setAddress(Address a);
 	void markAsInternal();
 	void markAsExternal();
+	void markAsVolatile();
 
 	/// @name Visitor Interface
 	/// @{
@@ -74,6 +76,8 @@ private:
 
 	/// Is the variable internal?
 	bool internal;
+
+	bool volatileObject;
 
 	/// Some variables may have addresses:
 	/// - Local variables created from temporary LLVM variables: LLVM insn addr.

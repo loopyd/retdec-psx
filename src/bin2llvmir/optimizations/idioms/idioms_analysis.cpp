@@ -228,8 +228,9 @@ bool IdiomsAnalysis::doAnalysis(Function & f, Pass * p) {
 
 		// all arch
 		// all compilers
-		change_made |= analyse(bb, &IdiomsCommon::exchangeBitShiftUDiv,
-									"IdiomsCommon::exchangeBitShiftUDiv");
+		if (arch != ARCH_MIPS)
+			change_made |= analyse(bb, &IdiomsCommon::exchangeBitShiftUDiv,
+										"IdiomsCommon::exchangeBitShiftUDiv");
 
 		// all arch
 		// all compilers

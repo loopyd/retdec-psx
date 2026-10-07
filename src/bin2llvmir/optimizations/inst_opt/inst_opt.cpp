@@ -294,36 +294,6 @@ bool xor_i1(llvm::Instruction* insn)
 }
 
 /**
- * a = and i1 x, y
- *   =>
- * a = icmp eq i1 x, y
- */
-bool and_i1(llvm::Instruction* insn)
-{
-	Value* op0;
-	Value* op1;
-
-	if (!(match(insn, m_And(m_Value(op0), m_Value(op1)))
-			&& insn->getType()->isIntegerTy(1)))
-	{
-		return false;
-	}
-
-	auto* cmp = CmpInst::Create(
-			Instruction::ICmp,
-			ICmpInst::ICMP_EQ,
-			op0,
-			op1,
-			"",
-			insn);
-	cmp->takeName(insn);
-	insn->replaceAllUsesWith(cmp);
-	insn->eraseFromParent();
-
-	return true;
-}
-
-/**
  * a = add x, c1
  * b = add a, c2
  *   =>
@@ -551,7 +521,6 @@ std::vector<bool (*)(llvm::Instruction*)> optimizations =
 		&xorLoadXX,
 		&xorXX,
 		&xor_i1,
-		&and_i1,
 		&orAndLoadXX,
 		&orAndXX,
 		&addSequence,

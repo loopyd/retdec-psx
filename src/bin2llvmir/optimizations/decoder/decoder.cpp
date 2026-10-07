@@ -6,6 +6,11 @@
 
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/PatternMatch.h>
+#include <llvm/IR/ValueHandle.h>
+#include <stdexcept>
+#include "mips_call_effects.h"
+
+#include "retdec/fileformat/file_format/elf/elf_format.h"
 
 #include "retdec/utils/conversion.h"
 #include "retdec/utils/string.h"
@@ -22,6 +27,119 @@ using namespace retdec::utils::io;
 
 namespace retdec {
 namespace bin2llvmir {
+
+// MIPS I has a one-instruction GPR load delay. Keep the loaded value's
+// store in place, but make reads in the following instruction observe the
+// pre-load value. A following write then naturally cancels the pending load.
+// Run before pseudo-call/CFG rewrites, while instruction ownership is intact.
+static void preserveMipsOneLoadDelay(llvm::Module* module, FileImage* image,
+		Abi* abi, bool originalOnlyReturnRecovery)
+{
+	auto* elf = dynamic_cast<ElfFormat*>(image->getFileFormat());
+	// ELF EF_MIPS_ARCH == 0 identifies MIPS I, not interlocked MIPS32.
+	if (!originalOnlyReturnRecovery && (!elf
+			|| elf->getTargetArchitecture() != retdec::fileformat::Architecture::MIPS
+			|| (elf->getFileFlags() & 0xf0000000) != 0))
+		return;
+
+	struct DelayedRead {
+		llvm::StoreInst* write;
+		std::vector<llvm::LoadInst*> reads;
+	};
+	std::vector<DelayedRead> pending;
+	for (auto& entry : AsmInstruction::getLlvmToCapstoneInsnMap(module))
+	{
+		auto* insn = entry.second;
+		switch (insn->id)
+		{
+			case MIPS_INS_LB: case MIPS_INS_LBU:
+			case MIPS_INS_LH: case MIPS_INS_LHU: case MIPS_INS_LW:
+			case MIPS_INS_LWL: case MIPS_INS_LWR:
+				break;
+			default: continue;
+		}
+		AsmInstruction current(entry.first);
+		llvm::StoreInst* write = nullptr;
+		for (auto& ir : current)
+			if (auto* store = llvm::dyn_cast<llvm::StoreInst>(&ir))
+				if (abi->isRegister(store->getPointerOperand())) write = store;
+		if (!write) continue;
+
+		AsmInstruction next(module, current.getEndAddress());
+		if (!next || next.getBasicBlock() != current.getBasicBlock()) {
+			auto* word = image->getConstantInt(llvm::Type::getInt32Ty(module->getContext()), current.getAddress());
+			auto* following = image->getConstantInt(llvm::Type::getInt32Ty(module->getContext()), current.getEndAddress());
+			auto* previous = image->getConstantInt(llvm::Type::getInt32Ty(module->getContext()), current.getAddress() - 4);
+			bool inDelaySlot = true;
+			if (previous) {
+				uint32_t bits = previous->getZExtValue();
+				unsigned op = bits >> 26, fn = bits & 63;
+				inDelaySlot = (op >= 1 && op <= 7) || (op == 0 && (fn == 8 || fn == 9))
+						|| (op >= 16 && op <= 19);
+			}
+			if (word && following && !inDelaySlot) {
+				unsigned destination = (word->getZExtValue() >> 16) & 31;
+				uint32_t bits = following->getZExtValue();
+				unsigned op = bits >> 26, rs = (bits >> 21) & 31, rt = (bits >> 16) & 31;
+				bool independent = bits == 0;
+				if (next) {
+					if (op == 2 || op == 3 || op == 15) independent = true;
+					if ((op >= 8 && op <= 14) || (op == 32 || op == 33 || op == 35 || op == 36 || op == 37))
+						independent = rs != destination;
+					if (op == 4 || op == 5 || op == 40 || op == 41 || op == 43)
+						independent = rs != destination && rt != destination;
+					if (op == 0) {
+						unsigned fn = bits & 63;
+						if (fn == 0 || fn == 2 || fn == 3) independent = rt != destination;
+						if (fn == 8 || fn == 9) independent = rs != destination;
+						if (fn == 4 || fn == 6 || fn == 7 || (fn >= 32 && fn <= 39) || fn == 42 || fn == 43)
+							independent = rs != destination && rt != destination;
+					}
+				}
+				if (independent) continue;
+			}
+		}
+		if (!next || next.getBasicBlock() != current.getBasicBlock())
+			throw std::runtime_error("MIPS I load delay crosses an unsupported decode boundary at "
+					+ current.getAddress().toHexString());
+		DelayedRead item{write, {}};
+		for (auto& ir : next)
+			if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&ir))
+				if (load->getPointerOperand() == write->getPointerOperand()
+						&& !load->getMetadata("retdec.mips.merge"))
+					item.reads.push_back(load);
+		pending.push_back(item);
+	}
+	for (auto& item : pending)
+	{
+		if (item.reads.empty()) continue;
+		llvm::IRBuilder<> irb(item.write);
+		auto* old = irb.CreateLoad(item.write->getPointerOperand(), "load_delay_old");
+		for (auto* read : item.reads)
+		{
+			read->replaceAllUsesWith(old);
+			read->eraseFromParent();
+		}
+	}
+}
+
+static void markMipsBreakDelaySlot(llvm::Instruction* instruction,
+		llvm::Value* branchTaken = nullptr)
+{
+	AsmInstruction slot(instruction);
+	for (auto& ir : slot)
+	{
+		auto* call = llvm::dyn_cast<llvm::CallInst>(&ir);
+		if (!call || !call->getCalledFunction()
+				|| call->getCalledFunction()->getName() != "__retdec_mips_break")
+			continue;
+		llvm::IRBuilder<> irb(call);
+		auto* type = call->getArgOperand(1)->getType();
+		// The pinned Redux interpreter marks only taken branches as BD.
+		call->setArgOperand(1, branchTaken ? irb.CreateZExtOrTrunc(branchTaken, type)
+				: llvm::ConstantInt::get(type, 1));
+	}
+}
 
 char Decoder::ID = 0;
 
@@ -78,6 +196,18 @@ bool Decoder::runOnModuleCustom(
 
 bool Decoder::runCatcher()
 {
+	if (_config && _config->getConfig().parameters.isOriginalOnlyReturnRecovery())
+	{
+		try { return run(); }
+		catch (const std::exception&) {
+			publishOriginalDecodeCoverage("decoder-failure");
+			throw;
+		}
+		catch (...) {
+			publishOriginalDecodeCoverage("decoder-failure");
+			throw;
+		}
+	}
 	// TODO: here, we shoudl catch only the most severe capstone2llvmir
 	// problems which prevents us from using it.
 	// Other problems (e.g. throws in instruction translating like unxpected
@@ -103,6 +233,8 @@ bool Decoder::run()
 		return false;
 	}
 
+	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery())
+		validateOriginalOnlyProfile();
 	initTranslator();
 	initDryRunCsInstruction();
 	initEnvironment();
@@ -113,6 +245,11 @@ bool Decoder::run()
 	LOG << _jumpTargets << std::endl;
 
 	decode();
+	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery())
+		publishOriginalDecodeCoverage();
+	if (_config->getConfig().architecture.isMipsOrPic32())
+		preserveMipsOneLoadDelay(_module, _image, _abi,
+			_config->getConfig().parameters.isOriginalOnlyReturnRecovery());
 
 	if (debug_enabled && fs::exists(_config->getOutputDirectory()))
 	{
@@ -130,6 +267,12 @@ bool Decoder::run()
 	}
 
 	initConfigFunctions();
+	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery())
+		publishOriginalDecodeCoverage();
+	if (_config->getConfig().architecture.isMipsOrPic32()) {
+		annotateMipsLeafCalls(_module, _image);
+		simplifyMipsGuards(_module, _abi);
+	}
 
 	if (debug_enabled && fs::exists(_config->getOutputDirectory()))
 	{
@@ -139,6 +282,153 @@ bool Decoder::run()
 	initializeGpReg_mips();
 
 	return false;
+}
+
+void Decoder::validateOriginalOnlyProfile() const
+{
+	const auto& c = _config->getConfig();
+	const auto& p = c.parameters;
+	auto refuse = [](bool condition) {
+		if (!condition) throw std::runtime_error("original-only native profile rejected");
+	};
+	refuse(c.architecture.isMips() && c.architecture.getBitSize() == 32
+		&& c.architecture.isEndianLittle() && c.fileFormat.isRaw32());
+	refuse(!p.getInputFile().empty() && p.getSectionVMA().isDefined()
+		&& p.getEntryPoint().isDefined() && p.getMainAddress().isUndefined());
+	refuse(p.isSelectedDecodeOnly() && p.isKeepAllFunctions()
+		&& !p.isDetectStaticCode() && p.selectedRanges.size() == 1
+		&& p.selectedFunctions.empty() && p.selectedNotFoundFunctions.empty());
+	refuse(c.functions.empty() && c.globals.empty() && c.structures.empty()
+		&& c.registers.empty() && c.vtables.empty() && c.classes.empty()
+		&& c.patterns.empty());
+	refuse(p.getInputPdbFile().empty() && p.getOrdinalNumbersDirectory().empty()
+		&& p.staticSignaturePaths.empty() && p.userStaticSignaturePaths.empty()
+		&& p.libraryTypeInfoPaths.empty() && p.cryptoPatternPaths.empty()
+		&& p.abiPaths.empty());
+	const auto& range = *p.selectedRanges.begin();
+	refuse(range.getStart().isDefined() && range.getEnd().isDefined());
+	auto start = range.getStart().getValue(), end = range.getEnd().getValue();
+	refuse(start == p.getEntryPoint().getValue() && start < end
+		&& start % 4 == 0 && end % 4 == 0 && end <= (uint64_t(1) << 32));
+	auto* format = _image->getFileFormat();
+	refuse(format && format->isRawData() && format->getBytesPerWord() == 4
+		&& format->isLittleEndian());
+	auto bytes = _image->getImage()->getRawSegmentData(start);
+	refuse(bytes.first && end - start <= bytes.second);
+	const auto& passes = p.llvmPasses;
+	auto decoder = std::find(passes.begin(), passes.end(), "retdec-decoder");
+	auto param = std::find(passes.begin(), passes.end(), "retdec-param-return");
+	auto output = std::find(passes.begin(), passes.end(), "retdec-llvmir2hll");
+	refuse(std::count(passes.begin(), passes.end(), "retdec-decoder") == 1
+		&& std::count(passes.begin(), passes.end(), "retdec-param-return") == 1
+		&& output != passes.end() && decoder < param && param < output);
+	refuse(!_debug || (!_debug->hasInformation() && _debug->functions.empty()
+		&& _debug->globals.empty() && _debug->types.empty()));
+}
+
+void Decoder::captureOriginalInstruction(
+	const capstone2llvmir::Capstone2LlvmIrTranslator::TranslationResultOne& result,
+	llvm::Instruction* continuation)
+{
+	auto pc = result.capstoneInsn->address;
+	auto extent = _originalExtents.upper_bound(pc);
+	if (extent == _originalExtents.begin() || pc >= std::prev(extent)->second)
+		throw std::runtime_error("original-instruction-outside-activated-scope");
+	--extent;
+	auto& disposition = _originalDispositions[extent->first];
+	disposition.contractGraph = bool(_config->getConfig().parameters.getOriginalCallScope());
+	auto& evidence = disposition.evidence;
+	if (getFunctionAtAddress(Address(extent->first)) != result.llvmInsn->getFunction())
+		evidence.obligations.push_back({pc, "architectural", "original-function-owner-mismatch"});
+	if (evidence.instructions.size() == common::ReturnDisposition::RowLimit)
+	{
+		if (evidence.obligations.empty())
+			evidence.obligations.push_back({result.capstoneInsn->address,
+				"architectural", "decode-evidence-exhausted"});
+		return;
+	}
+	common::ReturnDisposition::Instruction row;
+	auto* instruction = result.capstoneInsn;
+	row.pc = instruction->address;
+	row.owner = result.llvmInsn->getFunction() ? result.llvmInsn->getFunction()->getName().str() : "";
+	row.bytes = instruction->size;
+	row.mapped = row.bytes == 4 && result.llvmInsn->getFunction() != nullptr;
+	if (row.bytes == 4)
+		for (unsigned i = 0; i < 4; ++i)
+			row.word |= uint32_t(instruction->bytes[i]) << (i * 8);
+	bool reachedContinuation = false;
+	if (continuation && result.llvmInsn->getParent() == continuation->getParent()) {
+		for (auto* ir = result.llvmInsn->getNextNode(); ir; ir = ir->getNextNode()) {
+			if (ir == continuation) {
+				reachedContinuation = true;
+				break;
+			}
+			if (AsmInstruction::isLlvmToAsmInstruction(ir)) break;
+			for (const auto& operand : ir->operands())
+				row.undef |= llvm::isa<llvm::UndefValue>(operand.get());
+			if (auto* store = llvm::dyn_cast<llvm::StoreInst>(ir)) {
+				auto id = _abi->getRegisterId(store->getPointerOperand());
+				if (store->getValueOperand()->getType()->isIntegerTy(32)) {
+					if (MIPS_REG_0 <= id && id <= MIPS_REG_31)
+						row.fullWidthRegisters.push_back(id - MIPS_REG_0);
+					else if (id == MIPS_REG_HI)
+						row.fullWidthRegisters.push_back(common::ReturnDisposition::HiRegister);
+					else if (id == MIPS_REG_LO)
+						row.fullWidthRegisters.push_back(common::ReturnDisposition::LoRegister);
+				}
+			}
+		}
+	}
+	if (!reachedContinuation) {
+		row.mapped = false;
+		row.fullWidthRegisters.clear();
+		if (evidence.obligations.size() < common::ReturnDisposition::RowLimit)
+			evidence.obligations.push_back({row.pc, "architectural", "unsupported-translation-span"});
+	}
+	std::sort(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end());
+	row.fullWidthRegisters.erase(std::unique(row.fullWidthRegisters.begin(),
+		row.fullWidthRegisters.end()), row.fullWidthRegisters.end());
+	evidence.instructions.push_back(std::move(row));
+}
+
+void Decoder::admitOriginalDirectTarget(uint64_t callPc, uint64_t target)
+{
+	const auto& scope = _config->getConfig().parameters.getOriginalCallScope();
+	if (!scope) return;
+	for (const auto& f : scope->callees) {
+		if (f.start != target) continue;
+		if (_originalExtents.emplace(f.start, f.end).second) {
+			_ranges.addPrimary(Address(f.start), Address(f.end));
+			createFunction(Address(f.start));
+		}
+		return;
+	}
+}
+
+void Decoder::publishOriginalDecodeCoverage(const std::string& failure)
+{
+	auto& c = _config->getConfig();
+	for (const auto& extent : _originalExtents) {
+		auto& disposition = _originalDispositions[extent.first];
+		disposition.contractGraph = bool(c.parameters.getOriginalCallScope());
+		auto& evidence = disposition.evidence;
+		evidence.start = extent.first; evidence.end = extent.second;
+		evidence.selection = extent.first == c.parameters.getEntryPoint().getValue() ? "selected-root" : "analysis-callee";
+		auto* f = getFunctionAtAddress(Address(extent.first));
+		auto* cf = _config->getConfigFunction(Address(extent.first));
+		if (!cf) {
+			common::Function record(Address(extent.first), Address(extent.second),
+				f ? f->getName().str() : "undecoded_" + Address(extent.first).toHexString());
+			cf = const_cast<common::Function*>(&*c.functions.insert(record).first);
+		}
+		evidence.symbol = cf->getName();
+		for (const auto& row : evidence.instructions)
+			if (row.owner != evidence.symbol && evidence.obligations.size() < common::ReturnDisposition::RowLimit)
+				evidence.obligations.push_back({row.pc, "architectural", "original-function-owner-mismatch"});
+		if (!failure.empty()) evidence.obligations.push_back({evidence.start, "architectural", failure});
+		cf->returnDisposition = disposition;
+		cf->returnType.setLlvmIr(""); cf->returnStorage = common::Storage::undefined();
+	}
 }
 
 void Decoder::decode()
@@ -181,6 +471,16 @@ bool Decoder::getJumpTarget(JumpTarget& jt)
 void Decoder::decodeJumpTarget(const JumpTarget& jt)
 {
 	const Address start = jt.getAddress();
+	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery() && start.isDefined()) {
+		auto extent = _originalExtents.upper_bound(start.getValue());
+		if (extent == _originalExtents.begin() || start.getValue() >= std::prev(extent)->second) return;
+		--extent;
+		if (jt.getFromAddress().isDefined() && jt.getType() != JumpTarget::eType::CONTROL_FLOW_CALL_TARGET
+			&& (jt.getFromAddress().getValue() < extent->first || jt.getFromAddress().getValue() >= extent->second)) {
+			_originalDispositions[extent->first].evidence.obligations.push_back({start.getValue(), "architectural", "cross-function-decode-edge"});
+			return;
+		}
+	}
 	if (start.isUndefined())
 	{
 		LOG << "\t\t" << "unknown target address -> skip" << std::endl;
@@ -344,6 +644,13 @@ void Decoder::decodeJumpTarget(const JumpTarget& jt)
 capstone2llvmir::Capstone2LlvmIrTranslator::TranslationResultOne
 Decoder::translate(ByteData& bytes, common::Address& addr, llvm::IRBuilder<>& irb)
 {
+	llvm::WeakVH continuation, insertionBlock;
+	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery()
+		&& irb.GetInsertBlock() && irb.GetInsertPoint() != irb.GetInsertBlock()->end())
+	{
+		continuation = &*irb.GetInsertPoint();
+		insertionBlock = irb.GetInsertBlock();
+	}
 	auto res = _c2l->translateOne(bytes.first, bytes.second, addr, irb);
 
 	// MIPS 64-bit mode can decompile more instructions than the 32-bit mode.
@@ -355,13 +662,23 @@ Decoder::translate(ByteData& bytes, common::Address& addr, llvm::IRBuilder<>& ir
 	//
 	if (_config->getConfig().architecture.isMipsOrPic32()
 			&& (_c2l->getBasicMode() & CS_MODE_MIPS32)
-			&& res.failed())
+			&& res.failed()
+			&& !_config->getConfig().parameters.isOriginalOnlyReturnRecovery())
 	{
 		_c2l->modifyBasicMode(CS_MODE_MIPS64);
 		res = _c2l->translateOne(bytes.first, bytes.second, addr, irb);
 		_c2l->modifyBasicMode(CS_MODE_MIPS32);
 	}
 
+	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery()
+			&& !res.failed() && res.llvmInsn)
+	{
+		auto* boundary = llvm::dyn_cast_or_null<llvm::Instruction>(continuation);
+		auto* block = llvm::dyn_cast_or_null<llvm::BasicBlock>(insertionBlock);
+		captureOriginalInstruction(res,
+			boundary && block && boundary->getParent() == block
+				&& res.llvmInsn->getParent() == block ? boundary : nullptr);
+	}
 	return res;
 }
 
@@ -517,6 +834,9 @@ bool Decoder::getJumpTargetsFromInstruction(
 				return false;
 			}
 
+			if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery()
+				&& tr.capstoneInsn->size == 4 && (tr.capstoneInsn->bytes[3] >> 2) == 3)
+				admitOriginalDirectTarget(addr.getValue(), t.getValue());
 			auto m = determineMode(tr.capstoneInsn, t);
 			getOrCreateCallTarget(t, tFnc, tBb);
 
@@ -1403,6 +1723,9 @@ void Decoder::handleDelaySlotTypical(
 			break;
 		}
 		_llvm2capstone->emplace(r.llvmInsn, r.capstoneInsn);
+		markMipsBreakDelaySlot(r.llvmInsn,
+				_c2l->isCondBranchFunctionCall(res.branchCall)
+						? res.branchCall->getArgOperand(0) : nullptr);
 	}
 
 	irb.SetInsertPoint(oldIp);
@@ -1460,6 +1783,7 @@ void Decoder::handleDelaySlotLikely(
 				break;
 			}
 			_llvm2capstone->emplace(res.llvmInsn, res.capstoneInsn);
+			markMipsBreakDelaySlot(res.llvmInsn);
 		}
 
 		_likelyBb2Target.emplace(newBb, target);
@@ -1549,6 +1873,18 @@ void Decoder::finalizePseudoCalls()
 		if (!icf && !irf && !ibf && !icbf)
 		{
 			continue;
+		}
+
+		if (icf && _config->getConfig().architecture.isMipsOrPic32()
+				&& !llvm::isa<llvm::CallInst>(pseudo->getNextNode()))
+		{
+			auto* retObj = getCallReturnObject();
+			auto* type = llvm::FunctionType::get(retObj->getValueType(), false);
+			llvm::IRBuilder<> builder(pseudo->getNextNode());
+			auto* target = builder.CreateIntToPtr(
+					pseudo->getArgOperand(0), type->getPointerTo());
+			auto* call = builder.CreateCall(target);
+			builder.CreateStore(call, retObj);
 		}
 
 		llvm::Instruction* it = pseudo->getPrevNode();

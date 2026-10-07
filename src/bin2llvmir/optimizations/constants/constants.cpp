@@ -90,7 +90,11 @@ bool ConstantsAnalysis::run()
 				continue;
 			}
 
-			checkForGlobalInInstruction(RDA, store, store->getValueOperand(), true);
+			if (!_config->getConfig().architecture.isMipsOrPic32()
+					|| !_abi->isRegister(store->getPointerOperand()))
+			{
+				checkForGlobalInInstruction(RDA, store, store->getValueOperand(), true);
+			}
 
 			if (isa<GlobalVariable>(store->getPointerOperand()))
 			{
@@ -109,6 +113,8 @@ bool ConstantsAnalysis::run()
 			checkForGlobalInInstruction(RDA, load, load->getPointerOperand());
 		}
 	}
+
+	IrModifier::markDeclaredVolatileAccesses(_module, _config);
 
 	IrModifier::eraseUnusedInstructionsRecursive(_toRemove);
 
@@ -134,7 +140,8 @@ void ConstantsAnalysis::checkForGlobalInInstruction(
 
 	if (max && maxC && maxC->getValue().getActiveBits() <= 64 && maxC->getZExtValue() != 0)
 	if (userI || max == &root)
-	if (_image->getImage()->hasDataOnAddress(maxC->getZExtValue()))
+	if (_image->getImage()->hasDataOnAddress(maxC->getZExtValue())
+			|| IrModifier::isDeclaredVolatileObject(_config, maxC->getZExtValue()))
 	{
 		IrModifier irm(_module, _config);
 		auto* ngv = irm.getGlobalVariable(
@@ -162,7 +169,8 @@ void ConstantsAnalysis::checkForGlobalInInstruction(
 	}
 
 	auto* gv = dyn_cast<GlobalVariable>(root.value);
-	if (isa<LoadInst>(inst) && gv && root.ops.size() <= 1)
+	if (isa<LoadInst>(inst) && gv && !_abi->isRegister(gv)
+			&& root.ops.size() <= 1)
 	{
 		auto* conv = IrModifier::convertConstantToType(gv, val->getType());
 		_toRemove.insert(val);

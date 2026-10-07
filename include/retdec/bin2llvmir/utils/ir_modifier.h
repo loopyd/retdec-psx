@@ -55,6 +55,17 @@ class IrModifier
 		static void eraseUnusedInstructionsRecursive(
 				std::unordered_set<llvm::Value*>& insns);
 
+		/// True when the supplied configuration declares a volatile object on
+		/// @a addr. Only such an explicit declaration may carry an address that
+		/// has no image data -- never the absence of image data alone.
+		static bool isDeclaredVolatileObject(
+				Config* config,
+				retdec::common::Address addr);
+
+		/// Marks every load/store that accesses a declared volatile object, so
+		/// the memory access itself survives the destructive LLVM passes.
+		static void markDeclaredVolatileAccesses(llvm::Module* module, Config* config);
+
 	public:
 		IrModifier(llvm::Module* m, Config* c);
 

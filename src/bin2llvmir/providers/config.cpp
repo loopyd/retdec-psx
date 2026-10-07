@@ -325,6 +325,17 @@ const retdec::common::Object* Config::insertGlobalVariable(
 	{
 		cgv.type.setIsWideString(true);
 	}
+	const retdec::common::Object* previous =
+			_configDB.globals.getObjectByName(cgv.getName());
+	if (previous == nullptr)
+	{
+		previous = _configDB.globals.getObjectByAddress(address);
+	}
+	if (previous != nullptr)
+	{
+		cgv.type.setCType(previous->type.getCType());
+		cgv.type.setIsVolatile(previous->type.isVolatile());
+	}
 	auto p = _configDB.globals.insert(cgv);
 
 	return &(*p.first);

@@ -4,7 +4,10 @@
  * @copyright (c) 2017 Avast Software, licensed under the MIT license
  */
 
+#include <set>
+
 #include <llvm/IR/InstIterator.h>
+#include <llvm/IR/Instructions.h>
 
 #include "retdec/utils/string.h"
 #include "retdec/bin2llvmir/providers/abi/abi.h"
@@ -416,6 +419,39 @@ Constant* detectGlobalVariableInitializerCycle(
 	return c;
 }
 
+GlobalVariable* accessedObject(Value* value)
+{
+	if (auto* gv = dyn_cast<GlobalVariable>(value))
+	{
+		return gv;
+	}
+	if (auto* cast = dyn_cast<CastInst>(value))
+	{
+		return accessedObject(cast->getOperand(0));
+	}
+	if (auto* expr = dyn_cast<ConstantExpr>(value))
+	{
+		if (expr->isCast())
+		{
+			return accessedObject(expr->getOperand(0));
+		}
+		return nullptr;
+	}
+	if (auto* gep = dyn_cast<GetElementPtrInst>(value))
+	{
+		for (auto index = gep->idx_begin(); index != gep->idx_end(); ++index)
+		{
+			auto* constant = dyn_cast<ConstantInt>(index->get());
+			if (!constant || !constant->isZero())
+			{
+				return nullptr;
+			}
+		}
+		return accessedObject(gep->getPointerOperand());
+	}
+	return nullptr;
+}
+
 bool globalVariableCanBeCreated(
 		Module* module,
 		Config* config,
@@ -427,7 +463,8 @@ bool globalVariableCanBeCreated(
 	{
 		return false;
 	}
-	if (!objf->getImage()->hasDataOnAddress(addr))
+	if (!objf->getImage()->hasDataOnAddress(addr)
+			&& !IrModifier::isDeclaredVolatileObject(config, addr))
 	{
 		return false;
 	}
@@ -500,6 +537,69 @@ IrModifier::IrModifier(llvm::Module* m, Config* c) :
 		_config(c)
 {
 
+}
+
+/**
+ * @return True when @a config declares a volatile object on @a addr.
+ */
+bool IrModifier::isDeclaredVolatileObject(
+		Config* config,
+		retdec::common::Address addr)
+{
+	if (config == nullptr)
+	{
+		return false;
+	}
+	const auto* object = config->getConfigGlobalVariable(addr);
+	return object != nullptr && object->type.isVolatile();
+}
+
+/**
+ * Marks every load/store that accesses a declared volatile object. The
+ * declaration qualifies the object, so the accesses to it must survive the
+ * destructive LLVM passes. Accesses through the object to its pointee are not
+ * marked.
+ */
+void IrModifier::markDeclaredVolatileAccesses(llvm::Module* module, Config* config)
+{
+	if (module == nullptr || config == nullptr)
+	{
+		return;
+	}
+
+	std::set<GlobalVariable*> declared;
+	for (auto& gv : module->globals())
+	{
+		const auto* object = config->getConfigGlobalVariable(&gv);
+		if (object != nullptr && object->type.isVolatile())
+		{
+			declared.insert(&gv);
+		}
+	}
+	if (declared.empty())
+	{
+		return;
+	}
+
+	for (auto& fnc : *module)
+	for (auto& bb : fnc)
+	for (auto& inst : bb)
+	{
+		if (auto* load = dyn_cast<LoadInst>(&inst))
+		{
+			if (declared.count(accessedObject(load->getPointerOperand())))
+			{
+				load->setVolatile(true);
+			}
+		}
+		else if (auto* store = dyn_cast<StoreInst>(&inst))
+		{
+			if (declared.count(accessedObject(store->getPointerOperand())))
+			{
+				store->setVolatile(true);
+			}
+		}
+	}
 }
 
 IrModifier::FunctionPair IrModifier::renameFunction(
@@ -667,6 +767,17 @@ GlobalVariable* IrModifier::getGlobalVariable(
 			c,
 			n);
 
+	if (c == nullptr && isDeclaredVolatileObject(_config, addr))
+	{
+		_config->insertGlobalVariable(
+				gv,
+				addr,
+				isFromDebug,
+				realName,
+				cryptoDesc);
+		return gv;
+	}
+
 	if (c == nullptr)
 	{
 		c = objf->getConstant(_config, dbgf, addr);
@@ -771,6 +882,8 @@ llvm::Value* IrModifier::changeObjectDeclarationType(
 					ecgv->getStorage());
 			cgv.type.setLlvmIr(
 					llvmObjToString(ogv->getType()->getPointerElementType()));
+			cgv.type.setCType(ecgv->type.getCType());
+			cgv.type.setIsVolatile(ecgv->type.isVolatile());
 			cgv.type.setIsWideString(wideString);
 			_config->getConfig().globals.insert(cgv);
 		}
