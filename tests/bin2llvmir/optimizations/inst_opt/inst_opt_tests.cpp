@@ -398,12 +398,12 @@ TEST_F(OptimizeTests, and_i1_xy)
 		@reg = global i1 1
 		define i1 @fnc() {
 			%a = load i1, i1* @reg
-			%b = icmp eq i1 %a, 1
+			%b = and i1 %a, 1
 			ret i1 %b
 		}
 	)";
 	checkModuleAgainstExpectedIr(exp);
-	EXPECT_TRUE(ret);
+	EXPECT_FALSE(ret);
 }
 
 //

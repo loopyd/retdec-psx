@@ -55,6 +55,18 @@ fresh `build/third_party/rz-psxdec/attempt-*` directory. RetDec support cleanup
 stays under that attempt's disposable install prefix. The lifecycle does not run
 a top-level install. Its guide is `tools/retdec-psx/README.md` in the workspace.
 
+Native test builds use the GoogleTest submodule at `deps/googletest/src`, pinned
+to commit `90a443f9c2437ca8a682a1ac625eba64e1d74a8a`. Initialize it from the
+backend repository before configuring with `RETDEC_TESTS=ON`:
+
+```sh
+git submodule update --init --recursive
+```
+
+CMake uses that checkout by default. `GOOGLETEST_LOCAL_DIR` can select another
+complete local GoogleTest source tree. No GoogleTest archive download is needed.
+To clear a previous source override, reconfigure with `-U GOOGLETEST_LOCAL_DIR`.
+
 ## Use
 
 Load the plugin's verified `rz-psxdec.so` into Rizin with `RZ_NOPLUGINS=1` and

@@ -36,21 +36,16 @@ else()
 	)
 endif()
 
-if(GOOGLETEST_LOCAL_DIR)
-	message(STATUS "Googletest: using local Googletest directory.")
-	set(GOOGLETEST_SOURCE_DIR "${GOOGLETEST_LOCAL_DIR}")
-	set(_GOOGLETEST_URL "")
-else()
-	message(STATUS "Googletest: using remote Googletest revision.")
-	set(GOOGLETEST_SOURCE_DIR "")
-	set(_GOOGLETEST_URL "${GOOGLETEST_URL}")
+if(NOT GOOGLETEST_LOCAL_DIR)
+	set(GOOGLETEST_LOCAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 endif()
+if(NOT EXISTS "${GOOGLETEST_LOCAL_DIR}/CMakeLists.txt")
+	message(FATAL_ERROR "GoogleTest source tree is missing. Run git submodule update --init --recursive in retdec-psx, or set GOOGLETEST_LOCAL_DIR to a complete GoogleTest checkout.")
+endif()
+message(STATUS "Googletest: using source directory ${GOOGLETEST_LOCAL_DIR}.")
 
 ExternalProject_Add(googletest
-	SOURCE_DIR ${GOOGLETEST_SOURCE_DIR}
-	URL ${_GOOGLETEST_URL}
-	URL_HASH SHA256=${GOOGLETEST_ARCHIVE_SHA256}
-	DOWNLOAD_NAME googletest.zip
+	SOURCE_DIR "${GOOGLETEST_LOCAL_DIR}"
 	CMAKE_ARGS
 		-DCMAKE_INSTALL_PREFIX=${GOOGLETEST_INSTALL_DIR}
 		# This does not work on MSVC, but is useful on Linux.
@@ -66,15 +61,12 @@ ExternalProject_Add(googletest
 		"${CMAKE_CXX_COMPILER_OPTION}"
 		-DCMAKE_POSITION_INDEPENDENT_CODE=${CMAKE_POSITION_INDEPENDENT_CODE}
 		-DCMAKE_LIBTOOL=${CMAKE_LIBTOOL}
-	LOG_DOWNLOAD ON
 	LOG_CONFIGURE ON
 	LOG_BUILD ON
 	BUILD_BYPRODUCTS
 		${GTEST_BYPRODUCTS}
 )
-if(GOOGLETEST_LOCAL_DIR)
-	force_configure_step(googletest)
-endif()
+force_configure_step(googletest)
 
 check_if_variable_changed(GOOGLETEST_LOCAL_DIR CHANGED)
 if(CHANGED)

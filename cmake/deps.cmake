@@ -8,15 +8,6 @@ set(CAPSTONE_ARCHIVE_SHA256
     CACHE STRING ""
 )
 
-set(GOOGLETEST_URL
-    "https://github.com/google/googletest/archive/90a443f9c2437ca8a682a1ac625eba64e1d74a8a.zip"
-    CACHE STRING "URL of Googletest archive to use."
-)
-set(GOOGLETEST_ARCHIVE_SHA256
-    "6fb9a49ad77656c860cfdafbb3148a91f076a3a8bda9c6d8809075c832549dd4"
-    CACHE STRING ""
-)
-
 set(KEYSTONE_URL
     "https://github.com/keystone-engine/keystone/archive/d7ba8e378e5284e6384fc9ecd660ed5f6532e922.zip"
     CACHE STRING "URL of Keystone archive to use."
