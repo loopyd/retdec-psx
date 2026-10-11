@@ -973,8 +973,43 @@ std::optional<common::OriginalEntryRelativeMemoryAddress> originalEntryRelativeM
     return address;
 }
 
+std::optional<common::OriginalEntryRelativeMemoryAddress> originalFlowMemoryAddress(
+    const common::OriginalMemoryAccess& access, const OriginalIdentityFlow& flow)
+{
+    auto instruction = flow.instructions.find(access.pc);
+    const auto* state = originalIdentityState(flow, access.pc);
+    if (instruction == flow.instructions.end() || !state
+        || !originalMemoryAccessMatches(access, *instruction->second, originalOperation(*instruction->second))) return {};
+    unsigned reg = (instruction->second->word >> 21) & 31;
+    const auto& value = (*state)[reg];
+    if (!reg || value.missing || value.constant || value.definitions.size() > 1
+        || state->mayPending[reg] || !state->mayNoPending[reg]
+        || access.addressDefinitions != std::vector<unsigned>(value.definitions.begin(), value.definitions.end())
+        || access.addressEntries != std::vector<unsigned>(value.entries.begin(), value.entries.end())) return {};
+    OriginalEntryOffset identity{}; identity.entry = reg;
+    std::optional<uint64_t> writer;
+    if (!value.definitions.empty()) {
+        auto id = *value.definitions.begin();
+        auto recovered = originalEntryOffset(id, flow);
+        if (!recovered || flow.definitions.at(id).reg != reg) return {};
+        identity = std::move(*recovered); writer = flow.definitions.at(id).pc;
+    } else if (value.equalEntry != std::optional<unsigned>{reg}) return {};
+    const auto& entry = flow.states.at({flow.start, 0})[identity.entry];
+    if (entry.missing || entry.equalEntry != std::optional<unsigned>{identity.entry}
+        || value.entries != std::set<unsigned>{identity.entry}
+        || value.formals != entry.formals || value.bad != entry.bad
+        || !originalIdentityWriter(flow, access.pc, reg, writer)) return {};
+    common::OriginalEntryRelativeMemoryAddress address;
+    address.entryRegister = identity.entry;
+    address.offset = identity.offset + uint32_t(int32_t(int16_t(instruction->second->word & 0xffff)));
+    address.equalityEvidence.assign(identity.evidence.begin(), identity.evidence.end());
+    address.derivation = common::OriginalEntryRelativeMemoryAddress::Derivation::Flow;
+    return address;
+}
+
 void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Disposition& disposition,
-    const FileImage* image, const common::OriginalCallScope& scope, const config::Parameters& parameters)
+    const FileImage* image, const common::OriginalCallScope& scope, const config::Parameters& parameters,
+    const std::map<uint64_t, common::OriginalMemoryAccess>& flowAccesses)
 {
     for (auto& access : summary.accesses) access.address = common::OriginalFact::partial("original-address-proof-unresolved");
     const auto& evidence = disposition.evidence;
@@ -1037,7 +1072,15 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
         if (!address) {
             auto relative = originalEntryRelativeMemoryAddress(access, instructions, definitions);
             if (relative && originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc,
-                    relative->equalityEvidence, relative->entryRegister)) access.address = std::move(*relative);
+                    relative->equalityEvidence, relative->entryRegister)) {
+                access.address = std::move(*relative); continue;
+            }
+            auto candidate = flowAccesses.find(access.pc);
+            if (candidate != flowAccesses.end()) {
+                const auto* flow = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&candidate->second.address);
+                if (flow && flow->derivation == common::OriginalEntryRelativeMemoryAddress::Derivation::Flow)
+                    access.address = *flow;
+            }
             continue;
         }
         if (!originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc, address->equalityEvidence)) continue;
@@ -1500,6 +1543,10 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                         || !originalIdentityWriter(flow, exit.first + 4, reg, definitions.at(id).pc, true)) continue;
                     value.equalEntry = identity->entry; value.equalityEvidence = identity->evidence;
                 }
+                for (auto& pair : accesses) {
+                    auto address = originalFlowMemoryAddress(pair.second, flow);
+                    if (address) pair.second.address = std::move(*address);
+                }
             }
 			std::size_t references = 0;
 			for (auto& pair : definitions) {
@@ -1540,7 +1587,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                         call.contract = std::move(complete); call.qualified = true; call.unresolved.clear();
                     }
                 }
-                recoverOriginalMemory(summary, disposition, _image, *scope, _config->getConfig().parameters);
+                recoverOriginalMemory(summary, disposition, _image, *scope, _config->getConfig().parameters, accesses);
             }
 		} catch (const std::exception& error) {
 			disposition.kind = Disposition::Kind::Unknown;

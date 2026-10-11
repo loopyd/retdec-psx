@@ -87,9 +87,11 @@ struct OriginalFixedMemoryAddress {
 	std::variant<OriginalFact, OriginalFileBytes> fileBytes = OriginalFact::partial("physical-file-backing-unresolved");
 };
 struct OriginalEntryRelativeMemoryAddress {
+	enum class Derivation { Prefix, Flow };
 	unsigned entryRegister = 0;
 	uint32_t offset = 0;
 	std::vector<uint64_t> equalityEvidence;
+	Derivation derivation = Derivation::Prefix;
 };
 struct OriginalMemoryAccess {
 	uint64_t pc = 0;

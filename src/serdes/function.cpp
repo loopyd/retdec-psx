@@ -145,7 +145,9 @@ void memoryAddress(Writer& writer, const retdec::common::OriginalMemoryAccess& a
     if (const auto* address = std::get_if<retdec::common::OriginalEntryRelativeMemoryAddress>(&access.address)) {
         if (!address->entryRegister || address->entryRegister > 31)
             throw std::runtime_error("invalid-entry-relative-memory-register");
-        writer.Key("address"); writer.StartObject(); writer.Key("kind"); writer.String("entry-register-relative-prefix/v1");
+        writer.Key("address"); writer.StartObject(); writer.Key("kind");
+        writer.String(address->derivation == retdec::common::OriginalEntryRelativeMemoryAddress::Derivation::Flow
+            ? "entry-register-relative-flow/v1" : "entry-register-relative-prefix/v1");
         writer.Key("entryRegister"); writer.Uint(address->entryRegister); writer.Key("offset"); writer.Uint(address->offset);
         numbers(writer, "equalityEvidence", address->equalityEvidence); writer.EndObject(); return;
     }
