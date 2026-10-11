@@ -567,6 +567,124 @@ void establishIdentity(RegisterFact& output, const RegisterState& state,
     if (output.constant) output.equalityEvidence.insert(row.pc);
 }
 
+struct OriginalEntryOffset {
+    unsigned entry;
+    uint32_t offset = 0;
+    std::set<uint64_t> evidence;
+    bool adjusted = false;
+};
+struct OriginalIdentityFlow {
+    uint64_t start;
+    const std::string& symbol;
+    const std::map<uint64_t, const Disposition::Instruction*>& instructions;
+    const std::map<unsigned, Disposition::Definition>& definitions;
+    const std::map<std::pair<uint64_t, uint64_t>, RegisterState>& states;
+    const std::multimap<uint64_t, const Disposition::Edge*>& incoming;
+};
+
+const RegisterState* originalIdentityState(const OriginalIdentityFlow& flow, uint64_t pc)
+{
+    auto state = flow.states.lower_bound({pc, 0});
+    if (state == flow.states.end() || state->first.first != pc) return nullptr;
+    auto next = state; ++next;
+    return next != flow.states.end() && next->first.first == pc ? nullptr : &state->second;
+}
+
+bool originalIdentityWriter(const OriginalIdentityFlow& flow, uint64_t pc, unsigned reg,
+    std::optional<uint64_t> expected, bool after = false)
+{
+    std::vector<std::pair<uint64_t, bool>> pending{{pc, after}};
+    std::set<uint64_t> visited;
+    unsigned terminals = 0, references = 0;
+    while (!pending.empty()) {
+        auto point = pending.back(); pending.pop_back();
+        pc = point.first;
+        if (point.second && !visited.insert(pc).second) continue;
+        if (visited.size() > Disposition::RowLimit) return false;
+        auto instruction = flow.instructions.find(pc);
+        const auto* state = originalIdentityState(flow, pc);
+        if (instruction == flow.instructions.end() || !state || (*state)[reg].missing
+            || state->mayPending[reg] || !state->mayNoPending[reg]) return false;
+        const auto& row = *instruction->second;
+        if (!row.mapped || row.undef || row.bytes != 4 || pc % 4 || row.owner != flow.symbol) return false;
+        if (point.second) {
+            auto operation = originalOperation(row);
+            if (operation.kind == MipsOperation::Call || operation.kind == MipsOperation::Trap
+                || operation.kind == MipsOperation::Unsupported) return false;
+            if (std::find(operation.destinations.begin(), operation.destinations.end(), reg) != operation.destinations.end()) {
+                if (operation.kind == MipsOperation::Load || expected != std::optional<uint64_t>{pc}
+                    || std::count(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), reg) != 1) return false;
+                ++terminals; continue;
+            }
+        }
+        if (pc == flow.start) {
+            if (expected) return false;
+            ++terminals;
+        }
+        auto predecessors = flow.incoming.equal_range(pc);
+        if (predecessors.first == predecessors.second) {
+            if (pc == flow.start) continue;
+            return false;
+        }
+        for (auto edge = predecessors.first; edge != predecessors.second; ++edge) {
+            if (++references > Disposition::ReferenceLimit) return false;
+            pending.emplace_back(edge->second->from, true);
+        }
+    }
+    return terminals != 0;
+}
+
+std::optional<OriginalEntryOffset> originalEntryOffset(unsigned id, const OriginalIdentityFlow& flow)
+{
+    OriginalEntryOffset result{};
+    std::set<unsigned> visited;
+    std::vector<const Disposition::Definition*> chain;
+    while (true) {
+        if (!visited.insert(id).second || visited.size() > 128) return {};
+        auto found = flow.definitions.find(id);
+        if (found == flow.definitions.end()) return {};
+        const auto& definition = found->second;
+        auto instruction = flow.instructions.find(definition.pc);
+        const auto* state = originalIdentityState(flow, definition.pc);
+        if (instruction == flow.instructions.end() || !state || definition.origin != "instruction"
+            || definition.width != 32 || definition.delayed || definition.constant
+            || !definition.reg || definition.reg >= Disposition::GprCount || definition.inputs.size() > 1) return {};
+        const auto& row = *instruction->second;
+        unsigned op = row.word >> 26, rs = (row.word >> 21) & 31, rt = (row.word >> 16) & 31;
+        bool copy = op == 0 && (row.word & 63) == 33 && ((row.word >> 6) & 31) == 0 && bool(rs) != bool(rt);
+        unsigned source = op == 9 ? rs : rs ? rs : rt;
+        unsigned destination = op == 9 ? rt : (row.word >> 11) & 31;
+        if ((op != 9 && !copy) || !source || destination != definition.reg
+            || definition.operation != (op == 9 ? "integer-immediate" : "integer-binary")
+            || !row.mapped || row.undef || row.bytes != 4 || row.pc % 4 || row.owner != flow.symbol
+            || std::count(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), destination) != 1
+            || (*state)[source].missing || state->mayPending[source] || !state->mayNoPending[source]
+            || state->mayPending[destination] || !state->mayNoPending[destination]
+            || definition.inputs != std::vector<unsigned>((*state)[source].definitions.begin(), (*state)[source].definitions.end())) return {};
+        std::optional<uint64_t> writer;
+        if (!definition.inputs.empty()) {
+            auto input = flow.definitions.find(definition.inputs.front());
+            if (input == flow.definitions.end() || input->second.reg != source) return {};
+            writer = input->second.pc;
+        }
+        if (!originalIdentityWriter(flow, row.pc, source, writer)) return {};
+        if (op == 9) {
+            result.offset += uint32_t(int32_t(int16_t(row.word & 0xffff)));
+            result.adjusted |= (row.word & 0xffff) != 0;
+        }
+        result.evidence.insert(row.pc); chain.push_back(&definition);
+        if (!definition.inputs.empty()) { id = definition.inputs.front(); continue; }
+        const auto& entry = flow.states.at({flow.start, 0})[source];
+        if (entry.missing || entry.equalEntry != std::optional<unsigned>{source}
+            || entry.entries != std::set<unsigned>{source}) return {};
+        for (const auto* member : chain)
+            if (member->entries != std::vector<unsigned>{source}
+                || member->formals != std::vector<unsigned>(entry.formals.begin(), entry.formals.end())
+                || member->bad != std::vector<std::string>(entry.bad.begin(), entry.bad.end())) return {};
+        result.entry = source; return result;
+    }
+}
+
 common::OriginalTransfer transferFact(unsigned reg, const RegisterState& state, bool covered)
 {
     common::OriginalTransfer row; row.reg = reg;
@@ -841,6 +959,10 @@ std::optional<common::OriginalEntryRelativeMemoryAddress> originalEntryRelativeM
             address.offset += uint32_t(int32_t(int16_t(word & 0xffff)));
             equalEntry.reset(); identityEvidence.clear();
         } else identityEvidence.push_back(definition.pc);
+        if (!address.offset && definition.equalEntry == std::optional<unsigned>{reg}) {
+            equalEntry = reg; identityEvidence = address.equalityEvidence;
+            identityEvidence.push_back(definition.pc);
+        }
         if (definition.equalEntry != equalEntry || definition.equalityEvidence != identityEvidence) return {};
         address.equalityEvidence.push_back(definition.pc);
         previous = &definition;
@@ -1353,14 +1475,38 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 				else if (control) send(pc + 4, pc, "delay-slot");
 				else send(pc + 4, 0, "fallthrough");
 			}
+			for (const auto& edge : edges) evidence.edges.push_back({std::get<0>(edge), std::get<1>(edge),
+				std::get<2>(edge) ? std::optional<uint64_t>(std::get<2>(edge)) : std::nullopt, std::get<3>(edge)});
+            if (revised && std::none_of(evidence.obligations.begin(), evidence.obligations.end(),
+                [](const auto& row) { return row.domain == "architectural"; })) {
+                std::multimap<uint64_t, const Disposition::Edge*> incoming;
+                for (const auto& edge : evidence.edges) incoming.emplace(edge.to, &edge);
+                OriginalIdentityFlow flow{evidence.start, evidence.symbol, instructions, definitions, states, incoming};
+                for (auto& pair : definitions) {
+                    auto& definition = pair.second;
+                    if (definition.equalEntry) continue;
+                    auto identity = originalEntryOffset(pair.first, flow);
+                    if (!identity || identity->offset || !identity->adjusted) continue;
+                    definition.equalEntry = identity->entry;
+                    definition.equalityEvidence.assign(identity->evidence.begin(), identity->evidence.end());
+                }
+                for (auto& exit : exitStates) for (unsigned reg = 1; reg < Disposition::GprCount; ++reg) {
+                    auto& value = exit.second[reg];
+                    if (value.equalEntry || value.missing || value.definitions.size() != 1
+                        || exit.second.mayPending[reg] || !exit.second.mayNoPending[reg]) continue;
+                    auto id = *value.definitions.begin();
+                    auto identity = originalEntryOffset(id, flow);
+                    if (!identity || identity->offset || !identity->adjusted
+                        || !originalIdentityWriter(flow, exit.first + 4, reg, definitions.at(id).pc, true)) continue;
+                    value.equalEntry = identity->entry; value.equalityEvidence = identity->evidence;
+                }
+            }
 			std::size_t references = 0;
 			for (auto& pair : definitions) {
 				references += pair.second.inputs.size() + pair.second.formals.size() + pair.second.bad.size();
 				if (references > Disposition::ReferenceLimit) throw std::runtime_error("return-references-exhausted");
 				evidence.definitions.push_back(std::move(pair.second));
 			}
-			for (const auto& edge : edges) evidence.edges.push_back({std::get<0>(edge), std::get<1>(edge),
-				std::get<2>(edge) ? std::optional<uint64_t>(std::get<2>(edge)) : std::nullopt, std::get<3>(edge)});
 			for (auto& pair : exits) evidence.exits.push_back(std::move(pair.second));
 			for (auto& pair : calls) evidence.calls.push_back(std::move(pair.second));
 			evidence.decodeComplete = std::none_of(evidence.obligations.begin(), evidence.obligations.end(),
