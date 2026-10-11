@@ -268,7 +268,10 @@ MipsOperation originalOperation(const Disposition::Instruction& instruction)
 		+ int64_t(int16_t(word & 0xffff)) * 4);
 	if (op == 0)
 	{
-		if (fn == 8 && rs == 31) { result.kind = MipsOperation::Return; result.name = "jr-ra"; result.inputs = {31}; }
+		if (fn == 8 && rt == 0 && rd == 0 && ((word >> 6) & 31) == 0) {
+			result.kind = rs == 31 ? MipsOperation::Return : MipsOperation::Branch;
+			result.name = rs == 31 ? "jr-ra" : "jr"; result.inputs = {rs};
+		}
 		else if (fn == 9) { result.kind = MipsOperation::Call; result.name = "jalr"; result.inputs = {rs}; }
 		else if (fn == 0 || fn == 2 || fn == 3) {
 			result.kind = MipsOperation::Compute; result.destinations = {rd};
