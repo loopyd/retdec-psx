@@ -323,7 +323,8 @@ ShPtr<Expression> WhileTrueToForLoopOptimizer::computeEndCondOfForLoop(
 		}
 
 		// The resulting condition is of the form `indVar < endValue`.
-		return LtOpExpr::create(indVarInfo->indVar, endValue);
+		return LtOpExpr::create(indVarInfo->indVar, endValue,
+			ltOpExpr->getVariant());
 	} else if (auto ltEqOpExpr = cast<LtEqOpExpr>(endCondOpExpr)) {
 		// <=
 		auto endValue = ltEqOpExpr->getSecondOperand();
@@ -338,7 +339,9 @@ ShPtr<Expression> WhileTrueToForLoopOptimizer::computeEndCondOfForLoop(
 		}
 
 		// The resulting condition is of the form `indVar < endValue`.
-		return LtOpExpr::create(indVarInfo->indVar, endValue);
+		auto variant = ltEqOpExpr->getVariant() == LtEqOpExpr::Variant::SCmp
+			? LtOpExpr::Variant::SCmp : LtOpExpr::Variant::UCmp;
+		return LtOpExpr::create(indVarInfo->indVar, endValue, variant);
 	} else if (auto gtOpExpr = cast<GtOpExpr>(endCondOpExpr)) {
 		// >
 
@@ -349,8 +352,10 @@ ShPtr<Expression> WhileTrueToForLoopOptimizer::computeEndCondOfForLoop(
 		if (indVarInfo->updateBeforeExit) {
 			return gtOpExpr;
 		} else {
+			auto variant = gtOpExpr->getVariant() == GtOpExpr::Variant::SCmp
+				? GtEqOpExpr::Variant::SCmp : GtEqOpExpr::Variant::UCmp;
 			return GtEqOpExpr::create(gtOpExpr->getFirstOperand(),
-				gtOpExpr->getSecondOperand());
+				gtOpExpr->getSecondOperand(), variant);
 		}
 	} else if (auto gtEqOpExpr = cast<GtEqOpExpr>(endCondOpExpr)) {
 		// >=
@@ -361,7 +366,8 @@ ShPtr<Expression> WhileTrueToForLoopOptimizer::computeEndCondOfForLoop(
 		if (indVarInfo->updateBeforeExit) {
 			return GtEqOpExpr::create(
 				gtEqOpExpr->getFirstOperand(),
-				gtEqOpExpr->getSecondOperand()
+				gtEqOpExpr->getSecondOperand(),
+				gtEqOpExpr->getVariant()
 			);
 		} else {
 			return GtEqOpExpr::create(
@@ -369,7 +375,8 @@ ShPtr<Expression> WhileTrueToForLoopOptimizer::computeEndCondOfForLoop(
 				SubOpExpr::create(
 					gtEqOpExpr->getSecondOperand(),
 					ConstInt::create(1, 32)
-				)
+				),
+				gtEqOpExpr->getVariant()
 			);
 		}
 	} else if (auto neqOpExpr = cast<NeqOpExpr>(endCondOpExpr)) {
@@ -486,22 +493,30 @@ ShPtr<ConstInt> WhileTrueToForLoopOptimizer::evaluate(ShPtr<Expression> expr) co
 */
 ShPtr<BinaryOpExpr> WhileTrueToForLoopOptimizer::exchangeCompOpAndOperands(
 		ShPtr<BinaryOpExpr> expr) {
-	if (isa<GtOpExpr>(expr)) {
+	if (auto gtOpExpr = cast<GtOpExpr>(expr)) {
 		// x > y  ->  y < x
+		auto variant = gtOpExpr->getVariant() == GtOpExpr::Variant::SCmp
+			? LtOpExpr::Variant::SCmp : LtOpExpr::Variant::UCmp;
 		return LtOpExpr::create(
-			expr->getSecondOperand(), expr->getFirstOperand());
-	} else if (isa<LtOpExpr>(expr)) {
+			expr->getSecondOperand(), expr->getFirstOperand(), variant);
+	} else if (auto ltOpExpr = cast<LtOpExpr>(expr)) {
 		// x < y  ->  y > x
+		auto variant = ltOpExpr->getVariant() == LtOpExpr::Variant::SCmp
+			? GtOpExpr::Variant::SCmp : GtOpExpr::Variant::UCmp;
 		return GtOpExpr::create(
-			expr->getSecondOperand(), expr->getFirstOperand());
-	} else if (isa<LtEqOpExpr>(expr)) {
+			expr->getSecondOperand(), expr->getFirstOperand(), variant);
+	} else if (auto ltEqOpExpr = cast<LtEqOpExpr>(expr)) {
 		// x <= y  ->  y >= x
+		auto variant = ltEqOpExpr->getVariant() == LtEqOpExpr::Variant::SCmp
+			? GtEqOpExpr::Variant::SCmp : GtEqOpExpr::Variant::UCmp;
 		return GtEqOpExpr::create(
-			expr->getSecondOperand(), expr->getFirstOperand());
-	} else if (isa<GtEqOpExpr>(expr)) {
+			expr->getSecondOperand(), expr->getFirstOperand(), variant);
+	} else if (auto gtEqOpExpr = cast<GtEqOpExpr>(expr)) {
 		// x >= y  ->  y <= x
+		auto variant = gtEqOpExpr->getVariant() == GtEqOpExpr::Variant::SCmp
+			? LtEqOpExpr::Variant::SCmp : LtEqOpExpr::Variant::UCmp;
 		return LtEqOpExpr::create(
-			expr->getSecondOperand(), expr->getFirstOperand());
+			expr->getSecondOperand(), expr->getFirstOperand(), variant);
 	} else if (isa<EqOpExpr>(expr)) {
 		// x == y  ->  y == x
 		return EqOpExpr::create(

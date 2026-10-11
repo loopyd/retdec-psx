@@ -5,6 +5,7 @@
 */
 
 #include "retdec/llvmir2hll/ir/deref_op_expr.h"
+#include "retdec/llvmir2hll/ir/pointer_type.h"
 #include "retdec/llvmir2hll/support/debug.h"
 #include "retdec/llvmir2hll/support/visitor.h"
 
@@ -18,6 +19,13 @@ namespace llvmir2hll {
 */
 DerefOpExpr::DerefOpExpr(ShPtr<Expression> op):
 	UnaryOpExpr(op) {}
+
+ShPtr<Type> DerefOpExpr::getType() const {
+	if (auto pointer = cast<PointerType>(op->getType())) {
+		return pointer->getContainedType();
+	}
+	return UnaryOpExpr::getType();
+}
 
 bool DerefOpExpr::isEqualTo(ShPtr<Value> otherValue) const {
 	if (ShPtr<DerefOpExpr> otherValueDerefOpExpr = cast<DerefOpExpr>(otherValue)) {

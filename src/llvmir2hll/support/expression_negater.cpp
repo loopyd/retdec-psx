@@ -134,19 +134,31 @@ void ExpressionNegater::visit(ShPtr<NeqOpExpr> expr) {
 }
 
 void ExpressionNegater::visit(ShPtr<LtEqOpExpr> expr) {
-	exprStack.push(GtOpExpr::create(expr->getFirstOperand(), expr->getSecondOperand()));
+	auto variant = expr->getVariant() == LtEqOpExpr::Variant::SCmp
+		? GtOpExpr::Variant::SCmp : GtOpExpr::Variant::UCmp;
+	exprStack.push(GtOpExpr::create(expr->getFirstOperand(),
+		expr->getSecondOperand(), variant));
 }
 
 void ExpressionNegater::visit(ShPtr<GtEqOpExpr> expr) {
-	exprStack.push(LtOpExpr::create(expr->getFirstOperand(), expr->getSecondOperand()));
+	auto variant = expr->getVariant() == GtEqOpExpr::Variant::SCmp
+		? LtOpExpr::Variant::SCmp : LtOpExpr::Variant::UCmp;
+	exprStack.push(LtOpExpr::create(expr->getFirstOperand(),
+		expr->getSecondOperand(), variant));
 }
 
 void ExpressionNegater::visit(ShPtr<LtOpExpr> expr) {
-	exprStack.push(GtEqOpExpr::create(expr->getFirstOperand(), expr->getSecondOperand()));
+	auto variant = expr->getVariant() == LtOpExpr::Variant::SCmp
+		? GtEqOpExpr::Variant::SCmp : GtEqOpExpr::Variant::UCmp;
+	exprStack.push(GtEqOpExpr::create(expr->getFirstOperand(),
+		expr->getSecondOperand(), variant));
 }
 
 void ExpressionNegater::visit(ShPtr<GtOpExpr> expr) {
-	exprStack.push(LtEqOpExpr::create(expr->getFirstOperand(), expr->getSecondOperand()));
+	auto variant = expr->getVariant() == GtOpExpr::Variant::SCmp
+		? LtEqOpExpr::Variant::SCmp : LtEqOpExpr::Variant::UCmp;
+	exprStack.push(LtEqOpExpr::create(expr->getFirstOperand(),
+		expr->getSecondOperand(), variant));
 }
 
 void ExpressionNegater::visit(ShPtr<AddOpExpr> expr) {

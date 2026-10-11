@@ -660,15 +660,8 @@ void CHLLWriter::visit(ShPtr<NegOpExpr> expr) {
 }
 
 void CHLLWriter::emitBitPatternEquality(const std::string &op, ShPtr<BinaryOpExpr> expr) {
-	auto operandType = [](ShPtr<Expression> operand) {
-		if (auto deref = cast<DerefOpExpr>(operand)) {
-			if (auto pointer = cast<PointerType>(deref->getOperand()->getType()))
-				return cast<IntType>(pointer->getContainedType());
-		}
-		return cast<IntType>(operand->getType());
-	};
-	auto lhs = operandType(expr->getFirstOperand());
-	auto rhs = operandType(expr->getSecondOperand());
+	auto lhs = cast<IntType>(expr->getFirstOperand()->getType());
+	auto rhs = cast<IntType>(expr->getSecondOperand()->getType());
 	if (!lhs || !rhs || lhs->getSize() != rhs->getSize()
 			|| lhs->isSigned() != rhs->isSigned()
 			|| (lhs->getSize() != 8 && lhs->getSize() != 16)) {
@@ -698,18 +691,34 @@ void CHLLWriter::visit(ShPtr<NeqOpExpr> expr) {
 }
 
 void CHLLWriter::visit(ShPtr<LtOpExpr> expr) {
+	if (expr->getVariant() == LtOpExpr::Variant::UCmp
+			&& emitUnsignedIntegerBinary("<", expr)) {
+		return;
+	}
 	emitBinaryOpExpr("<", expr);
 }
 
 void CHLLWriter::visit(ShPtr<GtOpExpr> expr) {
+	if (expr->getVariant() == GtOpExpr::Variant::UCmp
+			&& emitUnsignedIntegerBinary(">", expr)) {
+		return;
+	}
 	emitBinaryOpExpr(">", expr);
 }
 
 void CHLLWriter::visit(ShPtr<LtEqOpExpr> expr) {
+	if (expr->getVariant() == LtEqOpExpr::Variant::UCmp
+			&& emitUnsignedIntegerBinary("<=", expr)) {
+		return;
+	}
 	emitBinaryOpExpr("<=", expr);
 }
 
 void CHLLWriter::visit(ShPtr<GtEqOpExpr> expr) {
+	if (expr->getVariant() == GtEqOpExpr::Variant::UCmp
+			&& emitUnsignedIntegerBinary(">=", expr)) {
+		return;
+	}
 	emitBinaryOpExpr(">=", expr);
 }
 
@@ -787,12 +796,7 @@ bool CHLLWriter::emitUnsignedIntegerBinary(const std::string &op,
 	ShPtr<IntType> types[2];
 	for (unsigned i = 0; i < 2; ++i) {
 		auto operand = i ? expr->getSecondOperand() : expr->getFirstOperand();
-		auto operandType = operand->getType();
-		if (auto deref = cast<DerefOpExpr>(operand)) {
-			if (auto pointer = cast<PointerType>(deref->getOperand()->getType()))
-				operandType = pointer->getContainedType();
-		}
-		types[i] = cast<IntType>(operandType);
+		types[i] = cast<IntType>(operand->getType());
 	}
 	if (!types[0] || !types[1]) {
 		return false;
@@ -848,13 +852,7 @@ void CHLLWriter::visit(ShPtr<BitXorOpExpr> expr) {
 
 void CHLLWriter::visit(ShPtr<BitShlOpExpr> expr) {
 	auto operand = expr->getFirstOperand();
-	auto operandType = operand->getType();
-	if (auto deref = cast<DerefOpExpr>(operand)) {
-		if (auto pointer = cast<PointerType>(deref->getOperand()->getType())) {
-			operandType = pointer->getContainedType();
-		}
-	}
-	auto type = cast<IntType>(operandType);
+	auto type = cast<IntType>(operand->getType());
 	if (!type || (type->getSize() != 8 && type->getSize() != 16
 			&& type->getSize() != 32 && type->getSize() != 64)) {
 		emitBinaryOpExpr("<<", expr);
@@ -885,13 +883,7 @@ void CHLLWriter::visit(ShPtr<BitShlOpExpr> expr) {
 
 void CHLLWriter::visit(ShPtr<BitShrOpExpr> expr) {
 	auto operand = expr->getFirstOperand();
-	auto operandType = operand->getType();
-	if (auto deref = cast<DerefOpExpr>(operand)) {
-		if (auto pointer = cast<PointerType>(deref->getOperand()->getType())) {
-			operandType = pointer->getContainedType();
-		}
-	}
-	auto type = cast<IntType>(operandType);
+	auto type = cast<IntType>(operand->getType());
 	if (!type || (type->getSize() != 8 && type->getSize() != 16
 			&& type->getSize() != 32 && type->getSize() != 64)) {
 		emitBinaryOpExpr(">>", expr);
@@ -944,13 +936,7 @@ void CHLLWriter::visit(ShPtr<ExtCastExpr> expr) {
 		emitOriginalExtraction(*association);
 		return;
 	}
-	auto sourceType = expr->getOperand()->getType();
-	if (auto deref = cast<DerefOpExpr>(expr->getOperand())) {
-		if (auto pointer = cast<PointerType>(deref->getOperand()->getType())) {
-			sourceType = pointer->getContainedType();
-		}
-	}
-	auto source = cast<IntType>(sourceType);
+	auto source = cast<IntType>(expr->getOperand()->getType());
 	if (source && !source->isBool()
 			&& expr->getVariant() != ExtCastExpr::Variant::FPExt) {
 		// LLVM integer types carry no signedness. The extension opcode,

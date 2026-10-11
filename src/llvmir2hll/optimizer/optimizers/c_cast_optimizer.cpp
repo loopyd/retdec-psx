@@ -63,8 +63,10 @@ ShPtr<Expression> CCastOptimizer::checkAndOptimize(ShPtr<Expression> dst,
 			if (ShPtr<IntType> srcType = cast<IntType>(src->getType())) {
 				// Both are signed or unsigned.
 				if (dstType->isSigned() == srcType->isSigned()) {
-					if (cast<IntType>(srcCast->getOperand()->getType()) ||
-							cast<FloatType>(srcCast->getOperand()->getType())) {
+					ShPtr<IntType> operandType = cast<IntType>(
+						srcCast->getOperand()->getType());
+					if (operandType && operandType->isEqualTo(srcType) &&
+							operandType->isSigned() == srcType->isSigned()) {
 						// Cast expression removed.
 						optimized = true;
 						return srcCast->getOperand();

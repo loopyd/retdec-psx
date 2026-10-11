@@ -28,6 +28,7 @@ class DerefOpExpr final: public UnaryOpExpr {
 public:
 	static ShPtr<DerefOpExpr> create(ShPtr<Expression> op);
 
+	virtual ShPtr<Type> getType() const override;
 	virtual bool isEqualTo(ShPtr<Value> otherValue) const override;
 	virtual ShPtr<Value> clone() override;
 
