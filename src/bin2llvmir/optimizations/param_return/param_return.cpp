@@ -1454,6 +1454,23 @@ DataFlowEntry ParamReturn::createDataFlowEntry(Value* calledValue, bool attachOr
 		}
 		dataflow.setReturnDisposition(std::move(disposition));
 	}
+	if (!attachOriginalEvidence && _config->getConfig().parameters.isOriginalOnlyReturnRecovery()) {
+		bool decoded = false;
+		auto* cf = _config->getConfigFunction(dataflow.getFunction());
+		if (cf && cf->returnDisposition && cf->getStart().isDefined() && cf->getEnd().isDefined()) {
+			const auto& evidence = cf->returnDisposition->evidence;
+			decoded = !evidence.instructions.empty() && evidence.instructions.size() <= Disposition::RowLimit
+				&& evidence.symbol == cf->getName() && evidence.start == cf->getStart().getValue()
+				&& evidence.end == cf->getEnd().getValue() && evidence.end >= evidence.start
+				&& evidence.end - evidence.start == 4 * evidence.instructions.size();
+			for (unsigned i = 0; decoded && i < evidence.instructions.size(); ++i) {
+				const auto& instruction = evidence.instructions[i];
+				decoded = instruction.pc == evidence.start + 4 * i && instruction.owner == evidence.symbol
+					&& instruction.bytes == 4 && instruction.mapped && !instruction.undef;
+			}
+		}
+		dataflow.setIsFullyDecoded(decoded);
+	}
     _collector->collectDefArgs(&dataflow);
     _collector->collectDefRets(&dataflow);
     if (!_config->getConfig().parameters.isOriginalOnlyReturnRecovery()) collectExtraData(&dataflow);
