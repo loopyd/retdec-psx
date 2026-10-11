@@ -267,8 +267,13 @@ bool Decoder::run()
 	}
 
 	initConfigFunctions();
-	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery())
+	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery()) {
 		publishOriginalDecodeCoverage();
+		auto* root = _config->getConfigFunction(_config->getConfig().parameters.getEntryPoint());
+		if (root && root->returnDisposition)
+			root->originalCalleeContexts = inspectOriginalMipsCallees(_image,
+				_config->getConfig().parameters, root->returnDisposition->evidence);
+	}
 	if (_config->getConfig().architecture.isMipsOrPic32()) {
 		annotateMipsLeafCalls(_module, _image);
 		simplifyMipsGuards(_module, _abi);

@@ -436,6 +436,37 @@ void serialize(Writer& writer, const common::Function& f)
     bool concreteReturn = !f.returnDisposition || f.returnDisposition->kind == common::ReturnDisposition::Kind::Value;
     if (f.returnDisposition) disposition(writer, *f.returnDisposition);
     if (f.originalCallSummary) summary(writer, *f.originalCallSummary);
+	if (f.originalCalleeContexts) {
+		const auto& contexts = *f.originalCalleeContexts;
+		writer.Key("originalCalleeContexts"); writer.StartObject();
+		writer.Key("rule"); writer.String("mips-same-image-leaf-context/v1");
+		writer.Key("imageId"); writer.String(contexts.imageId);
+		writer.Key("payloadHash"); writer.String(contexts.payloadHash);
+		writer.Key("mappingStart"); writer.Uint(contexts.mappingStart);
+		writer.Key("mappingBytes"); writer.Uint64(contexts.mappingBytes);
+		strings(writer, "conditions", std::vector<std::string>{"this-image-supplies-executed-instructions",
+			"no-pending-entry-gpr-loads", "instruction-fetches-and-loads-complete-normally", "mips-i-load-and-branch-delays"});
+		strings(writer, "remaining", contexts.remaining);
+		writer.Key("candidates"); writer.StartArray();
+		for (const auto& context : contexts.candidates) {
+			writer.StartObject(); writer.Key("entry"); writer.Uint(context.entry);
+			numbers(writer, "callPcs", context.callPcs);
+			writer.Key("localExploration"); writer.String(context.mayWriteGprs ? "closed-normal-paths" : "unresolved");
+			optional(writer, "mayWriteGprs", context.mayWriteGprs);
+			numbers(writer, "normalReturnPcs", context.normalReturnPcs);
+			writer.Key("words"); writer.StartArray();
+			for (const auto& word : context.words) {
+				writer.StartObject(); writer.Key("pc"); writer.Uint(word.first);
+				writer.Key("word"); writer.Uint(word.second); writer.EndObject();
+			}
+			writer.EndArray();
+			strings(writer, "remaining", std::vector<std::string>{"candidate-extent-not-reviewed",
+				"call-execution-and-residency-unresolved", "memory-effects-and-exceptions-unresolved",
+				"result-and-pending-load-transfers-not-analyzed", "callee-declaration-unresolved"});
+			writer.EndObject();
+		}
+		writer.EndArray(); writer.EndObject();
+	}
 	if (f.originalBodyCandidate) {
 		writer.Key("originalBodyCandidate");
 		switch (*f.originalBodyCandidate) {
@@ -542,6 +573,8 @@ void deserialize(const rapidjson::Value& val, common::Function& f)
 	deserialize(val, JSON_returnType, f.returnType);
     f.originalCallSummary.reset();
     if (val.HasMember("originalCallSummary")) throw std::runtime_error("original-call-summary-is-invocation-output-only");
+	f.originalCalleeContexts.reset();
+	if (val.HasMember("originalCalleeContexts")) throw std::runtime_error("original-callee-context-is-invocation-output-only");
 	f.originalBodyCandidate.reset();
 	if (val.HasMember("originalBodyCandidate")) throw std::runtime_error("original-body-candidate-is-invocation-output-only");
 	f.originalSourceExpressions.clear();

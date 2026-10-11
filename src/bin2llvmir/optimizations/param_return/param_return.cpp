@@ -168,6 +168,7 @@ void ParamReturn::invalidatePreviousNativeReturnEvidence() const
 		{
 			const_cast<common::Function&>(cf).returnDisposition.reset();
 			const_cast<common::Function&>(cf).originalCallSummary.reset();
+			const_cast<common::Function&>(cf).originalCalleeContexts.reset();
 			const_cast<common::Function&>(cf).originalBodyCandidate.reset();
 			const_cast<common::Function&>(cf).originalSourceExpressions.clear();
 		}

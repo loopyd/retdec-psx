@@ -38,6 +38,20 @@ struct OriginalCallScope {
 	ReviewedOriginalFunction root;
 	std::vector<ReviewedOriginalFunction> callees;
 };
+struct OriginalCalleeContext {
+	uint32_t entry = 0;
+	std::vector<uint64_t> callPcs;
+	std::map<uint32_t, uint32_t> words;
+	std::vector<uint32_t> normalReturnPcs;
+	std::optional<uint32_t> mayWriteGprs;
+};
+struct OriginalCalleeContexts {
+	std::string imageId, payloadHash;
+	uint32_t mappingStart = 0;
+	uint64_t mappingBytes = 0;
+	std::vector<OriginalCalleeContext> candidates;
+	std::vector<std::string> remaining;
+};
 struct OriginalFact {
 	enum class Kind { Unknown, Partial, Complete };
 	Kind kind = Kind::Unknown;
@@ -385,6 +399,7 @@ class Function : public retdec::common::AddressRange
 		common::Type returnType;
 		std::optional<ReturnDisposition> returnDisposition;
 		std::optional<OriginalFunctionSummary> originalCallSummary;
+		std::optional<OriginalCalleeContexts> originalCalleeContexts;
 		std::optional<OriginalBodyCandidate> originalBodyCandidate;
 		std::vector<OriginalSourceExpression> originalSourceExpressions;
 		std::optional<std::vector<OriginalSourceFormApplication>> originalSourceForms;
