@@ -1174,8 +1174,16 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 				if (operation.kind == MipsOperation::Load || operation.kind == MipsOperation::Store)
 					obligation(pc, "memory", "contents-object-address-alias-effect-placement-unresolved");
 				if ((operation.kind == MipsOperation::Store || operation.kind == MipsOperation::Branch)
-					&& !inputs.bad.empty())
-					obligation(pc, "architectural", "unproved-control-or-effect-input");
+					&& !inputs.bad.empty()) {
+					bool entryInput = revised && !inputs.missing
+						&& std::all_of(inputs.bad.begin(), inputs.bad.end(), [&](const auto& reason) {
+							return std::any_of(inputs.entries.begin(), inputs.entries.end(), [&](unsigned reg) {
+								return (reg == 1 || reg == 3 || (8 <= reg && reg <= 30))
+									&& reason == "unproved-entry-register-" + std::to_string(reg);
+							});
+						});
+					obligation(pc, entryInput ? "entry" : "architectural", "unproved-control-or-effect-input");
+				}
 				auto send = [&](uint64_t target, uint64_t delayOwner, const std::string& kind) {
 					edges.emplace(pc, target, delayOwner, kind);
 					if (edges.size() > Disposition::RowLimit) throw std::runtime_error("return-edges-exhausted");
@@ -1234,6 +1242,8 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 				[](const auto& row) { return row.domain == "architectural"; });
 			evidence.analysisComplete = true;
 			bool value = evidence.decodeComplete && !evidence.exits.empty();
+			value &= std::none_of(evidence.obligations.begin(), evidence.obligations.end(),
+				[](const auto& row) { return row.domain == "entry"; });
 			for (const auto& exit : evidence.exits)
 				value &= !exit.missing && !exit.definitions.empty() && exit.bad.empty();
 			if (revised) {
