@@ -643,8 +643,16 @@ void finishOriginalDeclaration(common::OriginalFunctionSummary& summary)
 bool originalMemoryPrefix(const Disposition::Evidence& evidence,
     const std::map<uint64_t, const Disposition::Instruction*>& instructions,
     const std::multimap<uint64_t, const Disposition::Edge*>& outgoingEdges,
-    const std::multimap<uint64_t, const Disposition::Edge*>& incomingEdges, uint64_t accessPc)
+    const std::multimap<uint64_t, const Disposition::Edge*>& incomingEdges, uint64_t accessPc,
+    const common::OriginalFixedMemoryAddress& constantAddress)
 {
+    std::set<unsigned> protectedRegisters{(instructions.at(accessPc)->word >> 21) & 31};
+    for (auto pc : constantAddress.equalityEvidence) {
+        auto word = instructions.at(pc)->word;
+        protectedRegisters.insert((word >> 16) & 31);
+        if ((word >> 26) != 15) protectedRegisters.insert((word >> 21) & 31);
+    }
+    protectedRegisters.erase(0);
     for (const auto& pair : instructions) {
         const auto& row = *pair.second;
         auto operation = originalOperation(row);
@@ -657,11 +665,12 @@ bool originalMemoryPrefix(const Disposition::Evidence& evidence,
                 || (operation.conditional && entersPrefix(uint32_t(row.pc + 8)))) return false;
         }
         if (row.pc >= accessPc) continue;
-        if (operation.kind == MipsOperation::Load || operation.kind == MipsOperation::Branch
-            || operation.kind == MipsOperation::Return) return false;
-        for (auto destination : operation.destinations)
+        if (operation.kind == MipsOperation::Branch || operation.kind == MipsOperation::Return) return false;
+        for (auto destination : operation.destinations) {
+            if (operation.kind == MipsOperation::Load && protectedRegisters.count(destination)) return false;
             if (destination && std::count(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), destination) != 1)
                 return false;
+        }
         unsigned outgoing = 0;
         auto edges = outgoingEdges.equal_range(row.pc);
         for (auto position = edges.first; position != edges.second; ++position) {
@@ -817,9 +826,9 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
         physical = raw.first && raw.second == payload.size() && std::equal(payload.begin(), payload.end(), raw.first);
     }
     for (auto& access : summary.accesses) {
-        if (!instructions.count(access.pc) || !originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc)) continue;
+        if (!instructions.count(access.pc)) continue;
         auto address = originalMemoryAddress(access, instructions, definitions);
-        if (!address) continue;
+        if (!address || !originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc, *address)) continue;
         uint64_t count = access.width / 8, value = address->value;
         if (physical && address->alignment.isComplete() && value >= load
             && value + count <= (uint64_t(1) << 32) && value - load <= payload.size()
