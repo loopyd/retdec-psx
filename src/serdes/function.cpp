@@ -433,7 +433,9 @@ void serialize(Writer& writer, const common::Function& f)
 	serializeBool(writer, JSON_isVariadic, f.isVariadic(), false);
 	serializeBool(writer, JSON_isThumb, f.isThumb(), false);
 
-    bool concreteReturn = !f.returnDisposition || f.returnDisposition->kind == common::ReturnDisposition::Kind::Value;
+    bool concreteReturn = !f.returnDisposition || f.returnDisposition->kind == common::ReturnDisposition::Kind::Value
+        || (f.originalBodyCandidate
+            && std::holds_alternative<common::OriginalEntryStackWordBody>(*f.originalBodyCandidate));
     if (f.returnDisposition) disposition(writer, *f.returnDisposition);
     if (f.originalCallSummary) summary(writer, *f.originalCallSummary);
 	if (!f.originalJumpTables.empty()) {
