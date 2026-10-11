@@ -1188,14 +1188,28 @@ std::optional<OriginalSnapshotDispatch> sampleOriginalJumpTable(
     }
     if (!compare || !guard || std::count(compare->fullWidthRegisters.begin(), compare->fullWidthRegisters.end(),
         (compare->word >> 16) & 31) != 1 || !instruction(defaultPc)) return {};
+    bool memoryPrefix = false;
+    auto prefixStep = [&](const Disposition::Instruction& row) {
+        if (jumpTablePrefixCompute(row)) return true;
+        auto step = originalOperation(row);
+        if (step.merge || (step.kind != MipsOperation::Load && step.kind != MipsOperation::Store)) return false;
+        for (auto reg : step.destinations)
+            if (reg && (reg >= Disposition::GprCount
+                || std::count(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), reg) != 1)) return false;
+        memoryPrefix = true;
+        return true;
+    };
     std::set<uint64_t> prefix;
     for (uint64_t pc = evidence.start; pc < compare->pc; pc += 4) {
         auto* row = instruction(pc);
-        if (!row || !jumpTablePrefixCompute(*row)) return {};
+        if (!row || !prefixStep(*row)) return {};
+        auto step = originalOperation(*row);
+        if (pc + 4 == compare->pc && step.kind == MipsOperation::Load
+            && std::find(step.destinations.begin(), step.destinations.end(), selector) != step.destinations.end()) return {};
         prefix.insert(pc);
     }
     auto* guardDelay = instruction(guard->pc + 4);
-    if (!guardDelay || !jumpTablePrefixCompute(*guardDelay)) return {};
+    if (!guardDelay || !prefixStep(*guardDelay)) return {};
     for (auto reg : originalOperation(*guardDelay).destinations) if (reg == selector) return {};
     prefix.insert(compare->pc); prefix.insert(guard->pc); prefix.insert(guardDelay->pc);
     for (uint64_t pc = shift->pc; pc <= jumpDelay->pc; pc += 4) prefix.insert(pc);
@@ -1244,6 +1258,7 @@ std::optional<OriginalSnapshotDispatch> sampleOriginalJumpTable(
         "no-pending-entry-gpr-loads", "active-table-binding-matches-this-image",
         "loaded-table-words-equal-file-backed-initial-bytes", "instruction-fetches-and-loads-complete-normally",
         "mips-i-load-and-branch-delays"};
+    if (memoryPrefix) report.conditions.push_back("memory-accesses-complete-normally");
     return OriginalSnapshotDispatch(std::move(report));
 }
 
