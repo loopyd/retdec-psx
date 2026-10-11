@@ -297,7 +297,11 @@ MipsOperation originalOperation(const Disposition::Instruction& instruction)
 			result.kind = rs == 31 ? MipsOperation::Return : MipsOperation::Branch;
 			result.name = rs == 31 ? "jr-ra" : "jr"; result.inputs = {rs};
 		}
-		else if (fn == 9) { result.kind = MipsOperation::Call; result.name = "jalr"; result.inputs = {rs}; }
+		else if (fn == 9) {
+			result.kind = MipsOperation::Call; result.name = "jalr"; result.inputs = {rs};
+			if (rt == 0 && ((word >> 6) & 31) == 0 && rd == 31 && rs != rd)
+				result.destinations = {31};
+		}
 		else if (fn == 0 || fn == 2 || fn == 3) {
 			result.kind = MipsOperation::Compute; result.destinations = {rd};
 			result.inputs = {rt}; result.name = "shift-immediate";
@@ -572,7 +576,8 @@ void establishIdentity(RegisterFact& output, const RegisterState& state,
         output.possibleOneBits = state[reg].possibleOnes();
         output.equalityEvidence = state[reg].equalityEvidence; output.equalityEvidence.insert(row.pc);
     };
-    if (op == 3 && destination == 31) output.constant = uint32_t(row.pc + 8);
+    if (destination == 31 && (op == 3 || (op == 0 && fn == 9)))
+        output.constant = uint32_t(row.pc + 8);
     else if (op == 15) output.constant = (row.word & 0xffff) << 16;
     else if (op == 0 && (fn == 0 || fn == 2 || fn == 3) && shift == 0) copy(rt);
     else if (op == 0 && (fn == 33 || fn == 37 || fn == 38) && state[rt].constant == std::optional<uint32_t>{0}) copy(rs);
@@ -1780,6 +1785,9 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                             append(access.valueEntries, state[operation.inputs[1]].entries);
                         }
                     }
+                }
+                if (operation.kind == MipsOperation::Call && !operation.destinations.empty()) {
+                    inputs = RegisterFact{}; inputs.missing = false;
                 }
                 auto identityState = state;
                 auto immediateDestination = operation.kind != MipsOperation::Load && operation.destinations.size() == 1
