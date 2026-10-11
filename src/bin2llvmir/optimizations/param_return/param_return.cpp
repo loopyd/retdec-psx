@@ -234,104 +234,6 @@ bool canProposeEmptyBody(const common::Function& function)
 	return true;
 }
 
-bool canProposeOrdinaryBody(const common::Function& function)
-{
-	if (!function.returnDisposition || !function.originalCallSummary || !function.parameters.empty()) return false;
-	const auto& disposition = *function.returnDisposition;
-	const auto& evidence = disposition.evidence;
-	const auto& summary = *function.originalCallSummary;
-	const auto& rows = evidence.instructions;
-	if (disposition.kind != Disposition::Kind::Unknown || evidence.selection != "selected-root"
-		|| !evidence.analysisComplete || summary.result.isComplete() || summary.declaration.isComplete()
-		|| rows.size() < 2 || rows.size() > Disposition::RowLimit
-		|| evidence.end != evidence.start + 4 * rows.size() || evidence.edges.size() != rows.size() - 1
-		|| evidence.exits.size() != 1 || rows[rows.size() - 2].word != 0x03e00008) return false;
-	const int frame = rows.front().word >> 16 == 0x27bd ? -int(int16_t(rows.front().word)) : 0;
-	const bool slotRestore = frame && rows.back().word == (0x27bd0000u | unsigned(frame));
-	const bool earlyRestore = frame && rows.size() >= 3 && rows.back().word == 0
-		&& rows[rows.size() - 3].word == (0x27bd0000u | unsigned(frame));
-	if (frame && (frame < 8 || frame > 32767 || frame % 8 || (!slotRestore && !earlyRestore))) return false;
-	std::optional<int> savedLink;
-	unsigned savedCount = 0, loadedCount = 0, callIndex = 0;
-	std::optional<unsigned> pendingLoad;
-	for (unsigned i = 0; i < rows.size(); ++i) {
-		const auto& row = rows[i];
-		unsigned op = row.word >> 26, rs = (row.word >> 21) & 31, rt = (row.word >> 16) & 31;
-		bool call = op == 3, terminal = row.word == 0x03e00008;
-		bool load = op == 35 || op == 36, store = op == 40 || op == 41 || op == 43;
-		bool writesRegister = op == 9 || op == 15 || load;
-		if (row.pc != evidence.start + 4 * i || row.owner != evidence.symbol || row.bytes != 4
-			|| !row.mapped || row.undef || (row.word && !writesRegister && !store && !call && !terminal)
-			|| (op == 15 && rs) || (terminal && i != rows.size() - 2)
-			|| (i && (rows[i - 1].word >> 26 == 3 || rows[i - 1].word == 0x03e00008)
-				&& (call || terminal || (load && rt)))) return false;
-		std::set<unsigned> reads;
-		if (op == 9 || load || store) reads.insert(rs);
-		if (store) reads.insert(rt);
-		if (terminal) reads.insert(31);
-		if (pendingLoad && reads.count(*pendingLoad)) return false;
-		pendingLoad = load && rt ? std::optional<unsigned>(rt) : std::nullopt;
-		if (writesRegister && rt
-			&& std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), rt) == row.fullWidthRegisters.end()) return false;
-		if (call && std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), 31) == row.fullWidthRegisters.end()) return false;
-		bool stackAdjustment = frame && op == 9 && rs == 29 && rt == 29
-			&& (i == 0 || (slotRestore && i == rows.size() - 1) || (earlyRestore && i == rows.size() - 3));
-		bool linkAccess = frame && rs == 29 && rt == 31 && (op == 35 || op == 43);
-		if (linkAccess) {
-			int offset = int16_t(row.word);
-			if (offset < 0 || offset % 4 || offset + 4 > frame) return false;
-			if (op == 43) {
-				if (i != 1 || savedCount++) return false;
-				savedLink = offset;
-			} else if (!savedLink || *savedLink != offset || loadedCount++ || i >= rows.size() - 2) return false;
-		}
-		if (!stackAdjustment && !linkAccess
-			&& (reads.count(29) || (writesRegister && rt == 29)
-				|| (!terminal && reads.count(31)) || (writesRegister && rt == 31))) return false;
-		if (call) {
-			if (loadedCount || i + 2 >= rows.size() || callIndex >= evidence.calls.size()) return false;
-			const auto& observed = evidence.calls[callIndex++];
-			uint64_t target = ((row.pc + 4) & 0xf0000000u) | ((row.word & 0x03ffffffu) << 2);
-			if (observed.pc != row.pc || observed.target != target) return false;
-		}
-		if (i + 1 < rows.size()) {
-			const auto& edge = evidence.edges[i];
-			bool continuation = i && rows[i - 1].word >> 26 == 3;
-			if (edge.from != row.pc || edge.to != row.pc + 4
-				|| edge.delayOwner != ((call || terminal) ? std::optional<uint64_t>(row.pc) : std::nullopt)
-				|| edge.kind != ((call || terminal) ? "delay-slot" : continuation ? "call-continuation" : "fallthrough")) return false;
-		}
-	}
-	if (callIndex != evidence.calls.size() || (frame && (savedCount != 1 || loadedCount != 1)) || (callIndex && !frame)) return false;
-	const auto& exit = evidence.exits.front();
-	if (exit.pc != evidence.end - 8 || exit.delaySlot != evidence.end - 4 || exit.missing
-		|| exit.definitions.empty() || !exit.formals.empty() || !exit.pendingDefinitions.empty() || !exit.bad.empty()) return false;
-	std::map<unsigned, const Disposition::Definition*> definitions;
-	for (const auto& definition : evidence.definitions)
-		if (!definitions.emplace(definition.id, &definition).second) return false;
-	std::vector<unsigned> pending = exit.definitions;
-	std::set<unsigned> visited;
-	for (auto id : exit.definitions)
-		if (!definitions.count(id) || definitions.at(id)->reg != 2) return false;
-	while (!pending.empty()) {
-		auto id = pending.back(); pending.pop_back();
-		if (!visited.insert(id).second) continue;
-		auto found = definitions.find(id);
-		if (found == definitions.end()) return false;
-		const auto& definition = *found->second;
-		if (definition.width != 32 || definition.origin != "instruction" || !definition.bad.empty()
-			|| !definition.entries.empty() || !definition.formals.empty()
-			|| definition.pc < evidence.start || definition.pc >= evidence.end || (definition.pc - evidence.start) % 4) return false;
-		const auto& instruction = rows[(definition.pc - evidence.start) / 4];
-		if (std::find(instruction.fullWidthRegisters.begin(), instruction.fullWidthRegisters.end(), definition.reg) == instruction.fullWidthRegisters.end()) return false;
-		for (auto input : definition.inputs) {
-			if (input >= id) return false;
-			pending.push_back(input);
-		}
-	}
-	return true;
-}
-
 struct RegisterFact {
 	bool missing = true;
 	std::set<unsigned> definitions, formals, entries;
@@ -445,6 +347,130 @@ MipsOperation originalOperation(const Disposition::Instruction& instruction)
 		result.inputs = {rs, rt};
 	}
 	return result;
+}
+
+bool ordinaryBodyLayout(const Disposition::Evidence& evidence)
+{
+	const auto& rows = evidence.instructions;
+	if (rows.size() < 2 || rows.size() > Disposition::RowLimit
+		|| evidence.end != evidence.start + 4 * rows.size()
+		|| rows[rows.size() - 2].word != 0x03e00008) return false;
+	const int frame = rows.front().word >> 16 == 0x27bd ? -int(int16_t(rows.front().word)) : 0;
+	const bool slotRestore = frame && rows.back().word == (0x27bd0000u | unsigned(frame));
+	const bool earlyRestore = frame && rows.size() >= 3 && rows.back().word == 0
+		&& rows[rows.size() - 3].word == (0x27bd0000u | unsigned(frame));
+	if (frame && (frame < 8 || frame > 32767 || frame % 8 || (!slotRestore && !earlyRestore))) return false;
+	std::optional<unsigned> lastCall;
+	for (unsigned i = 0; i < rows.size(); ++i)
+		if (rows[i].word >> 26 == 3) lastCall = i;
+	std::optional<int> savedLink;
+	unsigned savedCount = 0, loadedCount = 0, callIndex = 0, branchCount = 0;
+	std::optional<unsigned> pendingLoad;
+	std::vector<Disposition::Edge> edges;
+	MipsOperation previous;
+	for (unsigned i = 0; i < rows.size(); ++i) {
+		const auto& row = rows[i];
+		const auto operation = originalOperation(row);
+		unsigned op = row.word >> 26, rs = (row.word >> 21) & 31, rt = (row.word >> 16) & 31;
+		bool call = op == 3, terminal = row.word == 0x03e00008, branch = op == 4 || op == 5;
+		bool load = op == 32 || op == 35 || op == 36, store = op == 40 || op == 41 || op == 43;
+		bool writesRegister = op == 9 || op == 15 || load;
+		if (row.pc != evidence.start + 4 * i || row.owner != evidence.symbol || row.bytes != 4
+			|| !row.mapped || row.undef || (row.word && !writesRegister && !store && !call && !terminal && !branch)
+			|| (op == 15 && rs) || (terminal && i != rows.size() - 2)
+			|| (op == 32 && (!lastCall || i <= *lastCall))
+			|| ((previous.kind == MipsOperation::Call || previous.kind == MipsOperation::Return
+				|| previous.kind == MipsOperation::Branch) && (call || terminal || branch || (load && rt)))) return false;
+		if (branch && (branchCount++ || !frame || savedCount != 1 || loadedCount
+			|| (lastCall && i <= *lastCall) || i + 3 >= rows.size()
+			|| operation.target != row.pc + 12 || rows[i + 1].word >> 16 != 0x2402
+			|| rows[i + 2].word >> 16 != 0x2402)) return false;
+		std::set<unsigned> reads(operation.inputs.begin(), operation.inputs.end());
+		if (pendingLoad && reads.count(*pendingLoad)) return false;
+		pendingLoad = load && rt ? std::optional<unsigned>(rt) : std::nullopt;
+		for (auto destination : operation.destinations)
+			if (destination && std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), destination)
+				== row.fullWidthRegisters.end()) return false;
+		bool stackAdjustment = frame && op == 9 && rs == 29 && rt == 29
+			&& (i == 0 || (slotRestore && i == rows.size() - 1) || (earlyRestore && i == rows.size() - 3));
+		bool linkAccess = frame && rs == 29 && rt == 31 && (op == 35 || op == 43);
+		if (linkAccess) {
+			int offset = int16_t(row.word);
+			if (offset < 0 || offset % 4 || offset + 4 > frame) return false;
+			if (op == 43) {
+				if (callIndex || loadedCount || savedCount++) return false;
+				savedLink = offset;
+			} else if (!savedLink || *savedLink != offset || loadedCount++ || i >= rows.size() - 2) return false;
+		}
+		if (!stackAdjustment && !linkAccess
+			&& (reads.count(29) || (writesRegister && rt == 29)
+				|| (!terminal && reads.count(31)) || (writesRegister && rt == 31))) return false;
+		if (call) {
+			if (loadedCount || i + 2 >= rows.size() || callIndex >= evidence.calls.size()) return false;
+			const auto& observed = evidence.calls[callIndex++];
+			if (observed.pc != row.pc || observed.target != operation.target) return false;
+		}
+		if (i + 1 < rows.size()) {
+			if (previous.kind == MipsOperation::Branch) {
+				edges.push_back({row.pc, row.pc + 4, std::nullopt, "fallthrough"});
+				edges.push_back({row.pc, *previous.target, std::nullopt, "branch"});
+			} else {
+				edges.push_back({row.pc, row.pc + 4,
+					(call || terminal || branch) ? std::optional<uint64_t>(row.pc) : std::nullopt,
+					(call || terminal || branch) ? "delay-slot"
+						: previous.kind == MipsOperation::Call ? "call-continuation" : "fallthrough"});
+			}
+		}
+		previous = operation;
+	}
+	if (callIndex != evidence.calls.size() || (frame && (savedCount != 1 || loadedCount != 1))
+		|| (callIndex && !frame) || evidence.edges.size() != edges.size()) return false;
+	for (unsigned i = 0; i < edges.size(); ++i) {
+		const auto& expected = edges[i];
+		const auto& observed = evidence.edges[i];
+		if (observed.from != expected.from || observed.to != expected.to
+			|| observed.delayOwner != expected.delayOwner || observed.kind != expected.kind) return false;
+	}
+	return true;
+}
+
+bool canProposeOrdinaryBody(const common::Function& function)
+{
+	if (!function.returnDisposition || !function.originalCallSummary || !function.parameters.empty()) return false;
+	const auto& disposition = *function.returnDisposition;
+	const auto& evidence = disposition.evidence;
+	const auto& summary = *function.originalCallSummary;
+	const auto& rows = evidence.instructions;
+	if (disposition.kind != Disposition::Kind::Unknown || evidence.selection != "selected-root"
+		|| !evidence.analysisComplete || summary.result.isComplete() || summary.declaration.isComplete()
+		|| evidence.exits.size() != 1 || !ordinaryBodyLayout(evidence)) return false;
+	const auto& exit = evidence.exits.front();
+	if (exit.pc != evidence.end - 8 || exit.delaySlot != evidence.end - 4 || exit.missing
+		|| exit.definitions.empty() || !exit.formals.empty() || !exit.pendingDefinitions.empty() || !exit.bad.empty()) return false;
+	std::map<unsigned, const Disposition::Definition*> definitions;
+	for (const auto& definition : evidence.definitions)
+		if (!definitions.emplace(definition.id, &definition).second) return false;
+	std::vector<unsigned> pending = exit.definitions;
+	std::set<unsigned> visited;
+	for (auto id : exit.definitions)
+		if (!definitions.count(id) || definitions.at(id)->reg != 2) return false;
+	while (!pending.empty()) {
+		auto id = pending.back(); pending.pop_back();
+		if (!visited.insert(id).second) continue;
+		auto found = definitions.find(id);
+		if (found == definitions.end()) return false;
+		const auto& definition = *found->second;
+		if (definition.width != 32 || definition.origin != "instruction" || !definition.bad.empty()
+			|| !definition.entries.empty() || !definition.formals.empty()
+			|| definition.pc < evidence.start || definition.pc >= evidence.end || (definition.pc - evidence.start) % 4) return false;
+		const auto& instruction = rows[(definition.pc - evidence.start) / 4];
+		if (std::find(instruction.fullWidthRegisters.begin(), instruction.fullWidthRegisters.end(), definition.reg) == instruction.fullWidthRegisters.end()) return false;
+		for (auto input : definition.inputs) {
+			if (input >= id) return false;
+			pending.push_back(input);
+		}
+	}
+	return true;
 }
 
 std::optional<uint32_t> retainedLoadMask(const MipsOperation& operation,
