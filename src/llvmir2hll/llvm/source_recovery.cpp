@@ -461,6 +461,126 @@ void recover(llvm::Function& function, common::Function& source,
 }
 }
 
+void restoreSignedNarrowLoadEqualities(llvm::Function& function, const common::Function& source) {
+	if (source.getName() != function.getName().str() || !source.returnDisposition
+			|| !source.originalCallSummary || !source.getStart().isDefined()
+			|| !source.getEnd().isDefined()) return;
+	const auto& evidence = source.returnDisposition->evidence;
+	const auto& summary = *source.originalCallSummary;
+	if (evidence.symbol != source.getName() || summary.function.empty()
+			|| !evidence.decodeComplete || !evidence.analysisComplete
+			|| evidence.start != source.getStart().getValue()
+			|| evidence.end != source.getEnd().getValue() || evidence.start >= evidence.end
+			|| evidence.end > uint64_t(UINT32_MAX) + 1 || evidence.start % 4 || evidence.end % 4) return;
+	struct SignedLoadEquality {
+		llvm::ICmpInst* comparison;
+		llvm::LoadInst* load;
+		llvm::ConstantInt* constant;
+		unsigned loadOperand;
+	};
+	std::vector<SignedLoadEquality> matches;
+	auto cleanDefinition = [](const auto& row) {
+		return row.width == 32 && row.origin == "instruction" && row.bad.empty()
+			&& row.entries.empty() && row.formals.empty() && !row.equalEntry
+			&& row.callee.empty() && !row.available && !row.delay
+			&& row.calleeDefinitions.empty() && row.substitutedEntries.empty();
+	};
+	for (auto& block : function) for (auto& instruction : block) {
+		auto* comparison = llvm::dyn_cast<llvm::ICmpInst>(&instruction);
+		if (!comparison || (comparison->getPredicate() != llvm::CmpInst::ICMP_EQ
+				&& comparison->getPredicate() != llvm::CmpInst::ICMP_NE)) continue;
+		llvm::LoadInst* load = nullptr;
+		llvm::ConstantInt* constant = nullptr;
+		unsigned loadOperand = 0;
+		for (; loadOperand < 2; ++loadOperand) {
+			load = llvm::dyn_cast<llvm::LoadInst>(comparison->getOperand(loadOperand));
+			constant = llvm::dyn_cast<llvm::ConstantInt>(comparison->getOperand(1 - loadOperand));
+			if (load && constant) break;
+		}
+		if (loadOperand == 2 || (!load->getType()->isIntegerTy(8) && !load->getType()->isIntegerTy(16))
+				|| constant->getType() != load->getType() || constant->getValue().isNegative()
+				|| constant->getValue().getActiveBits() >= load->getType()->getIntegerBitWidth()
+				|| !load->hasOneUse() || load->getParent() != &block || load->isVolatile()
+				|| load->isAtomic() || load->getPointerOperand()->getType()->getPointerAddressSpace()) continue;
+		bool precedes = false;
+		for (auto& prior : block) {
+			if (&prior == comparison) break;
+			if (&prior == load) { precedes = true; break; }
+		}
+		if (!precedes) continue;
+		const auto* row = original_expression::unique(evidence.instructions, [&](const auto& candidate) {
+			return original_expression::hasPc(*load, candidate.pc);
+		});
+		unsigned width = load->getType()->getIntegerBitWidth();
+		if (!row || row->owner != evidence.symbol || row->bytes != 4 || !row->mapped || row->undef
+				|| row->pc < evidence.start || row->pc >= evidence.end || row->pc % 4
+				|| row->word >> 26 != (width == 8 ? 32u : 33u)) continue;
+		unsigned survivingLoads = 0;
+		for (auto& candidateBlock : function) for (auto& candidate : candidateBlock)
+			if (llvm::isa<llvm::LoadInst>(candidate) && original_expression::hasPc(candidate, row->pc)) ++survivingLoads;
+		unsigned destination = (row->word >> 16) & 31, baseRegister = (row->word >> 21) & 31;
+		if (survivingLoads != 1 || !destination || !baseRegister
+				|| std::count(row->fullWidthRegisters.begin(), row->fullWidthRegisters.end(), destination) != 1) continue;
+		const auto* definition = original_expression::unique(evidence.definitions,
+			[&](const auto& candidate) { return candidate.pc == row->pc; });
+		const auto* access = original_expression::unique(summary.accesses,
+			[&](const auto& candidate) { return candidate.pc == row->pc; });
+		if (!definition || !cleanDefinition(*definition) || definition->reg != destination
+				|| definition->operation != "full-register-load" || !definition->delayed
+				|| definition->constant || !definition->equalityEvidence.empty()
+				|| original_expression::unique(evidence.definitions, [&](const auto& candidate) {
+					return candidate.id == definition->id;
+				}) != definition || !access || access->kind != "read" || access->extension != "sign"
+				|| access->width != width || !access->delayed || !access->addressEntries.empty()
+				|| !access->valueDefinitions.empty() || !access->valueEntries.empty()
+				|| access->addressDefinitions.size() != 1 || definition->inputs != access->addressDefinitions) continue;
+		const auto* base = original_expression::unique(evidence.definitions, [&](const auto& candidate) {
+			return candidate.id == access->addressDefinitions.front();
+		});
+		if (!base || !cleanDefinition(*base) || base->reg != baseRegister || base->operation != "lui"
+				|| base->delayed || !base->inputs.empty() || !base->constant
+				|| base->pc < evidence.start || base->pc >= row->pc || row->pc - base->pc != 4
+				|| base->equalityEvidence != std::vector<uint64_t>{base->pc}
+				|| original_expression::unique(evidence.definitions, [&](const auto& candidate) {
+					return candidate.pc == base->pc;
+				}) != base) continue;
+		const auto* lui = original_expression::unique(evidence.instructions,
+			[&](const auto& candidate) { return candidate.pc == base->pc; });
+		if (!lui || lui->owner != evidence.symbol || lui->bytes != 4 || !lui->mapped || lui->undef
+				|| lui->word >> 26 != 15 || ((lui->word >> 21) & 31)
+				|| ((lui->word >> 16) & 31) != baseRegister
+				|| std::count(lui->fullWidthRegisters.begin(), lui->fullWidthRegisters.end(), baseRegister) != 1
+				|| *base->constant != (lui->word & 0xffff) << 16) continue;
+		const auto* outgoing = original_expression::unique(evidence.edges,
+			[&](const auto& candidate) { return candidate.from == lui->pc; });
+		const auto* incoming = original_expression::unique(evidence.edges,
+			[&](const auto& candidate) { return candidate.to == row->pc; });
+		if (!outgoing || incoming != outgoing || outgoing->to != row->pc
+				|| outgoing->delayOwner || outgoing->kind != "fallthrough") continue;
+		auto* pointer = llvm::dyn_cast<llvm::Operator>(load->getPointerOperand());
+		auto* address = pointer && pointer->getOpcode() == llvm::Instruction::IntToPtr
+			? llvm::dyn_cast<llvm::ConstantInt>(pointer->getOperand(0)) : nullptr;
+		uint32_t expectedAddress = *base->constant + uint32_t(int32_t(int16_t(row->word & 0xffff)));
+		if (!address || !address->getType()->isIntegerTy(32) || address->getZExtValue() != expectedAddress) continue;
+		matches.push_back({comparison, load, constant, loadOperand});
+	}
+	for (const auto& match : matches) {
+		auto* type = llvm::Type::getInt32Ty(function.getContext());
+		auto* extend = new llvm::SExtInst(match.load, type, "", match.comparison);
+		extend->setMetadata("insn.addr", match.load->getMetadata("insn.addr"));
+		extend->setDebugLoc(match.load->getDebugLoc());
+		auto* constant = llvm::ConstantInt::get(type, match.constant->getZExtValue());
+		auto* comparison = new llvm::ICmpInst(match.comparison, match.comparison->getPredicate(),
+			match.loadOperand ? static_cast<llvm::Value*>(constant) : extend,
+			match.loadOperand ? static_cast<llvm::Value*>(extend) : constant);
+		comparison->copyMetadata(*match.comparison);
+		comparison->setDebugLoc(match.comparison->getDebugLoc());
+		comparison->takeName(match.comparison);
+		match.comparison->replaceAllUsesWith(comparison);
+		match.comparison->eraseFromParent();
+	}
+}
+
 bool fixedStackOffset(llvm::Value *value, llvm::AllocaInst *frame,
 		const llvm::DataLayout &layout, int64_t &offset) {
 	if (value == frame) { offset = 0; return true; }
@@ -804,9 +924,23 @@ void recoverPointerExpressions(llvm::Module &module, config::Config &config) {
 	if (config.parameters.isOriginalOnlyReturnRecovery()) {
 		for (auto& function : module) {
 			if (config.architecture.isMipsOrPic32()) recoverUnsignedReciprocalSinks(function);
-			if (auto* source = config.functions.getFunctionByName(function.getName().str()))
+			if (auto* source = config.functions.getFunctionByName(function.getName().str())) {
 				original_expression::recover(function, const_cast<common::Function&>(*source),
 					config.parameters.getOriginalSourceForm());
+				const auto& scope = config.parameters.getOriginalCallScope();
+				if (config.architecture.isMipsOrPic32() && scope
+						&& source->returnDisposition && source->originalCallSummary) {
+					const auto& evidence = source->returnDisposition->evidence;
+					unsigned identities = 0;
+					auto matchIdentity = [&](const common::ReviewedOriginalFunction& row) {
+						identities += row.start == evidence.start && row.end == evidence.end
+							&& row.key == source->originalCallSummary->function;
+					};
+					matchIdentity(scope->root);
+					for (const auto& row : scope->callees) matchIdentity(row);
+					if (identities == 1) restoreSignedNarrowLoadEqualities(function, *source);
+				}
+			}
 		}
 		return;
 	}
