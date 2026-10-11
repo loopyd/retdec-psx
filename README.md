@@ -79,6 +79,12 @@ bytes, calling contracts, associated data or placement. Unsupported instruction,
 control or memory facts remain explicit obligations. Inferred machine values
 alone do not establish source C declarations.
 
+Original-only recovery can emit conditional C89 body proposals for supported
+straight-line code with direct calls. It retains unresolved return, call, memory
+and declaration facts. This path rejects indirect and exceptional control,
+incomplete lowering and escaping stack use. Proposed signatures describe emitted
+syntax and grant no original declaration authority.
+
 Keep private original images, authored evaluator references and byte-bearing
 captures local. Original-only generation withholds authored answers, names, maps
 and source-specific compiler profiles.

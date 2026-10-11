@@ -428,9 +428,12 @@ void serialize(Writer& writer, const common::Function& f)
     if (f.returnDisposition) disposition(writer, *f.returnDisposition);
     if (f.originalCallSummary) summary(writer, *f.originalCallSummary);
 	if (f.originalBodyCandidate) {
-		if (*f.originalBodyCandidate != common::OriginalBodyCandidate::EmptyVoid)
-			throw std::runtime_error("invalid-original-body-candidate");
-		writer.Key("originalBodyCandidate"); writer.String("mips-empty-body/v1");
+		writer.Key("originalBodyCandidate");
+		switch (*f.originalBodyCandidate) {
+			case common::OriginalBodyCandidate::EmptyVoid: writer.String("mips-empty-body/v1"); break;
+			case common::OriginalBodyCandidate::OrdinaryC: writer.String("mips-ordinary-body/v1"); break;
+			default: throw std::runtime_error("invalid-original-body-candidate");
+		}
 	}
 	if (!f.originalSourceExpressions.empty()) {
 		writer.Key("originalSourceExpressions"); writer.StartArray();

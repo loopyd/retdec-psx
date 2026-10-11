@@ -55,6 +55,7 @@ class ParamReturn : public llvm::ModulePass
 		void qualifyOriginalFunction(DataFlowEntry&, OriginalContractGraph&);
 		void retainSelectedDefinitionOnly();
 		void projectOriginalParameters();
+		void projectOriginalBody();
 		void publishReturnDispositions() const;
 		void requireSelectedContracts() const;
 		void invalidatePreviousNativeReturnEvidence() const;
@@ -66,9 +67,9 @@ class ParamReturn : public llvm::ModulePass
 	// Collection of functions.
 	//
 	private:
-		void collectAllCalls();
+		void collectAllCalls(bool attachOriginalEvidence = true);
 
-		DataFlowEntry createDataFlowEntry(llvm::Value* calledValue) const;
+		DataFlowEntry createDataFlowEntry(llvm::Value* calledValue, bool attachOriginalEvidence = true) const;
 
 	private:
 		void collectExtraData(DataFlowEntry* de) const;

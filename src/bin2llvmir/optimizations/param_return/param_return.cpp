@@ -106,22 +106,30 @@ bool ParamReturn::run()
 	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery())
 	{
 		validateStrictProfile();
+		bool syntaxOnly = false;
 		try {
 			_RDA.runOnModule(*_module, _abi);
 			collectAllCalls();
 			qualifyReturns();
 			publishReturnDispositions();
 			requireSelectedContracts();
-			filterCalls();
-			projectOriginalParameters();
-			applyToIr();
+			auto* selected = _config->getConfigFunction(_config->getConfig().parameters.getEntryPoint());
+			syntaxOnly = selected && selected->originalBodyCandidate == common::OriginalBodyCandidate::OrdinaryC;
+			if (syntaxOnly) projectOriginalBody();
+			else {
+				filterCalls();
+				projectOriginalParameters();
+				applyToIr();
+			}
 			retainSelectedDefinitionOnly();
 		} catch (...) {
-			for (const auto& function : _config->getConfig().functions)
-				if (function.originalCallSummary)
-					for (auto& access : const_cast<common::Function&>(function).originalCallSummary->accesses)
-						access.address = common::OriginalFact::partial("native-analysis-failed");
-			publishReturnDispositions();
+			if (!syntaxOnly) {
+				for (const auto& function : _config->getConfig().functions)
+					if (function.originalCallSummary)
+						for (auto& access : const_cast<common::Function&>(function).originalCallSummary->accesses)
+							access.address = common::OriginalFact::partial("native-analysis-failed");
+				publishReturnDispositions();
+			}
 			_RDA.clear();
 			throw;
 		}
@@ -222,6 +230,98 @@ bool canProposeEmptyBody(const common::Function& function)
 		const auto& transfer = summary.transfers[reg];
 		if (transfer.reg != reg || transfer.kind != "preserved" || !transfer.proof.isComplete()
 			|| transfer.pending || !transfer.pendingDefinitions.empty()) return false;
+	}
+	return true;
+}
+
+bool canProposeOrdinaryBody(const common::Function& function)
+{
+	if (!function.returnDisposition || !function.originalCallSummary || !function.parameters.empty()) return false;
+	const auto& disposition = *function.returnDisposition;
+	const auto& evidence = disposition.evidence;
+	const auto& summary = *function.originalCallSummary;
+	const auto& rows = evidence.instructions;
+	if (disposition.kind != Disposition::Kind::Unknown || evidence.selection != "selected-root"
+		|| !evidence.analysisComplete || summary.result.isComplete() || summary.declaration.isComplete()
+		|| rows.size() < 2 || rows.size() > Disposition::RowLimit
+		|| evidence.end != evidence.start + 4 * rows.size() || evidence.edges.size() != rows.size() - 1
+		|| evidence.exits.size() != 1 || rows[rows.size() - 2].word != 0x03e00008) return false;
+	const int frame = rows.front().word >> 16 == 0x27bd ? -int(int16_t(rows.front().word)) : 0;
+	if (frame && (frame < 8 || frame > 32767 || frame % 8 || rows.back().word != (0x27bd0000u | unsigned(frame)))) return false;
+	std::optional<int> savedLink;
+	unsigned savedCount = 0, loadedCount = 0, callIndex = 0;
+	std::optional<unsigned> pendingLoad;
+	for (unsigned i = 0; i < rows.size(); ++i) {
+		const auto& row = rows[i];
+		unsigned op = row.word >> 26, rs = (row.word >> 21) & 31, rt = (row.word >> 16) & 31;
+		bool call = op == 3, terminal = row.word == 0x03e00008;
+		if (row.pc != evidence.start + 4 * i || row.owner != evidence.symbol || row.bytes != 4
+			|| !row.mapped || row.undef || (row.word && op != 9 && op != 15 && op != 35 && op != 43 && !call && !terminal)
+			|| (op == 15 && rs) || (terminal && i != rows.size() - 2)
+			|| (i && (rows[i - 1].word >> 26 == 3 || rows[i - 1].word == 0x03e00008)
+				&& (call || terminal || (op == 35 && rt)))) return false;
+		std::set<unsigned> reads;
+		if (op == 9 || op == 35 || op == 43) reads.insert(rs);
+		if (op == 43) reads.insert(rt);
+		if (terminal) reads.insert(31);
+		if (pendingLoad && reads.count(*pendingLoad)) return false;
+		pendingLoad = op == 35 && rt ? std::optional<unsigned>(rt) : std::nullopt;
+		if ((op == 9 || op == 15 || op == 35) && rt
+			&& std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), rt) == row.fullWidthRegisters.end()) return false;
+		if (call && std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), 31) == row.fullWidthRegisters.end()) return false;
+		bool stackAdjustment = frame && (i == 0 || i == rows.size() - 1) && op == 9 && rs == 29 && rt == 29;
+		bool linkAccess = frame && rs == 29 && rt == 31 && (op == 35 || op == 43);
+		if (linkAccess) {
+			int offset = int16_t(row.word);
+			if (offset < 0 || offset % 4 || offset + 4 > frame) return false;
+			if (op == 43) {
+				if (i != 1 || savedCount++) return false;
+				savedLink = offset;
+			} else if (!savedLink || *savedLink != offset || loadedCount++ || i >= rows.size() - 2) return false;
+		}
+		if (!stackAdjustment && !linkAccess
+			&& (reads.count(29) || (op != 43 && (op == 9 || op == 15 || op == 35) && rt == 29)
+				|| (!terminal && reads.count(31)) || ((op == 9 || op == 15 || op == 35) && rt == 31))) return false;
+		if (call) {
+			if (loadedCount || i + 2 >= rows.size() || callIndex >= evidence.calls.size()) return false;
+			const auto& observed = evidence.calls[callIndex++];
+			uint64_t target = ((row.pc + 4) & 0xf0000000u) | ((row.word & 0x03ffffffu) << 2);
+			if (observed.pc != row.pc || observed.target != target) return false;
+		}
+		if (i + 1 < rows.size()) {
+			const auto& edge = evidence.edges[i];
+			bool continuation = i && rows[i - 1].word >> 26 == 3;
+			if (edge.from != row.pc || edge.to != row.pc + 4
+				|| edge.delayOwner != ((call || terminal) ? std::optional<uint64_t>(row.pc) : std::nullopt)
+				|| edge.kind != ((call || terminal) ? "delay-slot" : continuation ? "call-continuation" : "fallthrough")) return false;
+		}
+	}
+	if (callIndex != evidence.calls.size() || (frame && (savedCount != 1 || loadedCount != 1)) || (callIndex && !frame)) return false;
+	const auto& exit = evidence.exits.front();
+	if (exit.pc != evidence.end - 8 || exit.delaySlot != evidence.end - 4 || exit.missing
+		|| exit.definitions.empty() || !exit.formals.empty() || !exit.pendingDefinitions.empty() || !exit.bad.empty()) return false;
+	std::map<unsigned, const Disposition::Definition*> definitions;
+	for (const auto& definition : evidence.definitions)
+		if (!definitions.emplace(definition.id, &definition).second) return false;
+	std::vector<unsigned> pending = exit.definitions;
+	std::set<unsigned> visited;
+	for (auto id : exit.definitions)
+		if (!definitions.count(id) || definitions.at(id)->reg != 2) return false;
+	while (!pending.empty()) {
+		auto id = pending.back(); pending.pop_back();
+		if (!visited.insert(id).second) continue;
+		auto found = definitions.find(id);
+		if (found == definitions.end()) return false;
+		const auto& definition = *found->second;
+		if (definition.width != 32 || definition.origin != "instruction" || !definition.bad.empty()
+			|| !definition.entries.empty() || !definition.formals.empty()
+			|| definition.pc < evidence.start || definition.pc >= evidence.end || (definition.pc - evidence.start) % 4) return false;
+		const auto& instruction = rows[(definition.pc - evidence.start) / 4];
+		if (std::find(instruction.fullWidthRegisters.begin(), instruction.fullWidthRegisters.end(), definition.reg) == instruction.fullWidthRegisters.end()) return false;
+		for (auto input : definition.inputs) {
+			if (input >= id) return false;
+			pending.push_back(input);
+		}
 	}
 	return true;
 }
@@ -1172,6 +1272,8 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 		cf->originalBodyCandidate.reset();
 		if (revised && canProposeEmptyBody(*cf))
 			cf->originalBodyCandidate = common::OriginalBodyCandidate::EmptyVoid;
+		else if (revised && canProposeOrdinaryBody(*cf))
+			cf->originalBodyCandidate = common::OriginalBodyCandidate::OrdinaryC;
 	}
 }
 
@@ -1196,7 +1298,9 @@ void ParamReturn::requireSelectedContracts() const
 {
 	const auto& p = _config->getConfig().parameters;
 	auto* cf = _config->getConfigFunction(p.getEntryPoint());
-	if (cf && cf->originalBodyCandidate && canProposeEmptyBody(*cf)) return;
+	if (cf && cf->originalBodyCandidate
+		&& ((*cf->originalBodyCandidate == common::OriginalBodyCandidate::EmptyVoid && canProposeEmptyBody(*cf))
+			|| (*cf->originalBodyCandidate == common::OriginalBodyCandidate::OrdinaryC && canProposeOrdinaryBody(*cf)))) return;
 	if (!cf || !cf->returnDisposition || cf->returnDisposition->kind != Disposition::Kind::Value)
 		throw std::runtime_error("original-only selected return contract is unknown");
     if (p.getOriginalCallScope() && (!cf->originalCallSummary || !cf->originalCallSummary->declaration.isComplete()))
@@ -1206,13 +1310,73 @@ void ParamReturn::requireSelectedContracts() const
 			throw std::runtime_error("original-only required call contract is unknown");
 }
 
+void ParamReturn::projectOriginalBody()
+{
+	auto& functions = _config->getConfig().functions;
+	const auto original = functions;
+	std::map<uint64_t, const common::Function*> identities;
+	for (const auto& function : original)
+		if (!function.getStart().isDefined() || !identities.emplace(function.getStart().getValue(), &function).second)
+			throw std::runtime_error("original-body-proposal-function-identity-unresolved");
+	auto* selected = original.getFunctionByStartAddress(_config->getConfig().parameters.getEntryPoint());
+	if (!selected || !canProposeOrdinaryBody(*selected)) throw std::runtime_error("original-body-proposal-scope-differs");
+	std::map<uint64_t, unsigned> arguments;
+	unsigned count = 0;
+	const auto& instructions = selected->returnDisposition->evidence.instructions;
+	for (unsigned i = 0; i < instructions.size(); ++i) {
+		auto word = instructions[i].word;
+		unsigned op = word >> 26, rt = (word >> 16) & 31;
+		if ((op == 9 || op == 15 || op == 35) && rt >= 4 && rt <= 7) count = std::max(count, rt - 3);
+		if (op == 3) {
+			auto slot = instructions[i + 1].word;
+			unsigned slotOp = slot >> 26, slotRt = (slot >> 16) & 31;
+			if ((slotOp == 9 || slotOp == 15 || slotOp == 35) && slotRt >= 4 && slotRt <= 7)
+				count = std::max(count, slotRt - 3);
+			arguments.emplace(instructions[i].pc, count);
+			count = 0; ++i;
+		}
+	}
+	try {
+		collectAllCalls(false);
+		filterCalls();
+		std::set<uint64_t> observed;
+		for (const auto& entry : _fnc2calls)
+			for (const auto& call : entry.second.callEntries()) {
+				auto* instruction = call.getCallInstruction();
+				if (_config->getFunctionAddress(instruction->getFunction()) != selected->getStart()) continue;
+				auto address = AsmInstruction(instruction).getAddress();
+				if (!address.isDefined() || !arguments.count(address.getValue())
+					|| !observed.insert(address.getValue()).second || call.args().size() < arguments.at(address.getValue())
+					|| std::find(call.args().begin(), call.args().end(), nullptr) != call.args().end())
+					throw std::runtime_error("original-body-proposal-call-arguments-unresolved");
+			}
+		if (observed.size() != arguments.size()) throw std::runtime_error("original-body-proposal-calls-unresolved");
+		applyToIr();
+		common::FunctionContainer restored;
+		for (const auto& function : functions) {
+			auto found = function.getStart().isDefined() ? identities.find(function.getStart().getValue()) : identities.end();
+			if (found == identities.end() || function.getName() != found->second->getName()
+				|| !restored.insert(*found->second).second)
+				throw std::runtime_error("original-body-proposal-function-identity-differs");
+		}
+		if (restored.size() != original.size()) throw std::runtime_error("original-body-proposal-function-inventory-differs");
+		functions = std::move(restored);
+		_fnc2calls.clear();
+	} catch (...) {
+		functions = original;
+		_fnc2calls.clear();
+		throw;
+	}
+}
+
 /**
  * Collect possible arguments' stores for all calls we want to analyze.
  * At the moment, we analyze only indirect or declared function calls with no
  * arguments inside one basic block.
  */
-void ParamReturn::collectAllCalls()
+void ParamReturn::collectAllCalls(bool attachOriginalEvidence)
 {
+	_fnc2calls.clear();
 	for (auto& f : _module->getFunctionList())
 	{
 		if (f.isIntrinsic())
@@ -1222,7 +1386,7 @@ void ParamReturn::collectAllCalls()
 
 		_fnc2calls.emplace(std::make_pair(
 					&f,
-					createDataFlowEntry(&f)));
+					createDataFlowEntry(&f, attachOriginalEvidence)));
 	}
 
 	for (auto& f : _module->getFunctionList())
@@ -1249,18 +1413,18 @@ void ParamReturn::collectAllCalls()
 			fIt = _fnc2calls.emplace(
 				std::make_pair(
 					calledVal,
-					createDataFlowEntry(calledVal))).first;
+					createDataFlowEntry(calledVal, attachOriginalEvidence))).first;
 		}
 
 		addDataFromCall(&fIt->second, call);
 	}
 }
 
-DataFlowEntry ParamReturn::createDataFlowEntry(Value* calledValue) const
+DataFlowEntry ParamReturn::createDataFlowEntry(Value* calledValue, bool attachOriginalEvidence) const
 {
 	DataFlowEntry dataflow(calledValue);
 
-	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery())
+	if (attachOriginalEvidence && _config->getConfig().parameters.isOriginalOnlyReturnRecovery())
 	{
 		common::ReturnDisposition disposition;
 		if (auto* cf = _config->getConfigFunction(dataflow.getFunction()))

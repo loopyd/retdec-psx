@@ -861,9 +861,15 @@ void recoverSourceSignatures(ShPtr<Module> module, const config::Config &config)
 		if (source && source->originalBodyCandidate) {
 			if (!config.parameters.isOriginalOnlyReturnRecovery()
 					|| source->getStart() != config.parameters.getEntryPoint()
-					|| *source->originalBodyCandidate != common::OriginalBodyCandidate::EmptyVoid
 					|| !source->returnDisposition
 					|| source->returnDisposition->kind != common::ReturnDisposition::Kind::Unknown)
+				throw std::runtime_error("invalid-original-body-candidate-projection");
+			if (*source->originalBodyCandidate == common::OriginalBodyCandidate::OrdinaryC) {
+				if (!machine || machine->isDeclaration() || !function->getBody())
+					throw std::runtime_error("original-body-proposal-lowering-incomplete");
+				continue;
+			}
+			if (*source->originalBodyCandidate != common::OriginalBodyCandidate::EmptyVoid)
 				throw std::runtime_error("invalid-original-body-candidate-projection");
 			function->setRetType(VoidType::create());
 			function->setParams({}); function->setLocalVars({}); function->setVarArg(false);

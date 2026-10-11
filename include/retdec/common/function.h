@@ -234,7 +234,7 @@ struct OriginalSourceExpression {
 };
 
 enum class OriginalSourceForm { SignedNarrowCast, UnsignedMaskSubtract };
-enum class OriginalBodyCandidate { EmptyVoid };
+enum class OriginalBodyCandidate { EmptyVoid, OrdinaryC };
 
 inline const char* originalSourceFormName(OriginalSourceForm form) {
 	switch (form) {
