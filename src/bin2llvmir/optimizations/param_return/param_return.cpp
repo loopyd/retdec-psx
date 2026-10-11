@@ -169,6 +169,7 @@ void ParamReturn::invalidatePreviousNativeReturnEvidence() const
 			const_cast<common::Function&>(cf).returnDisposition.reset();
 			const_cast<common::Function&>(cf).originalCallSummary.reset();
 			const_cast<common::Function&>(cf).originalCalleeContexts.reset();
+			const_cast<common::Function&>(cf).originalJumpTables.clear();
 			const_cast<common::Function&>(cf).originalBodyCandidate.reset();
 			const_cast<common::Function&>(cf).originalSourceExpressions.clear();
 		}
@@ -266,6 +267,7 @@ struct RegisterState {
     std::array<RegisterFact, Disposition::RegisterCount> registers;
     std::array<RegisterFact, Disposition::GprCount> pending;
     std::array<bool, Disposition::GprCount> mayPending{}, mayNoPending{};
+    std::set<uint64_t> conditionalTables;
     RegisterFact& operator[](unsigned reg) { return registers[reg]; }
     const RegisterFact& operator[](unsigned reg) const { return registers[reg]; }
 };
@@ -533,6 +535,11 @@ bool joinFact(RegisterFact& fact, const RegisterFact& incoming)
 bool joinState(RegisterState& destination, const RegisterState& incoming)
 {
     bool changed = false;
+    auto conditions = destination.conditionalTables.size();
+    destination.conditionalTables.insert(incoming.conditionalTables.begin(), incoming.conditionalTables.end());
+    changed |= conditions != destination.conditionalTables.size();
+    if (destination.conditionalTables.size() > Disposition::ReferenceLimit)
+        throw std::runtime_error("conditional-table-references-exhausted");
     for (unsigned reg = 0; reg < Disposition::RegisterCount; ++reg) {
         changed |= joinFact(destination[reg], incoming[reg]);
         if (reg >= Disposition::GprCount) continue;
@@ -1031,6 +1038,215 @@ std::optional<common::OriginalEntryRelativeMemoryAddress> originalFlowMemoryAddr
     return address;
 }
 
+struct OriginalImageView {
+    uint32_t mappingStart;
+    const std::vector<uint8_t>& payload;
+    bool physical;
+    bool contains(uint64_t address, uint64_t count) const {
+        return address >= mappingStart && address <= UINT32_MAX
+            && count <= (uint64_t(1) << 32) - address
+            && address - mappingStart <= payload.size()
+            && count <= payload.size() - (address - mappingStart);
+    }
+    uint32_t word(uint64_t address) const {
+        auto offset = address - mappingStart;
+        return uint32_t(payload[offset]) | uint32_t(payload[offset + 1]) << 8
+            | uint32_t(payload[offset + 2]) << 16 | uint32_t(payload[offset + 3]) << 24;
+    }
+};
+
+std::optional<OriginalImageView> originalImageView(const FileImage* image,
+    const common::OriginalCallScope& scope, const config::Parameters& parameters,
+    const Disposition::Evidence& evidence, const std::string& function)
+{
+    if (!image || evidence.start % 4 || evidence.end % 4 || evidence.start >= evidence.end) return {};
+    unsigned identities = 0;
+    auto matchIdentity = [&](const common::ReviewedOriginalFunction& row) {
+        identities += row.start == evidence.start && row.end == evidence.end && row.key == function;
+    };
+    matchIdentity(scope.root); for (const auto& row : scope.callees) matchIdentity(row);
+    auto* format = image->getFileFormat();
+    auto configuredLoad = parameters.getSectionVMA();
+    if (identities != 1 || !format || !format->isRawData() || format->getSha256() != scope.payloadHash
+        || scope.payloadHash.size() != 64 || configuredLoad.isUndefined() || configuredLoad.getValue() > UINT32_MAX) return {};
+    uint64_t load = configuredLoad.getValue();
+    const auto& payload = format->getBytes();
+    if (payload.empty() || payload.size() > (uint64_t(1) << 32) - load || payload != format->getLoadedBytes()
+        || evidence.start < load || evidence.end - load > payload.size()) return {};
+    std::set<uint64_t> pcs;
+    OriginalImageView view{uint32_t(load), payload, false};
+    for (const auto& row : evidence.instructions) {
+        if (row.pc < evidence.start || row.pc >= evidence.end || row.pc % 4 || row.bytes != 4
+            || row.owner != evidence.symbol || !row.mapped || row.undef || !pcs.insert(row.pc).second
+            || !view.contains(row.pc, 4) || view.word(row.pc) != row.word) return {};
+    }
+    auto* loaded = image->getImage();
+    const auto* segment = loaded && loaded->getNumberOfSegments() == 1 ? loaded->getSegmentFromAddress(load) : nullptr;
+    view.physical = segment && segment->getAddress() == load && segment->getSize() == payload.size()
+        && segment->getPhysicalSize() == payload.size();
+    if (view.physical) {
+        auto raw = segment->getRawData();
+        view.physical = raw.first && raw.second == payload.size() && std::equal(payload.begin(), payload.end(), raw.first);
+    }
+    return view;
+}
+
+struct OriginalDispatchSite {
+    uint64_t jumpPc;
+    const Disposition::Evidence& evidence;
+    const std::map<uint64_t, const Disposition::Instruction*>& instructions;
+    const std::map<unsigned, Disposition::Definition>& definitions;
+    const OriginalImageView& image;
+    const common::ReviewedOriginalFunction& identity;
+    const std::string& payloadHash;
+};
+
+class OriginalSnapshotDispatch {
+    common::OriginalJumpTableContext _report;
+    explicit OriginalSnapshotDispatch(common::OriginalJumpTableContext report) : _report(std::move(report)) {}
+    friend std::optional<OriginalSnapshotDispatch> sampleOriginalJumpTable(const OriginalDispatchSite&, const RegisterState&);
+public:
+    std::set<uint32_t> distinctTargets() const { return {_report.indexedTargets.begin(), _report.indexedTargets.end()}; }
+    const common::OriginalJumpTableContext& report() const { return _report; }
+};
+
+bool jumpTablePrefixCompute(const Disposition::Instruction& row)
+{
+    auto word = row.word;
+    unsigned op = word >> 26, rs = (word >> 21) & 31, fn = word & 63, shift = (word >> 6) & 31;
+    bool supported = op == 9 || op == 12 || op == 13 || op == 14 || (op == 15 && !rs)
+        || (!op && (((fn == 0 || fn == 2 || fn == 3) && !rs)
+            || ((fn == 33 || fn == 35 || (36 <= fn && fn <= 39)) && !shift)));
+    if (!supported) return false;
+    for (auto reg : originalOperation(row).destinations)
+        if (reg && std::count(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), reg) != 1) return false;
+    return true;
+}
+
+std::optional<OriginalSnapshotDispatch> sampleOriginalJumpTable(
+    const OriginalDispatchSite& site, const RegisterState& before)
+{
+    const auto& evidence = site.evidence;
+    const auto& instructions = site.instructions;
+    auto instruction = [&](uint64_t pc) -> const Disposition::Instruction* {
+        auto found = instructions.find(pc); return found == instructions.end() ? nullptr : found->second;
+    };
+    auto* jump = instruction(site.jumpPc);
+    if (!site.image.physical || !jump || site.jumpPc < evidence.start + 20
+        || evidence.instructions.size() > Disposition::RowLimit) return {};
+    auto operation = originalOperation(*jump);
+    if (operation.kind != MipsOperation::Branch || operation.target || operation.name != "jr") return {};
+    auto* shift = instruction(site.jumpPc - 20);
+    auto* high = instruction(site.jumpPc - 16);
+    auto* add = instruction(site.jumpPc - 12);
+    auto* load = instruction(site.jumpPc - 8);
+    auto* loadDelay = instruction(site.jumpPc - 4);
+    auto* jumpDelay = instruction(site.jumpPc + 4);
+    if (!shift || !high || !add || !load || !loadDelay || !jumpDelay) return {};
+    unsigned selector = (shift->word >> 16) & 31, scaled = (shift->word >> 11) & 31;
+    unsigned base = (high->word >> 16) & 31, target = (jump->word >> 21) & 31;
+    if (!selector || !scaled || !base || !target || selector == scaled || selector == base || scaled == base
+        || jump->word != ((target << 21) | 8)
+        || shift->word != ((selector << 16) | (scaled << 11) | (2 << 6))
+        || high->word >> 21 != (15 << 5)
+        || (add->word != ((base << 21) | (scaled << 16) | (base << 11) | 33)
+            && add->word != ((scaled << 21) | (base << 16) | (base << 11) | 33))
+        || load->word >> 16 != ((35 << 10) | (base << 5) | target)
+        || loadDelay->word != 0 || !jumpTablePrefixCompute(*jumpDelay)) return {};
+    for (const auto* row : {shift, high, add, load})
+        for (auto reg : originalOperation(*row).destinations)
+            if (!reg || std::count(row->fullWidthRegisters.begin(), row->fullWidthRegisters.end(), reg) != 1) return {};
+    const auto& visible = before[target];
+    if (visible.missing || visible.constant || visible.equalEntry || visible.definitions.size() != 1
+        || before.mayPending[target] || !before.mayNoPending[target]) return {};
+    auto definition = site.definitions.find(*visible.definitions.begin());
+    if (definition == site.definitions.end() || definition->second.pc != load->pc
+        || definition->second.reg != target || definition->second.width != 32
+        || !definition->second.delayed || definition->second.origin != "instruction") return {};
+
+    const Disposition::Instruction* compare = nullptr;
+    const Disposition::Instruction* guard = nullptr;
+    uint64_t defaultPc = 0;
+    uint32_t count = 0;
+    for (const auto& pair : instructions) {
+        const auto& row = *pair.second;
+        if (row.pc < evidence.start || row.pc + 8 > shift->pc || row.word >> 26 != 11
+            || ((row.word >> 21) & 31) != selector) continue;
+        auto* candidate = instruction(row.pc + 4);
+        if (!candidate) continue;
+        unsigned comparison = (row.word >> 16) & 31, opcode = candidate->word >> 26;
+        auto branch = originalOperation(*candidate);
+        unsigned rs = (candidate->word >> 21) & 31, rt = (candidate->word >> 16) & 31;
+        if (!comparison || comparison == selector || (opcode != 4 && opcode != 5)
+            || !branch.target || !((rs == comparison && !rt) || (rt == comparison && !rs))) continue;
+        if ((opcode == 4 && candidate->pc + 8 != shift->pc)
+            || (opcode == 5 && *branch.target != shift->pc)) continue;
+        auto bound = uint32_t(int32_t(int16_t(row.word)));
+        if (!bound || bound > Disposition::RowLimit || compare) return {};
+        compare = &row; guard = candidate; count = bound;
+        defaultPc = opcode == 4 ? *branch.target : candidate->pc + 8;
+    }
+    if (!compare || !guard || std::count(compare->fullWidthRegisters.begin(), compare->fullWidthRegisters.end(),
+        (compare->word >> 16) & 31) != 1 || !instruction(defaultPc)) return {};
+    std::set<uint64_t> prefix;
+    for (uint64_t pc = evidence.start; pc < compare->pc; pc += 4) {
+        auto* row = instruction(pc);
+        if (!row || !jumpTablePrefixCompute(*row)) return {};
+        prefix.insert(pc);
+    }
+    auto* guardDelay = instruction(guard->pc + 4);
+    if (!guardDelay || !jumpTablePrefixCompute(*guardDelay)) return {};
+    for (auto reg : originalOperation(*guardDelay).destinations) if (reg == selector) return {};
+    prefix.insert(compare->pc); prefix.insert(guard->pc); prefix.insert(guardDelay->pc);
+    for (uint64_t pc = shift->pc; pc <= jumpDelay->pc; pc += 4) prefix.insert(pc);
+    if (prefix.count(defaultPc)) return {};
+    for (const auto& pair : instructions) {
+        auto candidate = originalOperation(*pair.second);
+        if (candidate.target && prefix.count(*candidate.target)
+            && !(pair.first == guard->pc && pair.second->word >> 26 == 5 && *candidate.target == shift->pc)) return {};
+        if (!prefix.count(pair.first) && !candidate.target
+            && (candidate.kind == MipsOperation::Branch || candidate.kind == MipsOperation::Call)) return {};
+        if (prefix.count(pair.first) && pair.first != guard->pc && pair.first != jump->pc
+            && (candidate.kind == MipsOperation::Branch || candidate.kind == MipsOperation::Call
+                || candidate.kind == MipsOperation::Return || candidate.kind == MipsOperation::Trap)) return {};
+        if (!prefix.count(pair.first) && prefix.count(pair.first + 4)) {
+            bool endsNormalPath = candidate.kind == MipsOperation::Trap;
+            auto previous = pair.first >= 4 ? instruction(pair.first - 4) : nullptr;
+            if (previous) {
+                auto branch = originalOperation(*previous);
+                endsNormalPath |= branch.kind == MipsOperation::Return
+                    || (branch.kind == MipsOperation::Branch && !branch.conditional);
+            }
+            if (!endsNormalPath) return {};
+        }
+    }
+    uint32_t address = uint32_t((high->word & 0xffff) << 16)
+        + uint32_t(int32_t(int16_t(load->word)));
+    uint64_t bytes = uint64_t(count) * 4;
+    if (address % 4 || !site.image.contains(address, bytes)
+        || count + prefix.size() > Disposition::ReferenceLimit) return {};
+    common::OriginalJumpTableContext report;
+    report.jumpPc = jump->pc; report.loadPc = load->pc; report.comparePc = compare->pc;
+    report.guardPc = guard->pc; report.defaultPc = defaultPc; report.selectorRegister = selector;
+    report.tableAddress = address; report.imageId = site.identity.imageId; report.payloadHash = site.payloadHash;
+    report.tableBytes.mappingStart = site.image.mappingStart; report.tableBytes.mappingBytes = site.image.payload.size();
+    report.tableBytes.payloadOffset = uint64_t(address) - site.image.mappingStart;
+    report.tableBytes.bytes.assign(site.image.payload.begin() + report.tableBytes.payloadOffset,
+        site.image.payload.begin() + report.tableBytes.payloadOffset + bytes);
+    for (uint32_t index = 0; index < count; ++index) {
+        auto destination = site.image.word(uint64_t(address) + 4 * index);
+        if (destination % 4 || destination < evidence.start || destination >= evidence.end
+            || !instruction(destination) || prefix.count(destination)) return {};
+        report.indexedTargets.push_back(destination);
+    }
+    report.instructionEvidence.assign(prefix.begin(), prefix.end());
+    report.conditions = {"this-image-supplies-executed-instructions", "entry-at-reviewed-function-start",
+        "no-pending-entry-gpr-loads", "active-table-binding-matches-this-image",
+        "loaded-table-words-equal-file-backed-initial-bytes", "instruction-fetches-and-loads-complete-normally",
+        "mips-i-load-and-branch-delays"};
+    return OriginalSnapshotDispatch(std::move(report));
+}
+
 void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Disposition& disposition,
     const FileImage* image, const common::OriginalCallScope& scope, const config::Parameters& parameters,
     const std::map<uint64_t, common::OriginalMemoryAccess>& flowAccesses)
@@ -1041,28 +1257,14 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
         || summary.exits.empty() || !evidence.calls.empty() || summary.pendingEntry != "requires-no-pending-gpr-loads"
         || evidence.start % 4 || evidence.end % 4 || evidence.start >= evidence.end
         || evidence.instructions.size() != (evidence.end - evidence.start) / 4 || !image) return;
-    unsigned identities = 0;
-    auto matchIdentity = [&](const common::ReviewedOriginalFunction& row) {
-        identities += row.start == evidence.start && row.end == evidence.end && row.key == summary.function;
-    };
-    matchIdentity(scope.root); for (const auto& row : scope.callees) matchIdentity(row);
-    auto* format = image->getFileFormat();
-    auto configuredLoad = parameters.getSectionVMA();
-    if (identities != 1 || !format || !format->isRawData() || format->getSha256() != scope.payloadHash
-        || scope.payloadHash.size() != 64 || configuredLoad.isUndefined() || configuredLoad.getValue() > UINT32_MAX) return;
-    uint64_t load = configuredLoad.getValue();
-    const auto& payload = format->getBytes();
-    if (payload.empty() || payload.size() > (uint64_t(1) << 32) - load || payload != format->getLoadedBytes()
-        || evidence.start < load || evidence.end - load > payload.size()) return;
+    auto view = originalImageView(image, scope, parameters, evidence, summary.function);
+    if (!view) return;
+    uint64_t load = view->mappingStart;
+    const auto& payload = view->payload;
     std::map<uint64_t, const Disposition::Instruction*> instructions;
     std::set<uint64_t> returns;
     for (const auto& row : evidence.instructions) {
-        if (row.pc < evidence.start || row.pc >= evidence.end || row.pc % 4 || row.bytes != 4
-            || row.owner != evidence.symbol || !row.mapped || row.undef || !instructions.emplace(row.pc, &row).second) return;
-        auto offset = row.pc - load;
-        uint32_t word = uint32_t(payload[offset]) | uint32_t(payload[offset + 1]) << 8
-            | uint32_t(payload[offset + 2]) << 16 | uint32_t(payload[offset + 3]) << 24;
-        if (word != row.word) return;
+        instructions.emplace(row.pc, &row);
         if (originalOperation(row).kind == MipsOperation::Return) returns.insert(row.pc);
     }
     if (returns.size() != summary.exits.size() || returns.size() != evidence.exits.size()) return;
@@ -1083,13 +1285,6 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
         outgoing.emplace(edge.from, &edge); incoming.emplace(edge.to, &edge);
     }
     auto* loaded = image->getImage();
-    const auto* segment = loaded && loaded->getNumberOfSegments() == 1 ? loaded->getSegmentFromAddress(load) : nullptr;
-    bool physical = segment && segment->getAddress() == load && segment->getSize() == payload.size()
-        && segment->getPhysicalSize() == payload.size();
-    if (physical) {
-        auto raw = segment->getRawData();
-        physical = raw.first && raw.second == payload.size() && std::equal(payload.begin(), payload.end(), raw.first);
-    }
     for (auto& access : summary.accesses) {
         if (!instructions.count(access.pc)) continue;
         auto address = originalMemoryAddress(access, instructions, definitions);
@@ -1109,7 +1304,7 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
         }
         if (!originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc, address->equalityEvidence)) continue;
         uint64_t count = access.width / 8, value = address->value;
-        if (physical && address->alignment.isComplete() && value >= load
+        if (view->physical && address->alignment.isComplete() && value >= load
             && value + count <= (uint64_t(1) << 32) && value - load <= payload.size()
             && count <= payload.size() - (value - load)) {
             common::OriginalFileBytes bytes;
@@ -1224,6 +1419,13 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     proof.remaining.clear();
     for (const auto* dimension : {&proof.identity, &proof.inputs, &proof.transfers, &proof.result, &proof.control, &proof.effects, &proof.declaration})
         if (!dimension->isComplete()) proof.remaining.insert(proof.remaining.end(), dimension->remaining.begin(), dimension->remaining.end());
+    for (auto jumpPc : state.conditionalTables) {
+        auto condition = "conditional-jump-table-" + std::to_string(jumpPc);
+        proof.inputs.kind = common::OriginalFact::Kind::Partial;
+        proof.inputs.remaining.push_back(condition); proof.remaining.push_back(std::move(condition));
+    }
+    std::sort(proof.inputs.remaining.begin(), proof.inputs.remaining.end());
+    proof.inputs.remaining.erase(std::unique(proof.inputs.remaining.begin(), proof.inputs.remaining.end()), proof.inputs.remaining.end());
     std::sort(proof.remaining.begin(), proof.remaining.end()); proof.remaining.erase(std::unique(proof.remaining.begin(), proof.remaining.end()), proof.remaining.end());
     call.unresolved = proof.remaining; call.qualified = false; call.contract = std::move(proof);
 }
@@ -1317,6 +1519,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 		evidence.selection = cf->getStart() == selected.getStart() ? "selected-root" : "analysis-callee";
 		evidence.edges.clear(); evidence.definitions.clear(); evidence.exits.clear(); evidence.calls.clear();
 		evidence.decodeComplete = false; evidence.analysisComplete = false;
+		cf->originalJumpTables.clear();
 		auto obligation = [&](uint64_t pc, const std::string& domain, const std::string& reason) {
 			for (const auto& row : evidence.obligations)
 				if (row.pc == pc && row.domain == domain && row.reason == reason) return;
@@ -1334,6 +1537,8 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 				if (!instructions.emplace(row.pc, &row).second)
 					throw std::runtime_error("duplicate-decode-evidence");
 			}
+			auto imageView = revised ? originalImageView(_image, *scope, _config->getConfig().parameters,
+				evidence, summary.function) : std::optional<OriginalImageView>{};
 			RegisterState entry;
             entry.mayNoPending.fill(true);
 			for (unsigned reg = 0; reg < Disposition::RegisterCount; ++reg)
@@ -1373,6 +1578,8 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 			std::map<uint64_t, common::OriginalMemoryAccess> accesses;
 			std::set<std::tuple<uint64_t, uint64_t, uint64_t, std::string>> edges;
 			std::map<uint64_t, unsigned> branchPaths;
+			std::map<uint64_t, OriginalSnapshotDispatch> sampledDispatches;
+			std::set<uint64_t> rejectedDispatches;
 			unsigned iterations = 0;
 			while (!work.empty()) {
 				if (++iterations > 262144) throw std::runtime_error("return-flow-exhausted");
@@ -1416,6 +1623,20 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     auto& paths = branchPaths[pc];
                     unsigned widened = paths | (trustedInstruction ? originalBranchPaths(row, state) : BothBranchPaths);
                     branchPathsChanged = widened != paths; paths = widened;
+                }
+                bool dispatchChanged = false;
+                if (revised && !owner && operation.kind == MipsOperation::Branch
+                    && !operation.target && operation.name == "jr") {
+                    std::optional<OriginalSnapshotDispatch> dispatch;
+                    if (imageView && !rejectedDispatches.count(pc))
+                        dispatch = sampleOriginalJumpTable({pc, evidence, instructions, definitions,
+                            *imageView, extent, scope->payloadHash}, state);
+                    if (dispatch) {
+                        dispatchChanged = sampledDispatches.emplace(pc, std::move(*dispatch)).second;
+                    } else {
+                        dispatchChanged = sampledDispatches.erase(pc) != 0;
+                        rejectedDispatches.insert(pc);
+                    }
                 }
 				auto inputs = inputFact(state, operation);
                 auto retainedMask = revised ? retainedLoadMask(operation, row, state) : std::optional<uint32_t>{};
@@ -1556,12 +1777,20 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                         unsigned paths = revised && branch.conditional ? branchPaths.at(owner) : BothBranchPaths;
                         if (paths & BranchTaken) {
                             if (branch.target) send(*branch.target, 0, "branch");
-                            else obligation(owner, "architectural", "unresolved-branch-target");
+                            else {
+                                obligation(owner, "architectural", "unresolved-branch-target");
+                                auto dispatch = sampledDispatches.find(owner);
+                                if (dispatch != sampledDispatches.end()) {
+                                    state.conditionalTables.insert(owner);
+                                    for (auto target : dispatch->second.distinctTargets())
+                                        send(target, 0, "conditional-table-branch");
+                                }
+                            }
                         }
 						if (branch.conditional && (paths & BranchFallthrough)) send(owner + 8, 0, "fallthrough");
 					}
 				}
-				else if (control) send(pc + 4, pc, "delay-slot", branchPathsChanged);
+				else if (control) send(pc + 4, pc, "delay-slot", branchPathsChanged || dispatchChanged);
 				else send(pc + 4, 0, "fallthrough");
 			}
 			for (const auto& edge : edges) evidence.edges.push_back({std::get<0>(edge), std::get<1>(edge),
@@ -1595,6 +1824,12 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                 }
             }
 			std::size_t references = 0;
+			for (const auto& pair : sampledDispatches) {
+				const auto& table = pair.second.report();
+				references += table.indexedTargets.size() + table.instructionEvidence.size();
+				if (references > Disposition::ReferenceLimit) throw std::runtime_error("return-references-exhausted");
+				cf->originalJumpTables.push_back(table);
+			}
 			for (auto& pair : definitions) {
 				references += pair.second.inputs.size() + pair.second.formals.size() + pair.second.bad.size();
 				if (references > Disposition::ReferenceLimit) throw std::runtime_error("return-references-exhausted");
@@ -1639,6 +1874,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 			disposition.kind = Disposition::Kind::Unknown;
             evidence.decodeComplete = false; evidence.analysisComplete = false;
             evidence.definitions.clear(); evidence.edges.clear(); evidence.exits.clear(); evidence.calls.clear();
+            cf->originalJumpTables.clear();
             for (auto& access : summary.accesses) access.address = common::OriginalFact::partial("native-analysis-failed");
             if (evidence.obligations.size() < Disposition::RowLimit)
 				evidence.obligations.push_back({evidence.start, "architectural", error.what()});

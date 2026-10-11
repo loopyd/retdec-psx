@@ -94,6 +94,18 @@ struct OriginalFileBytes {
 	uint64_t mappingBytes = 0, payloadOffset = 0;
 	std::vector<uint8_t> bytes;
 };
+struct OriginalJumpTableContext {
+	uint64_t jumpPc = 0, loadPc = 0, comparePc = 0, guardPc = 0, defaultPc = 0;
+	unsigned selectorRegister = 0;
+	uint32_t tableAddress = 0;
+	std::string imageId, payloadHash;
+	OriginalFileBytes tableBytes;
+	std::vector<uint32_t> indexedTargets;
+	std::vector<uint64_t> instructionEvidence;
+	OriginalFact runtimeBinding = OriginalFact::partial("jump-table-active-binding-unresolved");
+	OriginalFact currentContents = OriginalFact::partial("jump-table-runtime-contents-unresolved");
+	std::vector<std::string> conditions;
+};
 struct OriginalFixedMemoryAddress {
 	uint32_t base = 0, value = 0;
 	std::vector<uint64_t> equalityEvidence;
@@ -400,6 +412,7 @@ class Function : public retdec::common::AddressRange
 		std::optional<ReturnDisposition> returnDisposition;
 		std::optional<OriginalFunctionSummary> originalCallSummary;
 		std::optional<OriginalCalleeContexts> originalCalleeContexts;
+		std::vector<OriginalJumpTableContext> originalJumpTables;
 		std::optional<OriginalBodyCandidate> originalBodyCandidate;
 		std::vector<OriginalSourceExpression> originalSourceExpressions;
 		std::optional<std::vector<OriginalSourceFormApplication>> originalSourceForms;

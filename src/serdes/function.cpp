@@ -436,6 +436,26 @@ void serialize(Writer& writer, const common::Function& f)
     bool concreteReturn = !f.returnDisposition || f.returnDisposition->kind == common::ReturnDisposition::Kind::Value;
     if (f.returnDisposition) disposition(writer, *f.returnDisposition);
     if (f.originalCallSummary) summary(writer, *f.originalCallSummary);
+	if (!f.originalJumpTables.empty()) {
+		writer.Key("originalJumpTables"); writer.StartArray();
+		for (const auto& table : f.originalJumpTables) {
+			writer.StartObject(); writer.Key("rule"); writer.String("mips-guarded-snapshot-jump-table/v1");
+			writer.Key("jumpPc"); writer.Uint64(table.jumpPc); writer.Key("loadPc"); writer.Uint64(table.loadPc);
+			writer.Key("comparePc"); writer.Uint64(table.comparePc); writer.Key("guardPc"); writer.Uint64(table.guardPc);
+			writer.Key("defaultPc"); writer.Uint64(table.defaultPc); writer.Key("selectorRegister"); writer.Uint(table.selectorRegister);
+			writer.Key("tableAddress"); writer.Uint(table.tableAddress);
+			writer.Key("imageId"); writer.String(table.imageId); writer.Key("payloadHash"); writer.String(table.payloadHash);
+			writer.Key("tableBytes"); writer.StartObject(); writer.Key("kind"); writer.String("file-backed-initial-bytes");
+			writer.Key("mappingStart"); writer.Uint(table.tableBytes.mappingStart);
+			writer.Key("mappingBytes"); writer.Uint64(table.tableBytes.mappingBytes);
+			writer.Key("payloadOffset"); writer.Uint64(table.tableBytes.payloadOffset);
+			numbers(writer, "bytes", table.tableBytes.bytes); writer.EndObject();
+			numbers(writer, "indexedTargets", table.indexedTargets); numbers(writer, "instructionEvidence", table.instructionEvidence);
+			fact(writer, "runtimeBinding", table.runtimeBinding); fact(writer, "currentContents", table.currentContents);
+			strings(writer, "conditions", table.conditions); writer.EndObject();
+		}
+		writer.EndArray();
+	}
 	if (f.originalCalleeContexts) {
 		const auto& contexts = *f.originalCalleeContexts;
 		writer.Key("originalCalleeContexts"); writer.StartObject();
@@ -575,6 +595,8 @@ void deserialize(const rapidjson::Value& val, common::Function& f)
     if (val.HasMember("originalCallSummary")) throw std::runtime_error("original-call-summary-is-invocation-output-only");
 	f.originalCalleeContexts.reset();
 	if (val.HasMember("originalCalleeContexts")) throw std::runtime_error("original-callee-context-is-invocation-output-only");
+	f.originalJumpTables.clear();
+	if (val.HasMember("originalJumpTables")) throw std::runtime_error("original-jump-tables-is-invocation-output-only");
 	f.originalBodyCandidate.reset();
 	if (val.HasMember("originalBodyCandidate")) throw std::runtime_error("original-body-candidate-is-invocation-output-only");
 	f.originalSourceExpressions.clear();
