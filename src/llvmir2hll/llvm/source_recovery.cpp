@@ -1,3 +1,4 @@
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/Analysis/ValueTracking.h>
@@ -51,57 +52,196 @@
 namespace retdec {
 namespace llvmir2hll {
 namespace {
+struct ProvenSignedScale {
+	llvm::BinaryOperator *operation;
+	llvm::Value *input;
+	unsigned shift;
+};
+
+std::optional<ProvenSignedScale> proveSignedScale(llvm::Value &value) {
+	auto *scaled = llvm::dyn_cast<llvm::BinaryOperator>(&value);
+	if (!scaled || !scaled->getType()->isIntegerTy(32)) return {};
+	unsigned shift = 0;
+	llvm::Value *input = nullptr;
+	if (scaled->getOpcode() == llvm::Instruction::Mul) {
+		for (unsigned i = 0; i < 2; ++i) {
+			auto *factor = llvm::dyn_cast<llvm::ConstantInt>(scaled->getOperand(i));
+			if (!factor) continue;
+			if (factor->getValue() == llvm::APInt(32, 0x10000)) shift = 16;
+			else if (factor->getValue() == llvm::APInt(32, 0x1000000)) shift = 24;
+			else continue;
+			input = scaled->getOperand(1 - i);
+			break;
+		}
+	} else if (scaled->getOpcode() == llvm::Instruction::Shl) {
+		auto *count = llvm::dyn_cast<llvm::ConstantInt>(scaled->getOperand(1));
+		if (!count || (count->getValue() != llvm::APInt(32, 16)
+				&& count->getValue() != llvm::APInt(32, 24))) return {};
+		shift = unsigned(count->getZExtValue());
+		input = scaled->getOperand(0);
+	}
+	if (!input || !input->getType()->isIntegerTy(32) || llvm::isa<llvm::UndefValue>(input)
+			|| scaled->hasNoSignedWrap() || scaled->hasNoUnsignedWrap()) return {};
+	return ProvenSignedScale{scaled, input, shift};
+}
+
+struct ProvenSignedComparison {
+	llvm::ICmpInst *comparison;
+	llvm::CmpInst::Predicate predicate;
+	llvm::APInt boundary;
+};
+
+std::optional<ProvenSignedComparison> proveSignedScaledComparison(
+		llvm::ICmpInst &comparison, llvm::Value &scaled, unsigned shift) {
+	if (!comparison.getOperand(0)->getType()->isIntegerTy(32)) return {};
+	auto predicate = comparison.getPredicate();
+	if (predicate != llvm::ICmpInst::ICMP_SLT && predicate != llvm::ICmpInst::ICMP_SGE
+			&& predicate != llvm::ICmpInst::ICMP_SGT && predicate != llvm::ICmpInst::ICMP_SLE) return {};
+	llvm::ConstantInt *constant = nullptr;
+	if (comparison.getOperand(0) == &scaled) {
+		constant = llvm::dyn_cast<llvm::ConstantInt>(comparison.getOperand(1));
+	} else if (comparison.getOperand(1) == &scaled) {
+		constant = llvm::dyn_cast<llvm::ConstantInt>(comparison.getOperand(0));
+		predicate = llvm::ICmpInst::getSwappedPredicate(predicate);
+	}
+	if (!constant) return {};
+	llvm::APInt boundary = constant->getValue();
+	if (predicate == llvm::ICmpInst::ICMP_SGT || predicate == llvm::ICmpInst::ICMP_SLE) {
+		if (boundary.isMaxSignedValue()) return {};
+		boundary += llvm::APInt(32, 1);
+		predicate = predicate == llvm::ICmpInst::ICMP_SGT
+			? llvm::ICmpInst::ICMP_SGE : llvm::ICmpInst::ICMP_SLT;
+	}
+	if (!(boundary & llvm::APInt::getLowBitsSet(32, shift)).isNullValue()) return {};
+	return ProvenSignedComparison{&comparison, predicate, boundary.ashr(shift)};
+}
+
+llvm::Value *createSignedView(const ProvenSignedScale &scale, llvm::Instruction &before) {
+	auto *narrow = new llvm::TruncInst(scale.input,
+		llvm::Type::getIntNTy(before.getContext(), 32 - scale.shift), "", &before);
+	return new llvm::SExtInst(narrow, scale.input->getType(), "", &before);
+}
+
+bool hasOnlyLocationMetadata(const llvm::Instruction &instruction) {
+	llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 4> attachments;
+	instruction.getAllMetadata(attachments);
+	const unsigned address = instruction.getContext().getMDKindID("insn.addr");
+	return std::all_of(attachments.begin(), attachments.end(), [&](const auto &attachment) {
+		return attachment.first == llvm::LLVMContext::MD_dbg || attachment.first == address;
+	});
+}
+
+void recoverSharedSignedViews(llvm::Function &function) {
+	std::vector<llvm::WeakTrackingVH> roots;
+	for (auto &block : function) for (auto &instruction : block)
+		if (instruction.getType()->isIntegerTy(32)
+				&& (llvm::isa<llvm::BinaryOperator>(instruction)
+					|| llvm::isa<llvm::SelectInst>(instruction))) roots.emplace_back(&instruction);
+	for (auto &handle : roots) {
+		llvm::Value *live = handle;
+		auto *root = llvm::dyn_cast_or_null<llvm::Instruction>(live);
+		if (!root || !root->getParent() || root->isUsedByMetadata()) continue;
+		auto *selection = llvm::dyn_cast<llvm::SelectInst>(root);
+		std::vector<ProvenSignedScale> scales;
+		if (selection) {
+			if (!selection->getCondition()->getType()->isIntegerTy(1)
+					|| llvm::isa<llvm::UndefValue>(selection->getCondition())
+					|| llvm::isa<llvm::SelectInst>(selection->getCondition())
+					|| !hasOnlyLocationMetadata(*selection)) continue;
+			for (unsigned i = 1; i < 3; ++i) {
+				if (llvm::isa<llvm::ConstantInt>(selection->getOperand(i))) continue;
+				auto scale = proveSignedScale(*selection->getOperand(i));
+				if (!scale || !scale->operation->hasOneUse()
+						|| llvm::isa<llvm::SelectInst>(scale->input)) {
+					scales.clear();
+					break;
+				}
+				scales.push_back(*scale);
+			}
+			if (scales.empty()) continue;
+		} else {
+			auto scale = proveSignedScale(*root);
+			if (!scale || root->hasMetadata() || llvm::isa<llvm::SelectInst>(scale->input)) continue;
+			scales.push_back(*scale);
+		}
+		unsigned shift = scales.front().shift;
+		if (std::any_of(scales.begin(), scales.end(), [&](const auto &scale) {
+				return scale.shift != shift;
+			})) continue;
+		if (selection) {
+			bool aligned = true;
+			for (unsigned i = 1; i < 3; ++i)
+				if (auto *constant = llvm::dyn_cast<llvm::ConstantInt>(selection->getOperand(i)))
+					aligned &= (constant->getValue() & llvm::APInt::getLowBitsSet(32, shift)).isNullValue();
+			if (!aligned) continue;
+		}
+		std::vector<ProvenSignedComparison> comparisons;
+		std::vector<llvm::BinaryOperator*> shifts;
+		bool supported = true;
+		for (auto *user : root->users()) {
+			if (auto *comparison = llvm::dyn_cast<llvm::ICmpInst>(user)) {
+				auto proof = proveSignedScaledComparison(*comparison, *root, shift);
+				if (!proof || comparison->isUsedByMetadata() || !hasOnlyLocationMetadata(*comparison)) {
+					supported = false;
+					break;
+				}
+				comparisons.push_back(*proof);
+				continue;
+			}
+			auto *right = llvm::dyn_cast<llvm::BinaryOperator>(user);
+			auto *count = right ? llvm::dyn_cast<llvm::ConstantInt>(right->getOperand(1)) : nullptr;
+			if (!right || right->getOpcode() != llvm::Instruction::AShr
+					|| !right->getType()->isIntegerTy(32) || right->getOperand(0) != root
+					|| !count || count->getValue() != llvm::APInt(32, shift)
+					|| right->hasMetadata() || right->isUsedByMetadata()) {
+				supported = false;
+				break;
+			}
+			shifts.push_back(right);
+		}
+		if (!supported || comparisons.empty() || shifts.empty()) continue;
+		llvm::Value *view = root;
+		std::set<llvm::BinaryOperator*> cleanup;
+		for (const auto &scale : scales) {
+			auto *signedValue = createSignedView(scale, *root);
+			if (selection) {
+				for (unsigned i = 1; i < 3; ++i)
+					if (selection->getOperand(i) == scale.operation) selection->setOperand(i, signedValue);
+			} else view = signedValue;
+			cleanup.insert(scale.operation);
+		}
+		if (selection)
+			for (unsigned i = 1; i < 3; ++i)
+				if (auto *constant = llvm::dyn_cast<llvm::ConstantInt>(selection->getOperand(i)))
+					selection->setOperand(i, llvm::ConstantInt::get(function.getContext(), constant->getValue().ashr(shift)));
+		for (const auto &proof : comparisons) {
+			proof.comparison->setOperand(0, view);
+			proof.comparison->setOperand(1, llvm::ConstantInt::get(function.getContext(), proof.boundary));
+			proof.comparison->setPredicate(proof.predicate);
+		}
+		for (auto *right : shifts) {
+			right->replaceAllUsesWith(view);
+			right->eraseFromParent();
+		}
+		for (auto *operation : cleanup)
+			if (operation->use_empty() && !operation->hasMetadata() && !operation->isUsedByMetadata())
+				operation->eraseFromParent();
+	}
+}
+
 void recoverSignedScaledPredicates(llvm::Function &function) {
 	for (auto &block : function) for (auto &instruction : block) {
 		auto *comparison = llvm::dyn_cast<llvm::ICmpInst>(&instruction);
-		if (!comparison || !comparison->getOperand(0)->getType()->isIntegerTy(32)) continue;
-		auto predicate = comparison->getPredicate();
-		if (predicate != llvm::ICmpInst::ICMP_SLT && predicate != llvm::ICmpInst::ICMP_SGE
-				&& predicate != llvm::ICmpInst::ICMP_SGT && predicate != llvm::ICmpInst::ICMP_SLE) continue;
-		auto *constant = llvm::dyn_cast<llvm::ConstantInt>(comparison->getOperand(1));
-		auto *scaled = llvm::dyn_cast<llvm::BinaryOperator>(comparison->getOperand(0));
-		if (!constant) {
-			constant = llvm::dyn_cast<llvm::ConstantInt>(comparison->getOperand(0));
-			scaled = llvm::dyn_cast<llvm::BinaryOperator>(comparison->getOperand(1));
-			predicate = llvm::ICmpInst::getSwappedPredicate(predicate);
-		}
-		if (!constant || !scaled || !scaled->getType()->isIntegerTy(32)) continue;
-		unsigned shift = 0;
-		llvm::Value *input = nullptr;
-		if (scaled->getOpcode() == llvm::Instruction::Mul) {
-			for (unsigned i = 0; i < 2; ++i) {
-				auto *factor = llvm::dyn_cast<llvm::ConstantInt>(scaled->getOperand(i));
-				if (!factor) continue;
-				if (factor->getValue() == llvm::APInt(32, 0x10000)) shift = 16;
-				else if (factor->getValue() == llvm::APInt(32, 0x1000000)) shift = 24;
-				else continue;
-				input = scaled->getOperand(1 - i);
-				break;
-			}
-		} else if (scaled->getOpcode() == llvm::Instruction::Shl) {
-			auto *count = llvm::dyn_cast<llvm::ConstantInt>(scaled->getOperand(1));
-			if (!count || (count->getValue() != llvm::APInt(32, 16)
-					&& count->getValue() != llvm::APInt(32, 24))) continue;
-			shift = unsigned(count->getZExtValue());
-			input = scaled->getOperand(0);
-		}
-		if (!input || !input->getType()->isIntegerTy(32) || llvm::isa<llvm::UndefValue>(input)
-				|| scaled->hasNoSignedWrap() || scaled->hasNoUnsignedWrap()) continue;
-		llvm::APInt boundary = constant->getValue();
-		if (predicate == llvm::ICmpInst::ICMP_SGT || predicate == llvm::ICmpInst::ICMP_SLE) {
-			if (boundary.isMaxSignedValue()) continue;
-			boundary += llvm::APInt(32, 1);
-			predicate = predicate == llvm::ICmpInst::ICMP_SGT
-				? llvm::ICmpInst::ICMP_SGE : llvm::ICmpInst::ICMP_SLT;
-		}
-		if (!(boundary & llvm::APInt::getLowBitsSet(32, shift)).isNullValue()) continue;
-		auto *narrow = new llvm::TruncInst(input,
-			llvm::Type::getIntNTy(function.getContext(), 32 - shift), "", comparison);
-		auto *extended = new llvm::SExtInst(narrow, input->getType(), "", comparison);
-		comparison->setOperand(0, extended);
-		comparison->setOperand(1, llvm::ConstantInt::get(function.getContext(), boundary.ashr(shift)));
-		comparison->setPredicate(predicate);
-		if (scaled->use_empty()) scaled->eraseFromParent();
+		if (!comparison) continue;
+		unsigned operand = llvm::isa<llvm::ConstantInt>(comparison->getOperand(1)) ? 0 : 1;
+		auto scale = proveSignedScale(*comparison->getOperand(operand));
+		if (!scale) continue;
+		auto proof = proveSignedScaledComparison(*comparison, *scale->operation, scale->shift);
+		if (!proof) continue;
+		comparison->setOperand(0, createSignedView(*scale, *comparison));
+		comparison->setOperand(1, llvm::ConstantInt::get(function.getContext(), proof->boundary));
+		comparison->setPredicate(proof->predicate);
+		if (scale->operation->use_empty()) scale->operation->eraseFromParent();
 	}
 }
 
@@ -979,6 +1119,7 @@ void recoverPointerExpressions(llvm::Module &module, config::Config &config) {
 		for (auto& function : module) {
 			if (config.architecture.isMipsOrPic32()) {
 				recoverUnsignedReciprocalSinks(function);
+				recoverSharedSignedViews(function);
 				recoverSignedScaledPredicates(function);
 			}
 			if (auto* source = config.functions.getFunctionByName(function.getName().str())) {
