@@ -56,6 +56,7 @@ class ParamReturn : public llvm::ModulePass
 		void retainSelectedDefinitionOnly();
 		void projectOriginalParameters();
 		void projectOriginalBody();
+		void projectConditionalStackWordBody(const common::OriginalEntryStackWordBody&);
 		void publishReturnDispositions() const;
 		void requireSelectedContracts() const;
 		void invalidatePreviousNativeReturnEvidence() const;

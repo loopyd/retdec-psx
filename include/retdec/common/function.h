@@ -267,7 +267,14 @@ struct OriginalSourceExpression {
 };
 
 enum class OriginalSourceForm { SignedNarrowCast, UnsignedMaskSubtract };
-enum class OriginalBodyCandidate { EmptyVoid, OrdinaryC };
+struct OriginalEmptyVoidBody {};
+struct OriginalOrdinaryBody {};
+struct OriginalEntryStackWordBody {
+	uint64_t pc;
+	unsigned definition;
+};
+using OriginalBodyCandidate = std::variant<OriginalEmptyVoidBody,
+	OriginalOrdinaryBody, OriginalEntryStackWordBody>;
 
 inline const char* originalSourceFormName(OriginalSourceForm form) {
 	switch (form) {

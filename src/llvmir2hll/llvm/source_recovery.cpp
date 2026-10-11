@@ -998,12 +998,17 @@ void recoverSourceSignatures(ShPtr<Module> module, const config::Config &config)
 					|| !source->returnDisposition
 					|| source->returnDisposition->kind != common::ReturnDisposition::Kind::Unknown)
 				throw std::runtime_error("invalid-original-body-candidate-projection");
-			if (*source->originalBodyCandidate == common::OriginalBodyCandidate::OrdinaryC) {
+			if (std::holds_alternative<common::OriginalOrdinaryBody>(*source->originalBodyCandidate)
+					|| std::holds_alternative<common::OriginalEntryStackWordBody>(*source->originalBodyCandidate)) {
 				if (!machine || machine->isDeclaration() || !function->getBody())
 					throw std::runtime_error("original-body-proposal-lowering-incomplete");
+				if (std::holds_alternative<common::OriginalEntryStackWordBody>(*source->originalBodyCandidate)
+						&& (machine->arg_size() != 5 || function->getNumOfParams() != 5
+							|| !machine->getReturnType()->isIntegerTy(32)))
+					throw std::runtime_error("conditional-stack-word-projection-incomplete");
 				continue;
 			}
-			if (*source->originalBodyCandidate != common::OriginalBodyCandidate::EmptyVoid)
+			if (!std::holds_alternative<common::OriginalEmptyVoidBody>(*source->originalBodyCandidate))
 				throw std::runtime_error("invalid-original-body-candidate-projection");
 			function->setRetType(VoidType::create());
 			function->setParams({}); function->setLocalVars({}); function->setVarArg(false);

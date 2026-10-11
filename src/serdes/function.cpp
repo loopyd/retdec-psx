@@ -489,10 +489,18 @@ void serialize(Writer& writer, const common::Function& f)
 	}
 	if (f.originalBodyCandidate) {
 		writer.Key("originalBodyCandidate");
-		switch (*f.originalBodyCandidate) {
-			case common::OriginalBodyCandidate::EmptyVoid: writer.String("mips-empty-body/v1"); break;
-			case common::OriginalBodyCandidate::OrdinaryC: writer.String("mips-ordinary-body/v1"); break;
-			default: throw std::runtime_error("invalid-original-body-candidate");
+		if (std::holds_alternative<common::OriginalEmptyVoidBody>(*f.originalBodyCandidate))
+			writer.String("mips-empty-body/v1");
+		else if (std::holds_alternative<common::OriginalOrdinaryBody>(*f.originalBodyCandidate))
+			writer.String("mips-ordinary-body/v1");
+		else {
+			const auto& body = std::get<common::OriginalEntryStackWordBody>(*f.originalBodyCandidate);
+			writer.StartObject(); writer.Key("kind"); writer.String("mips-entry-stack-word-body/v1");
+			writer.Key("input"); writer.StartObject();
+			writer.Key("pc"); writer.Uint64(body.pc);
+			writer.Key("definition"); writer.Uint(body.definition); writer.EndObject();
+			writer.Key("condition"); writer.String("o32-entry-sp16-word-stable-until-load");
+			writer.EndObject();
 		}
 	}
 	if (!f.originalSourceExpressions.empty()) {

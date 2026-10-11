@@ -85,6 +85,13 @@ and declaration facts. This path rejects indirect and exceptional control,
 incomplete lowering and escaping stack use. Proposed signatures describe emitted
 syntax and grant no original declaration authority.
 
+Call-free bodies with complete direct control flow can also produce a conditional
+five-word C89 carrier for one incoming word at `sp+16`. This requires an unchanged
+stack pointer and a checked load before any branch or store. The carrier assumes
+the O32 word layout and a valid, aligned entry stack slot whose contents stay
+stable until the load. Its mechanical signature does not establish the original
+C parameters or return declaration; all original obligations remain intact.
+
 Keep private original images, authored evaluator references and byte-bearing
 captures local. Original-only generation withholds authored answers, names, maps
 and source-specific compiler profiles.

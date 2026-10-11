@@ -121,8 +121,11 @@ bool ParamReturn::run()
 			publishReturnDispositions();
 			requireSelectedContracts();
 			auto* selected = _config->getConfigFunction(_config->getConfig().parameters.getEntryPoint());
-			syntaxOnly = selected && selected->originalBodyCandidate == common::OriginalBodyCandidate::OrdinaryC;
-			if (syntaxOnly) projectOriginalBody();
+			syntaxOnly = selected && selected->originalBodyCandidate
+				&& !std::holds_alternative<common::OriginalEmptyVoidBody>(*selected->originalBodyCandidate);
+			if (syntaxOnly && std::holds_alternative<common::OriginalEntryStackWordBody>(*selected->originalBodyCandidate))
+				projectConditionalStackWordBody(std::get<common::OriginalEntryStackWordBody>(*selected->originalBodyCandidate));
+			else if (syntaxOnly) projectOriginalBody();
 			else {
 				filterCalls();
 				projectOriginalParameters();
@@ -1550,6 +1553,127 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
 
 }
 
+namespace {
+std::optional<common::OriginalEntryStackWordBody> proposeIncomingStackWordBody(
+	const Disposition& disposition, const common::OriginalFunctionSummary& summary,
+	const std::map<std::pair<uint64_t, uint64_t>, RegisterState>& states)
+{
+	const auto& evidence = disposition.evidence;
+	if (disposition.kind != Disposition::Kind::Unknown || evidence.selection != "selected-root"
+		|| !evidence.decodeComplete || !evidence.analysisComplete || !evidence.calls.empty()
+		|| !summary.entry.isComplete() || !summary.control.isComplete()
+		|| summary.result.kind != common::OriginalFact::Kind::Partial
+		|| summary.declaration.kind != common::OriginalFact::Kind::Partial
+		|| summary.effects.kind != common::OriginalFact::Kind::Partial
+		|| summary.pendingEntry != "requires-no-pending-gpr-loads"
+		|| evidence.exits.size() != 1 || summary.exits.size() != 1
+		|| evidence.instructions.size() < 3 || evidence.instructions.size() > Disposition::RowLimit
+		|| evidence.end != evidence.start + 4 * evidence.instructions.size()) return {};
+	const auto& exit = evidence.exits.front();
+	const auto& normal = summary.exits.front();
+	if (exit.missing || exit.definitions.empty() || !exit.bad.empty() || !exit.pendingDefinitions.empty()
+		|| normal.pc != exit.pc || normal.delay != exit.delaySlot
+		|| !normal.incomingLink.isComplete() || normal.sampledEntry != 31) return {};
+	std::map<uint64_t, const Disposition::Instruction*> instructions;
+	std::multimap<uint64_t, const Disposition::Edge*> incoming, outgoing;
+	std::optional<uint64_t> loadPc;
+	unsigned returns = 0;
+	bool prefix = true;
+	for (unsigned index = 0; index < evidence.instructions.size(); ++index) {
+		const auto& row = evidence.instructions[index];
+		auto operation = originalOperation(row);
+		if (row.pc != evidence.start + 4 * index || row.bytes != 4 || row.pc % 4
+			|| row.owner != evidence.symbol || !row.mapped || row.undef || operation.merge
+			|| operation.kind == MipsOperation::Unsupported || operation.kind == MipsOperation::Call
+			|| operation.kind == MipsOperation::Trap) return {};
+		instructions.emplace(row.pc, &row);
+		for (auto reg : operation.destinations)
+			if (reg == 29 || reg == 31 || (reg && std::count(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), reg) != 1)) return {};
+		for (auto reg : operation.inputs) if (reg == 29) {
+			if (loadPc || !prefix || row.word >> 26 != 35 || uint16_t(row.word) != 16
+				|| !((row.word >> 16) & 31)) return {};
+			loadPc = row.pc;
+		}
+		if (operation.kind == MipsOperation::Return) {
+			if (row.word != 0x03e00008 || row.pc != exit.pc || exit.delaySlot != row.pc + 4) return {};
+			++returns;
+		}
+		if (operation.kind == MipsOperation::Branch && (!operation.target
+			|| *operation.target < evidence.start || *operation.target >= evidence.end)) return {};
+		if (operation.kind == MipsOperation::Branch || operation.kind == MipsOperation::Store
+			|| operation.kind == MipsOperation::Return) prefix = false;
+	}
+	if (!loadPc || returns != 1) return {};
+	for (const auto& edge : evidence.edges) {
+		if (!instructions.count(edge.from) || !instructions.count(edge.to)
+			|| (edge.delayOwner && !instructions.count(*edge.delayOwner))) return {};
+		incoming.emplace(edge.to, &edge); outgoing.emplace(edge.from, &edge);
+	}
+	if (!originalMemoryPrefix(evidence, instructions, outgoing, incoming, *loadPc, {}, 29)) return {};
+	std::map<unsigned, const Disposition::Definition*> definitions;
+	std::optional<unsigned> loadDefinition;
+	for (const auto& definition : evidence.definitions) {
+		if (!definitions.emplace(definition.id, &definition).second || definition.width != 32
+			|| definition.origin != "instruction" || !instructions.count(definition.pc)) return {};
+		if (definition.pc == *loadPc) {
+			if (loadDefinition || definition.reg != ((instructions.at(*loadPc)->word >> 16) & 31)
+				|| !definition.delayed || definition.operation != "full-register-load"
+				|| !definition.inputs.empty() || !definition.formals.empty()
+				|| definition.entries != std::vector<unsigned>{29}
+				|| definition.bad != std::vector<std::string>{"unproved-entry-register-29"}) return {};
+			loadDefinition = definition.id;
+		}
+	}
+	if (!loadDefinition) return {};
+	auto derivesFromLoad = [&](unsigned reference) {
+		std::vector<unsigned> pending{reference};
+		std::set<unsigned> visited;
+		bool found = false;
+		while (!pending.empty()) {
+			auto id = pending.back(); pending.pop_back();
+			if (!visited.insert(id).second) continue;
+			if (visited.size() > Disposition::RowLimit || !definitions.count(id)) return false;
+			found |= id == *loadDefinition;
+			const auto& definition = *definitions.at(id);
+			pending.insert(pending.end(), definition.inputs.begin(), definition.inputs.end());
+		}
+		return found;
+	};
+	for (const auto& pair : definitions) {
+		const auto& definition = *pair.second;
+		if (!definition.bad.empty() && (definition.bad != std::vector<std::string>{"unproved-entry-register-29"}
+			|| !derivesFromLoad(definition.id))) return {};
+	}
+	for (auto reference : exit.definitions)
+		if (!definitions.count(reference) || definitions.at(reference)->reg != 2 || !definitions.at(reference)->bad.empty()) return {};
+	std::set<uint64_t> taintedUses;
+	for (const auto& point : states) {
+		if (!instructions.count(point.first.first) || !point.second.conditionalTables.empty()
+			|| !point.second.conditionalCallees.empty()) return {};
+		auto inputs = inputFact(point.second, originalOperation(*instructions.at(point.first.first)));
+		if (inputs.bad.empty()) continue;
+		if (inputs.bad != std::set<std::string>{"unproved-entry-register-29"} || inputs.missing) return {};
+		if (point.first.first != *loadPc && (inputs.definitions.empty()
+			|| std::none_of(inputs.definitions.begin(), inputs.definitions.end(), derivesFromLoad))) return {};
+		taintedUses.insert(point.first.first);
+	}
+	for (const auto& demand : summary.demands)
+		if (!((4 <= demand.reg && demand.reg <= 7) || (demand.reg == 31 && demand.role == "continuation")
+			|| (demand.reg == 29 && taintedUses.count(demand.pc)))) return {};
+	bool entryObligation = false;
+	for (const auto& obligation : evidence.obligations) {
+		if (obligation.domain == "architectural" && (obligation.pc != evidence.start
+			|| obligation.reason != "all-path-v0-definition-unresolved")) return {};
+		if (obligation.domain == "entry") {
+			if (obligation.reason != "unproved-control-or-effect-input" || !taintedUses.count(obligation.pc)) return {};
+			entryObligation = true;
+		}
+	}
+	if (!entryObligation) return {};
+	return common::OriginalEntryStackWordBody{*loadPc, *loadDefinition};
+}
+}
+
 void ParamReturn::qualifyReturns()
 {
     OriginalContractGraph graph;
@@ -1638,6 +1762,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 		evidence.edges.clear(); evidence.definitions.clear(); evidence.exits.clear(); evidence.calls.clear();
 		evidence.decodeComplete = false; evidence.analysisComplete = false;
 		cf->originalJumpTables.clear();
+		std::optional<common::OriginalEntryStackWordBody> stackWordBody;
 		auto obligation = [&](uint64_t pc, const std::string& domain, const std::string& reason) {
 			for (const auto& row : evidence.obligations)
 				if (row.pc == pc && row.domain == domain && row.reason == reason) return;
@@ -1992,6 +2117,8 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     }
                 }
                 recoverOriginalMemory(summary, disposition, _image, *scope, _config->getConfig().parameters, accesses);
+				if (imageView && cf->parameters.empty())
+					stackWordBody = proposeIncomingStackWordBody(disposition, summary, states);
             }
 		} catch (const std::exception& error) {
 			disposition.kind = Disposition::Kind::Unknown;
@@ -2010,9 +2137,11 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 		cf->returnDisposition = de.getReturnDisposition();
 		cf->originalBodyCandidate.reset();
 		if (revised && canProposeEmptyBody(*cf))
-			cf->originalBodyCandidate = common::OriginalBodyCandidate::EmptyVoid;
+			cf->originalBodyCandidate = common::OriginalEmptyVoidBody{};
 		else if (revised && canProposeOrdinaryBody(*cf))
-			cf->originalBodyCandidate = common::OriginalBodyCandidate::OrdinaryC;
+			cf->originalBodyCandidate = common::OriginalOrdinaryBody{};
+		else if (revised && stackWordBody)
+			cf->originalBodyCandidate = *stackWordBody;
 	}
 }
 
@@ -2038,8 +2167,9 @@ void ParamReturn::requireSelectedContracts() const
 	const auto& p = _config->getConfig().parameters;
 	auto* cf = _config->getConfigFunction(p.getEntryPoint());
 	if (cf && cf->originalBodyCandidate
-		&& ((*cf->originalBodyCandidate == common::OriginalBodyCandidate::EmptyVoid && canProposeEmptyBody(*cf))
-			|| (*cf->originalBodyCandidate == common::OriginalBodyCandidate::OrdinaryC && canProposeOrdinaryBody(*cf)))) return;
+		&& ((std::holds_alternative<common::OriginalEmptyVoidBody>(*cf->originalBodyCandidate) && canProposeEmptyBody(*cf))
+			|| (std::holds_alternative<common::OriginalOrdinaryBody>(*cf->originalBodyCandidate) && canProposeOrdinaryBody(*cf))
+			|| std::holds_alternative<common::OriginalEntryStackWordBody>(*cf->originalBodyCandidate))) return;
 	if (!cf || !cf->returnDisposition || cf->returnDisposition->kind != Disposition::Kind::Value)
 		throw OriginalContractRefusal("original-only selected return contract is unknown");
     if (p.getOriginalCallScope() && (!cf->originalCallSummary || !cf->originalCallSummary->declaration.isComplete()))
@@ -2047,6 +2177,80 @@ void ParamReturn::requireSelectedContracts() const
 	for (const auto& call : cf->returnDisposition->evidence.calls)
 		if (call.required && !call.qualified)
 			throw OriginalContractRefusal("original-only required call contract is unknown");
+}
+
+void ParamReturn::projectConditionalStackWordBody(const common::OriginalEntryStackWordBody& body)
+{
+	auto& functions = _config->getConfig().functions;
+	const auto original = functions;
+	auto* selected = original.getFunctionByStartAddress(_config->getConfig().parameters.getEntryPoint());
+	if (!selected || !selected->originalBodyCandidate
+		|| !std::holds_alternative<common::OriginalEntryStackWordBody>(*selected->originalBodyCandidate)
+		|| !selected->returnDisposition || selected->returnDisposition->kind != Disposition::Kind::Unknown)
+		throw std::runtime_error("conditional-stack-word-proposal-scope-differs");
+	auto* function = _module->getFunction(selected->getName());
+	if (!function || function->isDeclaration() || function->arg_size() || function->isVarArg())
+		throw std::runtime_error("conditional-stack-word-proposal-already-projected");
+	auto* slot = _config->getLlvmStackVariable(function, 16);
+	auto* v0 = _abi->getRegister(MIPS_REG_V0);
+	if (!slot || !slot->getAllocatedType()->isIntegerTy(32) || !v0 || !v0->getValueType()->isIntegerTy(32))
+		throw std::runtime_error("conditional-stack-word-carrier-unresolved");
+	unsigned loads = 0;
+	for (auto* user : slot->users()) {
+		auto* load = dyn_cast<LoadInst>(user);
+		if (!load || load->getPointerOperand() != slot || !load->getType()->isIntegerTy(32)
+			|| load->isVolatile() || load->isAtomic() || AsmInstruction(load).getAddress() != body.pc)
+			throw std::runtime_error("conditional-stack-word-slot-use-differs");
+		++loads;
+	}
+	if (loads != 1) throw std::runtime_error("conditional-stack-word-slot-load-unresolved");
+	std::vector<Value*> carriers;
+	std::vector<Type*> types;
+	std::vector<common::Storage> storages;
+	for (unsigned reg = MIPS_REG_A0; reg <= MIPS_REG_A3; ++reg) {
+		auto* value = _abi->getRegister(reg);
+		auto* observed = value ? _config->getConfigRegister(value) : nullptr;
+		if (!value || !value->getValueType()->isIntegerTy(32) || !observed
+			|| !observed->getStorage().isRegister() || observed->getStorage().getRegisterNumber() != reg)
+			throw std::runtime_error("conditional-stack-word-register-carrier-unresolved");
+		carriers.push_back(value); types.push_back(value->getValueType()); storages.push_back(observed->getStorage());
+	}
+	carriers.push_back(slot); types.push_back(slot->getAllocatedType()); storages.push_back(common::Storage::onStack(16));
+	std::vector<ReturnInst*> returns;
+	const auto& exit = selected->returnDisposition->evidence.exits.front();
+	for (auto& instruction : instructions(function)) if (auto* ret = dyn_cast<ReturnInst>(&instruction)) {
+		auto address = AsmInstruction(ret).getAddress();
+		if (!address.isDefined() || (address != exit.pc && address != exit.delaySlot))
+			throw std::runtime_error("conditional-stack-word-return-owner-differs");
+		returns.push_back(ret);
+	}
+	if (returns.size() != 1) throw std::runtime_error("conditional-stack-word-return-inventory-differs");
+	try {
+		std::map<ReturnInst*, Value*> values{{returns.front(), new LoadInst(v0, "", returns.front())}};
+		IrModifier modifier(_module, _config);
+		auto* projected = modifier.modifyFunction(function, v0->getValueType(), types, false,
+			values, {}, v0, carriers, {}).first;
+		auto* updated = _config->getConfigFunction(projected);
+		if (!updated || updated->getName() != selected->getName() || updated->parameters.size() != storages.size())
+			throw std::runtime_error("conditional-stack-word-projected-inventory-differs");
+		auto parameters = updated->parameters;
+		for (unsigned index = 0; index < parameters.size(); ++index) {
+			if (parameters[index].type.getLlvmIr() != "i32")
+				throw std::runtime_error("conditional-stack-word-projected-type-differs");
+			parameters[index].setStorage(storages[index]);
+		}
+		functions = original;
+		auto* restored = _config->getConfigFunction(projected);
+		if (!restored) throw std::runtime_error("conditional-stack-word-restored-identity-differs");
+		restored->parameters = std::move(parameters);
+		restored->returnType.setLlvmIr("i32");
+		restored->returnStorage = common::Storage::inRegister("v0", MIPS_REG_V0);
+		_fnc2calls.clear();
+	} catch (...) {
+		functions = original;
+		_fnc2calls.clear();
+		throw;
+	}
 }
 
 void ParamReturn::projectOriginalBody()
