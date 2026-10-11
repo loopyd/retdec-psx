@@ -30,6 +30,8 @@
 #include "retdec/llvmir2hll/ir/eq_op_expr.h"
 #include "retdec/llvmir2hll/ir/expression.h"
 #include "retdec/llvmir2hll/ir/ext_cast_expr.h"
+#include "retdec/llvmir2hll/ir/int_type.h"
+#include "retdec/llvmir2hll/ir/variable.h"
 #include "retdec/llvmir2hll/ir/fp_to_int_cast_expr.h"
 #include "retdec/llvmir2hll/ir/gt_eq_op_expr.h"
 #include "retdec/llvmir2hll/ir/gt_op_expr.h"
@@ -260,6 +262,14 @@ ShPtr<Expression> LLVMInstructionConverter::visitFPExtInst(llvm::FPExtInst &inst
 *        in BIR.
 */
 ShPtr<Expression> LLVMInstructionConverter::visitSExtInst(llvm::SExtInst &inst) {
+	if (auto association = getConverter()->bindOriginalExtraction(inst)) {
+		auto trunc = TruncCastExpr::create(association->parameter(),
+			IntType::create(association->witness().viewWidth, true));
+		auto extend = ExtCastExpr::create(trunc, IntType::create(32, true), ExtCastExpr::Variant::SExt);
+		trunc->setOriginalExtraction(association);
+		extend->setOriginalExtraction(association);
+		return extend;
+	}
 	return convertExtCastInstToExpression(inst, ExtCastExpr::Variant::SExt);
 }
 

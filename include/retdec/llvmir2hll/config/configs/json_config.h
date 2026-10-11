@@ -43,6 +43,9 @@ class JSONConfigParsingError: public JSONConfigError {
 class JSONConfig: public Config {
 public:
 	virtual ~JSONConfig() override;
+	bool isOriginalOnlyReturnRecovery() const override;
+	std::optional<common::OriginalSourceRecoveryView> getOriginalSourceRecovery(
+		const std::string& functionInitialName) const override;
 
 	/// @name Loading and Saving
 	/// @{

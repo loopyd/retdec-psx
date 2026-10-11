@@ -4,6 +4,7 @@
 * @copyright (c) 2019 Avast Software, licensed under the MIT license
 */
 
+#include <algorithm>
 #include <array>
 #include <deque>
 #include <functional>
@@ -28,6 +29,9 @@
 #include "retdec/bin2llvmir/utils/debug.h"
 #include "retdec/bin2llvmir/providers/asm_instruction.h"
 #include "retdec/bin2llvmir/utils/ir_modifier.h"
+#include "retdec/fileformat/file_format/file_format.h"
+#include "retdec/loader/loader/image.h"
+#include "retdec/loader/loader/segment.h"
 
 using namespace retdec::utils;
 using namespace llvm;
@@ -113,6 +117,10 @@ bool ParamReturn::run()
 			applyToIr();
 			retainSelectedDefinitionOnly();
 		} catch (...) {
+			for (const auto& function : _config->getConfig().functions)
+				if (function.originalCallSummary)
+					for (auto& access : const_cast<common::Function&>(function).originalCallSummary->accesses)
+						access.address = common::OriginalFact::partial("native-analysis-failed");
 			publishReturnDispositions();
 			_RDA.clear();
 			throw;
@@ -142,6 +150,7 @@ void ParamReturn::invalidatePreviousNativeReturnEvidence() const
 		{
 			const_cast<common::Function&>(cf).returnDisposition.reset();
 			const_cast<common::Function&>(cf).originalCallSummary.reset();
+			const_cast<common::Function&>(cf).originalBodyCandidate.reset();
 			const_cast<common::Function&>(cf).originalSourceExpressions.clear();
 		}
 }
@@ -171,6 +180,52 @@ void ParamReturn::validateStrictProfile() const
 
 namespace {
 using Disposition = common::ReturnDisposition;
+
+bool canProposeEmptyBody(const common::Function& function)
+{
+	if (!function.returnDisposition || !function.originalCallSummary) return false;
+	const auto& disposition = *function.returnDisposition;
+	const auto& evidence = disposition.evidence;
+	const auto& summary = *function.originalCallSummary;
+	if (disposition.kind != Disposition::Kind::Unknown || evidence.selection != "selected-root"
+		|| !evidence.decodeComplete || !evidence.analysisComplete
+		|| evidence.end != evidence.start + 8 || evidence.instructions.size() != 2
+		|| !evidence.definitions.empty() || !evidence.calls.empty()
+		|| evidence.edges.size() != 1 || evidence.exits.size() != 1
+		|| evidence.obligations.size() != 1 || !summary.entry.isComplete()
+		|| !summary.control.isComplete() || !summary.effects.isComplete()
+		|| summary.result.isComplete() || summary.declaration.isComplete()
+		|| !summary.accesses.empty() || !summary.parameterRegisters.empty()
+		|| summary.demands.size() != 1 || summary.exits.size() != 1
+		|| summary.transfers.size() != Disposition::RegisterCount) return false;
+	for (unsigned i = 0; i < 2; ++i) {
+		const auto& instruction = evidence.instructions[i];
+		if (instruction.pc != evidence.start + 4 * i || instruction.word != (i ? 0 : 0x03e00008)
+			|| instruction.owner != evidence.symbol || instruction.bytes != 4
+			|| !instruction.mapped || instruction.undef || !instruction.fullWidthRegisters.empty()) return false;
+	}
+	const auto& edge = evidence.edges.front();
+	const auto& exit = evidence.exits.front();
+	const auto& obligation = evidence.obligations.front();
+	const auto& demand = summary.demands.front();
+	const auto& normalExit = summary.exits.front();
+	if (edge.from != evidence.start || edge.to != evidence.start + 4
+		|| edge.delayOwner != evidence.start || edge.kind != "delay-slot"
+		|| exit.pc != evidence.start || exit.delaySlot != evidence.start + 4 || exit.missing
+		|| !exit.definitions.empty() || !exit.formals.empty() || !exit.pendingDefinitions.empty()
+		|| obligation.pc != evidence.start || obligation.domain != "architectural"
+		|| obligation.reason != "all-path-v0-definition-unresolved"
+		|| demand.pc != evidence.start || demand.reg != 31 || demand.role != "continuation"
+		|| normalExit.pc != evidence.start || normalExit.delay != evidence.start + 4
+		|| !normalExit.incomingLink.isComplete() || normalExit.sampledEntry != 31) return false;
+	for (unsigned reg = 0; reg < Disposition::RegisterCount; ++reg) {
+		const auto& transfer = summary.transfers[reg];
+		if (transfer.reg != reg || transfer.kind != "preserved" || !transfer.proof.isComplete()
+			|| transfer.pending || !transfer.pendingDefinitions.empty()) return false;
+	}
+	return true;
+}
+
 struct RegisterFact {
 	bool missing = true;
 	std::set<unsigned> definitions, formals, entries;
@@ -193,10 +248,12 @@ struct RegisterState {
     const RegisterFact& operator[](unsigned reg) const { return registers[reg]; }
 };
 struct MipsOperation {
-	enum Kind { Compute, Multiply, Load, Store, Branch, Return, Call, Unsupported } kind = Unsupported;
+	enum Kind { Compute, Multiply, Divide, Load, Store, Branch, Return, Call, Trap, Unsupported } kind = Unsupported;
+	enum class MergeMemory { Lwl, Lwr, Swl, Swr };
 	std::vector<unsigned> destinations;
 	std::vector<unsigned> inputs;
 	std::optional<uint64_t> target;
+	std::optional<MergeMemory> merge;
 	bool conditional = false;
 	std::string name = "unsupported";
 };
@@ -222,14 +279,23 @@ MipsOperation originalOperation(const Disposition::Instruction& instruction)
 			result.kind = MipsOperation::Compute; result.destinations = {rd};
 			result.inputs = {rs, rt}; result.name = "integer-binary";
 		}
-		else if (fn == 24 && rd == 0 && ((word >> 6) & 31) == 0) {
-			result.kind = MipsOperation::Multiply; result.name = "signed-multiply";
+		else if ((fn == 24 || fn == 25) && rd == 0 && ((word >> 6) & 31) == 0) {
+			result.kind = MipsOperation::Multiply;
+			result.name = fn == 24 ? "signed-multiply" : "unsigned-multiply";
 			result.destinations = {Disposition::HiRegister, Disposition::LoRegister};
 			result.inputs = {rs, rt};
 		}
-		else if (fn == 18 && rs == 0 && rt == 0 && ((word >> 6) & 31) == 0) {
-			result.kind = MipsOperation::Compute; result.name = "mflo";
-			result.destinations = {rd}; result.inputs = {Disposition::LoRegister};
+		else if ((fn == 26 || fn == 27) && rd == 0 && ((word >> 6) & 31) == 0) {
+			result.kind = MipsOperation::Divide;
+			result.name = fn == 26 ? "signed-divide" : "unsigned-divide";
+			result.destinations = {Disposition::HiRegister, Disposition::LoRegister};
+			result.inputs = {rs, rt};
+		}
+		else if (fn == 13) { result.kind = MipsOperation::Trap; result.name = "break"; }
+		else if ((fn == 16 || fn == 18) && rs == 0 && rt == 0 && ((word >> 6) & 31) == 0) {
+			result.kind = MipsOperation::Compute; result.name = fn == 16 ? "mfhi" : "mflo";
+			result.destinations = {rd};
+			result.inputs = {fn == 16 ? Disposition::HiRegister : Disposition::LoRegister};
 		}
 	}
 	else if (op == 2 || op == 3) {
@@ -256,10 +322,32 @@ MipsOperation originalOperation(const Disposition::Instruction& instruction)
 		result.kind = MipsOperation::Load; result.name = "full-register-load";
 		result.destinations = {rt}; result.inputs = {rs};
 	}
+	else if (op == 34 || op == 38) {
+		result.kind = MipsOperation::Load; result.name = op == 34 ? "lwl" : "lwr";
+		result.merge = op == 34 ? MipsOperation::MergeMemory::Lwl : MipsOperation::MergeMemory::Lwr;
+		result.destinations = {rt}; result.inputs = {rs};
+	}
 	else if (op == 40 || op == 41 || op == 43) {
 		result.kind = MipsOperation::Store; result.name = "memory-store"; result.inputs = {rs, rt};
 	}
+	else if (op == 42 || op == 46) {
+		result.kind = MipsOperation::Store; result.name = op == 42 ? "swl" : "swr";
+		result.merge = op == 42 ? MipsOperation::MergeMemory::Swl : MipsOperation::MergeMemory::Swr;
+		result.inputs = {rs, rt};
+	}
 	return result;
+}
+
+std::optional<uint32_t> retainedLoadMask(const MipsOperation& operation,
+    const Disposition::Instruction& row, const RegisterState& before)
+{
+    if (operation.kind != MipsOperation::Load || !operation.merge) return {};
+    const auto& base = before[operation.inputs.front()].constant;
+    if (!base) return {};
+    uint32_t address = *base + uint32_t(int32_t(int16_t(row.word & 0xffff)));
+    unsigned byte = address & 3;
+    return *operation.merge == MipsOperation::MergeMemory::Lwl
+        ? ~(UINT32_MAX << (8 * (3 - byte))) : ~(UINT32_MAX >> (8 * byte));
 }
 
 RegisterFact inputFact(const RegisterState& state, const MipsOperation& operation)
@@ -417,6 +505,200 @@ void finishOriginalDeclaration(common::OriginalFunctionSummary& summary)
     summary.declaration = supported ? common::OriginalFact::complete() : common::OriginalFact::partial("supported-i32-declaration-projection-unresolved");
 }
 
+bool originalMemoryPrefix(const Disposition::Evidence& evidence,
+    const std::map<uint64_t, const Disposition::Instruction*>& instructions,
+    const std::multimap<uint64_t, const Disposition::Edge*>& outgoingEdges,
+    const std::multimap<uint64_t, const Disposition::Edge*>& incomingEdges, uint64_t accessPc)
+{
+    for (const auto& pair : instructions) {
+        const auto& row = *pair.second;
+        auto operation = originalOperation(row);
+        if (operation.kind == MipsOperation::Unsupported || operation.kind == MipsOperation::Call
+            || operation.kind == MipsOperation::Trap
+            || (operation.kind == MipsOperation::Return && row.word != 0x03e00008)) return false;
+        if (operation.kind == MipsOperation::Branch) {
+            auto entersPrefix = [&](uint32_t target) { return evidence.start <= target && target <= accessPc; };
+            if (!operation.target || entersPrefix(uint32_t(*operation.target))
+                || (operation.conditional && entersPrefix(uint32_t(row.pc + 8)))) return false;
+        }
+        if (row.pc >= accessPc) continue;
+        if (operation.kind == MipsOperation::Load || operation.kind == MipsOperation::Branch
+            || operation.kind == MipsOperation::Return) return false;
+        for (auto destination : operation.destinations)
+            if (destination && std::count(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), destination) != 1)
+                return false;
+        unsigned outgoing = 0;
+        auto edges = outgoingEdges.equal_range(row.pc);
+        for (auto position = edges.first; position != edges.second; ++position) {
+            const auto& edge = *position->second;
+            if (edge.to != row.pc + 4 || edge.delayOwner || edge.kind != "fallthrough") return false;
+            ++outgoing;
+        }
+        if (outgoing != 1) return false;
+    }
+    for (uint64_t pc = evidence.start; pc <= accessPc; pc += 4) {
+        unsigned incoming = 0;
+        auto edges = incomingEdges.equal_range(pc);
+        for (auto position = edges.first; position != edges.second; ++position) {
+            const auto& edge = *position->second;
+            if (pc == evidence.start || edge.from != pc - 4 || edge.delayOwner || edge.kind != "fallthrough") return false;
+            ++incoming;
+        }
+        if (incoming != unsigned(pc != evidence.start)) return false;
+    }
+    return true;
+}
+
+const Disposition::Definition* originalMemoryLatest(
+    const std::map<uint64_t, const Disposition::Instruction*>& instructions,
+    const std::map<std::pair<uint64_t, unsigned>, const Disposition::Definition*>& definitions,
+    uint64_t before, unsigned reg)
+{
+    if (!reg) return nullptr;
+    auto position = instructions.lower_bound(before);
+    while (position != instructions.begin()) {
+        --position;
+        const auto& row = *position->second;
+        auto operation = originalOperation(row);
+        if (std::find(operation.destinations.begin(), operation.destinations.end(), reg) == operation.destinations.end()) continue;
+        auto definition = definitions.find({row.pc, reg});
+        return definition == definitions.end() ? nullptr : definition->second;
+    }
+    return nullptr;
+}
+
+std::optional<common::OriginalFixedMemoryAddress> originalMemoryAddress(
+    const common::OriginalMemoryAccess& access,
+    const std::map<uint64_t, const Disposition::Instruction*>& instructions,
+    const std::map<std::pair<uint64_t, unsigned>, const Disposition::Definition*>& definitions)
+{
+    const auto& instruction = *instructions.at(access.pc);
+    auto operation = originalOperation(instruction);
+    if (operation.merge) return {};
+    unsigned opcode = instruction.word >> 26;
+    unsigned width = opcode == 32 || opcode == 36 || opcode == 40 ? 8 : opcode == 33 || opcode == 37 || opcode == 41 ? 16 : 32;
+    std::string kind = operation.kind == MipsOperation::Load ? "read" : "write";
+    std::string extension = kind == "write" || width == 32 ? "none" : opcode == 32 || opcode == 33 ? "sign" : "zero";
+    if ((operation.kind != MipsOperation::Load && operation.kind != MipsOperation::Store)
+        || access.kind != kind || access.width != width || access.extension != extension
+        || access.delayed != (operation.kind == MipsOperation::Load) || !access.addressEntries.empty()) return {};
+    unsigned reg = (instruction.word >> 21) & 31;
+    auto* definition = originalMemoryLatest(instructions, definitions, access.pc, reg);
+    if ((reg && !definition) || access.addressDefinitions != (reg ? std::vector<unsigned>{definition->id} : std::vector<unsigned>{})) return {};
+    std::vector<const Disposition::Definition*> chain;
+    while (definition) {
+        if (chain.size() >= 128) return {};
+        auto row = instructions.find(definition->pc);
+        if (row == instructions.end()) return {};
+        auto word = row->second->word;
+        unsigned op = word >> 26, source = (word >> 21) & 31, destination = (word >> 16) & 31;
+        if ((op != 15 && op != 9 && op != 12 && op != 13 && op != 14)
+            || (op == 15 && source) || !destination || definition->reg != destination
+            || definition->width != 32 || definition->delayed || definition->origin != "instruction"
+            || definition->operation != (op == 15 ? "lui" : "integer-immediate")
+            || !definition->bad.empty() || !definition->entries.empty() || !definition->formals.empty()
+            || definition->equalEntry || !definition->constant
+            || std::count(row->second->fullWidthRegisters.begin(), row->second->fullWidthRegisters.end(), destination) != 1) return {};
+        const auto* input = op == 15 ? nullptr : originalMemoryLatest(instructions, definitions, definition->pc, source);
+        if ((source && !input) || definition->inputs != (input ? std::vector<unsigned>{input->id} : std::vector<unsigned>{})) return {};
+        chain.push_back(definition);
+        definition = input;
+    }
+    common::OriginalFixedMemoryAddress address;
+    std::vector<uint64_t> storedEquality;
+    for (auto position = chain.rbegin(); position != chain.rend(); ++position) {
+        const auto& proof = **position;
+        auto word = instructions.at(proof.pc)->word;
+        unsigned op = word >> 26;
+        uint32_t immediate = word & 0xffff;
+        address.base = op == 15 ? immediate << 16 : op == 9 ? address.base + uint32_t(int32_t(int16_t(immediate)))
+            : op == 12 ? address.base & immediate : op == 13 ? address.base | immediate : address.base ^ immediate;
+        address.equalityEvidence.push_back(proof.pc);
+        if (immediate || (op != 9 && op != 13 && op != 14)) storedEquality.clear();
+        storedEquality.push_back(proof.pc);
+        if (proof.constant != std::optional<uint32_t>{address.base} || proof.equalityEvidence != storedEquality) return {};
+    }
+    address.value = address.base + uint32_t(int32_t(int16_t(instruction.word & 0xffff)));
+    if (address.value % (width / 8) == 0) address.alignment = common::OriginalFact::complete();
+    return address;
+}
+
+void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Disposition& disposition,
+    const FileImage* image, const common::OriginalCallScope& scope, const config::Parameters& parameters)
+{
+    for (auto& access : summary.accesses) access.address = common::OriginalFact::partial("original-address-proof-unresolved");
+    const auto& evidence = disposition.evidence;
+    if (!evidence.analysisComplete || !evidence.decodeComplete || !summary.control.isComplete()
+        || summary.exits.empty() || !evidence.calls.empty() || summary.pendingEntry != "requires-no-pending-gpr-loads"
+        || evidence.start % 4 || evidence.end % 4 || evidence.start >= evidence.end
+        || evidence.instructions.size() != (evidence.end - evidence.start) / 4 || !image) return;
+    unsigned identities = 0;
+    auto matchIdentity = [&](const common::ReviewedOriginalFunction& row) {
+        identities += row.start == evidence.start && row.end == evidence.end && row.key == summary.function;
+    };
+    matchIdentity(scope.root); for (const auto& row : scope.callees) matchIdentity(row);
+    auto* format = image->getFileFormat();
+    auto configuredLoad = parameters.getSectionVMA();
+    if (identities != 1 || !format || !format->isRawData() || format->getSha256() != scope.payloadHash
+        || scope.payloadHash.size() != 64 || configuredLoad.isUndefined() || configuredLoad.getValue() > UINT32_MAX) return;
+    uint64_t load = configuredLoad.getValue();
+    const auto& payload = format->getBytes();
+    if (payload.empty() || payload.size() > (uint64_t(1) << 32) - load || payload != format->getLoadedBytes()
+        || evidence.start < load || evidence.end - load > payload.size()) return;
+    std::map<uint64_t, const Disposition::Instruction*> instructions;
+    std::set<uint64_t> returns;
+    for (const auto& row : evidence.instructions) {
+        if (row.pc < evidence.start || row.pc >= evidence.end || row.pc % 4 || row.bytes != 4
+            || row.owner != evidence.symbol || !row.mapped || row.undef || !instructions.emplace(row.pc, &row).second) return;
+        auto offset = row.pc - load;
+        uint32_t word = uint32_t(payload[offset]) | uint32_t(payload[offset + 1]) << 8
+            | uint32_t(payload[offset + 2]) << 16 | uint32_t(payload[offset + 3]) << 24;
+        if (word != row.word) return;
+        if (originalOperation(row).kind == MipsOperation::Return) returns.insert(row.pc);
+    }
+    if (returns.size() != summary.exits.size() || returns.size() != evidence.exits.size()) return;
+    std::set<uint64_t> observedExits;
+    for (const auto& exit : evidence.exits)
+        if (!returns.count(exit.pc) || !observedExits.insert(exit.pc).second || exit.delaySlot != exit.pc + 4) return;
+    for (const auto& exit : summary.exits)
+        if (!returns.erase(exit.pc) || !exit.incomingLink.isComplete() || exit.sampledEntry != std::optional<unsigned>{31}
+            || exit.delay != exit.pc + 4 || !instructions.count(exit.delay)
+            || std::count(exit.equalityEvidence.begin(), exit.equalityEvidence.end(), exit.pc) != 1) return;
+    std::map<std::pair<uint64_t, unsigned>, const Disposition::Definition*> definitions;
+    std::set<unsigned> ids;
+    for (const auto& definition : evidence.definitions)
+        if (!definition.id || !ids.insert(definition.id).second
+            || !definitions.emplace(std::make_pair(definition.pc, definition.reg), &definition).second) return;
+    std::multimap<uint64_t, const Disposition::Edge*> outgoing, incoming;
+    for (const auto& edge : evidence.edges) {
+        outgoing.emplace(edge.from, &edge); incoming.emplace(edge.to, &edge);
+    }
+    auto* loaded = image->getImage();
+    const auto* segment = loaded && loaded->getNumberOfSegments() == 1 ? loaded->getSegmentFromAddress(load) : nullptr;
+    bool physical = segment && segment->getAddress() == load && segment->getSize() == payload.size()
+        && segment->getPhysicalSize() == payload.size();
+    if (physical) {
+        auto raw = segment->getRawData();
+        physical = raw.first && raw.second == payload.size() && std::equal(payload.begin(), payload.end(), raw.first);
+    }
+    for (auto& access : summary.accesses) {
+        if (!instructions.count(access.pc) || !originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc)) continue;
+        auto address = originalMemoryAddress(access, instructions, definitions);
+        if (!address) continue;
+        uint64_t count = access.width / 8, value = address->value;
+        if (physical && address->alignment.isComplete() && value >= load
+            && value + count <= (uint64_t(1) << 32) && value - load <= payload.size()
+            && count <= payload.size() - (value - load)) {
+            common::OriginalFileBytes bytes;
+            bytes.mappingStart = uint32_t(load); bytes.mappingBytes = payload.size(); bytes.payloadOffset = value - load;
+            if (loaded->getXBytes(value, count, bytes.bytes) && bytes.bytes.size() == count
+                && std::equal(bytes.bytes.begin(), bytes.bytes.end(), payload.begin() + bytes.payloadOffset))
+                address->fileBytes = std::move(bytes);
+        }
+        access.address = std::move(*address);
+    }
+}
+
 template<typename Graph>
 void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Graph& graph,
     std::map<unsigned, Disposition::Definition>& definitions,
@@ -569,6 +851,7 @@ void ParamReturn::projectOriginalParameters()
         auto& de = pair.second;
         auto* cf = de.getFunction() ? _config->getConfigFunction(de.getFunction()) : nullptr;
         if (!cf || !cf->originalCallSummary) continue;
+        if (cf->originalBodyCandidate) continue;
         const auto& summary = *cf->originalCallSummary;
         if (!summary.declaration.isComplete()) throw std::runtime_error("original-only declaration projection is unknown");
         std::vector<Value*> args;
@@ -683,12 +966,18 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 					obligation(pc, "architectural", "unsupported-pc-ir-join");
 				if (operation.kind == MipsOperation::Unsupported)
 					obligation(pc, "architectural", "unsupported-machine-operation");
+				if (operation.kind == MipsOperation::Trap) {
+					obligation(pc, "architectural", "break-exception-control-unresolved");
+					obligation(pc, "effect", "break-exception-effects-unresolved");
+					continue;
+				}
 				bool control = operation.kind == MipsOperation::Branch
 					|| operation.kind == MipsOperation::Call || operation.kind == MipsOperation::Return;
 				if (owner && control) {
 					obligation(pc, "architectural", "control-in-delay-slot"); continue;
 				}
 				auto inputs = inputFact(state, operation);
+                auto retainedMask = revised ? retainedLoadMask(operation, row, state) : std::optional<uint32_t>{};
                 if (revised) {
                     for (std::size_t index = 0; index < operation.inputs.size(); ++index) {
                         auto reg = operation.inputs[index];
@@ -725,11 +1014,17 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     }
                     state.mayPending[reg] = false; state.mayNoPending[reg] = true;
                 }
+                if (operation.kind == MipsOperation::Load && operation.merge && (!retainedMask || *retainedMask)) {
+                    const auto& retained = state[operation.destinations.front()];
+                    joinFact(inputs, retained);
+                    if (retained.missing) inputs.bad.insert("merge-load-retained-value-unresolved");
+                    if (revised) for (auto incoming : retained.entries) demands.emplace(pc, incoming, "result");
+                }
 
 				if (row.undef) inputs.bad.insert("ir-undef");
 				if (!row.mapped || operation.kind == MipsOperation::Unsupported)
 					inputs.bad.insert("unsupported-operation");
-				if (operation.kind == MipsOperation::Multiply
+				if ((operation.kind == MipsOperation::Multiply || operation.kind == MipsOperation::Divide)
 					&& (std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), Disposition::HiRegister) == row.fullWidthRegisters.end()
 						|| std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), Disposition::LoRegister) == row.fullWidthRegisters.end())) {
 					inputs.bad.insert("unmapped-hi-lo-definition");
@@ -855,11 +1150,13 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                         call.contract = std::move(complete); call.qualified = true; call.unresolved.clear();
                     }
                 }
+                recoverOriginalMemory(summary, disposition, _image, *scope, _config->getConfig().parameters);
             }
 		} catch (const std::exception& error) {
 			disposition.kind = Disposition::Kind::Unknown;
             evidence.decodeComplete = false; evidence.analysisComplete = false;
             evidence.definitions.clear(); evidence.edges.clear(); evidence.exits.clear(); evidence.calls.clear();
+            for (auto& access : summary.accesses) access.address = common::OriginalFact::partial("native-analysis-failed");
             if (evidence.obligations.size() < Disposition::RowLimit)
 				evidence.obligations.push_back({evidence.start, "architectural", error.what()});
 		}
@@ -869,6 +1166,9 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
         }
 		de.setReturnDisposition(std::move(disposition));
 		cf->returnDisposition = de.getReturnDisposition();
+		cf->originalBodyCandidate.reset();
+		if (revised && canProposeEmptyBody(*cf))
+			cf->originalBodyCandidate = common::OriginalBodyCandidate::EmptyVoid;
 	}
 }
 
@@ -893,6 +1193,7 @@ void ParamReturn::requireSelectedContracts() const
 {
 	const auto& p = _config->getConfig().parameters;
 	auto* cf = _config->getConfigFunction(p.getEntryPoint());
+	if (cf && cf->originalBodyCandidate && canProposeEmptyBody(*cf)) return;
 	if (!cf || !cf->returnDisposition || cf->returnDisposition->kind != Disposition::Kind::Value)
 		throw std::runtime_error("original-only selected return contract is unknown");
     if (p.getOriginalCallScope() && (!cf->originalCallSummary || !cf->originalCallSummary->declaration.isComplete()))

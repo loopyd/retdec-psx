@@ -56,6 +56,7 @@ ShPtr<Expression> CCastOptimizer::checkAndOptimize(ShPtr<Expression> dst,
 		ShPtr<Expression> src) {
 	// If source expression is the cast expression.
 	if (ShPtr<CastExpr> srcCast = cast<CastExpr>(src)) {
+		if (srcCast->getOriginalExtraction()) { optimized = false; return src; }
 		// Integer type optimization.
 		// Implicit conversion to an integer type.
 		if (ShPtr<IntType> dstType = cast<IntType>(dst->getType())) {

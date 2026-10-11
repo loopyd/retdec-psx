@@ -34,6 +34,8 @@ class Parameters
 		bool isOriginalOnlyReturnRecovery() const;
 		void setOriginalCallScope(common::OriginalCallScope scope);
 		const std::optional<common::OriginalCallScope>& getOriginalCallScope() const { return _originalCallScope; }
+		void setOriginalSourceForm(common::OriginalSourceForm form);
+		const std::optional<common::OriginalSourceForm>& getOriginalSourceForm() const { return _originalSourceForm; }
 		bool isDetectStaticCode() const;
 		bool isTimeout() const;
 		bool isMaxMemoryLimitHalfRam() const;
@@ -156,6 +158,7 @@ class Parameters
 		bool _selectedDecodeOnly = false;
 		bool _originalOnlyReturnRecovery = false;
 		std::optional<common::OriginalCallScope> _originalCallScope;
+		std::optional<common::OriginalSourceForm> _originalSourceForm;
 
 		std::string _ordinalNumbersDirectory;
 		std::string _inputFile;

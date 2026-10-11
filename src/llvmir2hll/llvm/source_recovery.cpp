@@ -1,18 +1,23 @@
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Support/KnownBits.h>
 #include "retdec/bin2llvmir/utils/llvm.h"
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
+#include <llvm/IR/ValueHandle.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <set>
+#include <map>
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
 #include "retdec/config/config.h"
 #include "retdec/llvmir2hll/ir/function.h"
 #include "retdec/llvmir2hll/ir/int_type.h"
+#include "retdec/llvmir2hll/ir/void_type.h"
+#include "retdec/llvmir2hll/ir/empty_stmt.h"
 #include "retdec/llvmir2hll/ir/pointer_type.h"
 #include "retdec/llvmir2hll/ir/module.h"
 #include "retdec/llvmir2hll/ir/variable.h"
@@ -26,6 +31,12 @@
 #include "retdec/llvmir2hll/ir/neq_op_expr.h"
 #include "retdec/llvmir2hll/ir/eq_op_expr.h"
 #include "retdec/llvmir2hll/ir/cast_expr.h"
+#include "retdec/llvmir2hll/ir/ext_cast_expr.h"
+#include "retdec/llvmir2hll/ir/trunc_cast_expr.h"
+#include "retdec/llvmir2hll/ir/global_var_def.h"
+#include "retdec/llvmir2hll/analysis/value_analysis.h"
+#include "retdec/llvmir2hll/analysis/var_uses_visitor.h"
+#include "retdec/llvmir2hll/support/visitors/ordered_all_visitor.h"
 #include "retdec/llvmir2hll/ir/if_stmt.h"
 #include "retdec/llvmir2hll/ir/return_stmt.h"
 #include "retdec/llvmir2hll/optimizer/func_optimizer.h"
@@ -40,6 +51,235 @@
 namespace retdec {
 namespace llvmir2hll {
 namespace {
+struct ProvenUnsignedQuotient {
+	llvm::Value *unsignedInput;
+	llvm::BinaryOperator *wideShift;
+	uint32_t divisor;
+	unsigned discardedLowBits;
+};
+
+std::optional<ProvenUnsignedQuotient> proveUnsignedQuotient(
+		llvm::Value &value, unsigned discardedLowBits = 0) {
+	auto *shift = llvm::dyn_cast<llvm::BinaryOperator>(&value);
+	if (!shift || !shift->getType()->isIntegerTy(64)
+			|| shift->getOpcode() != llvm::Instruction::LShr || shift->isExact()) return {};
+	auto *count = llvm::dyn_cast<llvm::ConstantInt>(shift->getOperand(1));
+	auto *product = llvm::dyn_cast<llvm::BinaryOperator>(shift->getOperand(0));
+	if (!count || count->getValue().uge(64) || !product
+			|| product->getOpcode() != llvm::Instruction::Mul) return {};
+	unsigned exponent = unsigned(count->getZExtValue()) + discardedLowBits;
+	if (discardedLowBits >= 32 || exponent < 32 || exponent >= 64) return {};
+	llvm::ConstantInt *factor = nullptr;
+	llvm::ZExtInst *extend = nullptr;
+	for (unsigned i = 0; i < 2; ++i) {
+		factor = llvm::dyn_cast<llvm::ConstantInt>(product->getOperand(i));
+		extend = llvm::dyn_cast<llvm::ZExtInst>(product->getOperand(1 - i));
+		if (factor && extend) break;
+	}
+	if (!factor || !extend || factor->isZero() || factor->getValue().getActiveBits() > 32
+			|| !extend->getSrcTy()->isIntegerTy()
+			|| extend->getSrcTy()->getIntegerBitWidth() > 32) return {};
+	const llvm::APInt maximum(128, UINT32_MAX);
+	const llvm::APInt scale = llvm::APInt(128, 1).shl(exponent);
+	const llvm::APInt multiplier = factor->getValue().zext(128);
+	const llvm::APInt maximumProduct = (llvm::APInt(128, 1).shl(
+		extend->getSrcTy()->getIntegerBitWidth()) - 1) * multiplier;
+	if ((product->hasNoUnsignedWrap() && maximumProduct.ugt(llvm::APInt(128, UINT64_MAX)))
+			|| (product->hasNoSignedWrap() && maximumProduct.ugt(llvm::APInt(128, INT64_MAX)))) return {};
+	const llvm::APInt divisor = (scale + multiplier - 1).udiv(multiplier);
+	if (divisor.isNullValue() || divisor.ugt(maximum)) return {};
+	const llvm::APInt error = multiplier * divisor - scale;
+	auto exactAt = [&](const llvm::APInt &quotient, const llvm::APInt &remainder) {
+		return (quotient * error + remainder * multiplier).ult(scale);
+	};
+	const llvm::APInt fullBuckets = (maximum + 1).udiv(divisor);
+	if (!fullBuckets.isNullValue() && !exactAt(fullBuckets - 1, divisor - 1)) return {};
+	if (!exactAt(maximum.udiv(divisor), maximum.urem(divisor))) return {};
+	return ProvenUnsignedQuotient{extend->getOperand(0), shift,
+		uint32_t(divisor.getZExtValue()), discardedLowBits};
+}
+
+bool collectLow32Slice(llvm::Value &value, std::optional<ProvenUnsignedQuotient> &proof,
+		std::vector<llvm::Instruction*> &slice, std::set<llvm::Value*> &seen) {
+	if (!value.getType()->isIntegerTy()) return false;
+	if (value.getType()->getIntegerBitWidth() <= 32 || llvm::isa<llvm::ConstantInt>(value)) return true;
+	if (!seen.insert(&value).second) return true;
+	if (auto quotient = proveUnsignedQuotient(value)) {
+		if (proof && proof->wideShift != quotient->wideShift) return false;
+		proof = quotient;
+		slice.push_back(quotient->wideShift);
+		return true;
+	}
+	if (auto *cast = llvm::dyn_cast<llvm::CastInst>(&value)) {
+		if ((cast->getOpcode() != llvm::Instruction::Trunc
+				&& cast->getOpcode() != llvm::Instruction::ZExt
+				&& cast->getOpcode() != llvm::Instruction::SExt)
+				|| !collectLow32Slice(*cast->getOperand(0), proof, slice, seen)) return false;
+		slice.push_back(cast);
+		return true;
+	}
+	auto *operation = llvm::dyn_cast<llvm::BinaryOperator>(&value);
+	if (!operation) return false;
+	switch (operation->getOpcode()) {
+		case llvm::Instruction::Add:
+		case llvm::Instruction::Sub:
+		case llvm::Instruction::Mul:
+		case llvm::Instruction::And:
+		case llvm::Instruction::Or:
+		case llvm::Instruction::Xor:
+			break;
+		case llvm::Instruction::Shl: {
+			auto *count = llvm::dyn_cast<llvm::ConstantInt>(operation->getOperand(1));
+			if (!count || count->getValue().uge(32)) return false;
+			break;
+		}
+		default:
+			return false;
+	}
+	if (auto *overflow = llvm::dyn_cast<llvm::OverflowingBinaryOperator>(operation))
+		if (overflow->hasNoUnsignedWrap() || overflow->hasNoSignedWrap()) return false;
+	for (auto &operand : operation->operands())
+		if (!collectLow32Slice(*operand, proof, slice, seen)) return false;
+	slice.push_back(operation);
+	return true;
+}
+
+std::optional<ProvenUnsignedQuotient> proveMaskedUnsignedQuotient(
+		llvm::Value &value, unsigned sinkWidth, uint32_t &mask,
+		std::vector<llvm::Instruction*> &slice) {
+	auto *operation = llvm::dyn_cast<llvm::BinaryOperator>(&value);
+	if (!operation || operation->getOpcode() != llvm::Instruction::And
+			|| !operation->getType()->isIntegerTy()) return {};
+	llvm::ConstantInt *constant = nullptr;
+	llvm::Value *shifted = nullptr;
+	for (unsigned i = 0; i < 2; ++i)
+		if ((constant = llvm::dyn_cast<llvm::ConstantInt>(operation->getOperand(i)))) {
+			shifted = operation->getOperand(1 - i);
+			break;
+		}
+	if (!constant || constant->isZero() || constant->getValue().getActiveBits() > sinkWidth) return {};
+	unsigned observedBits = constant->getValue().getActiveBits();
+	mask = uint32_t(constant->getZExtValue());
+	unsigned discardedLowBits = constant->getValue().countTrailingZeros();
+	if (discardedLowBits >= 32) return {};
+	while (auto *cast = llvm::dyn_cast<llvm::CastInst>(shifted)) {
+		if ((cast->getOpcode() != llvm::Instruction::Trunc
+				&& cast->getOpcode() != llvm::Instruction::ZExt
+				&& cast->getOpcode() != llvm::Instruction::SExt)
+				|| !cast->getSrcTy()->isIntegerTy() || !cast->getDestTy()->isIntegerTy()
+				|| observedBits > cast->getSrcTy()->getIntegerBitWidth()
+				|| observedBits > cast->getDestTy()->getIntegerBitWidth()) return {};
+		slice.push_back(cast);
+		shifted = cast->getOperand(0);
+	}
+	auto proof = proveUnsignedQuotient(*shifted, discardedLowBits);
+	if (!proof) return {};
+	slice.push_back(proof->wideShift);
+	slice.push_back(operation);
+	return proof;
+}
+
+llvm::Value *rebuildLow32(llvm::Value &value, const ProvenUnsignedQuotient &proof,
+		const std::vector<llvm::Instruction*> &slice, llvm::IRBuilder<> &builder) {
+	std::map<llvm::Value*, llvm::Value*> lowered;
+	auto low32 = [&](llvm::Value *operand) -> llvm::Value* {
+		auto found = lowered.find(operand);
+		if (found != lowered.end()) return found->second;
+		if (auto *constant = llvm::dyn_cast<llvm::ConstantInt>(operand))
+			return builder.getInt32(constant->getValue().zextOrTrunc(32).getZExtValue());
+		return builder.CreateZExtOrTrunc(operand, builder.getInt32Ty());
+	};
+	auto *input = builder.CreateZExtOrTrunc(proof.unsignedInput, builder.getInt32Ty());
+	lowered[proof.wideShift] = builder.Insert(llvm::BinaryOperator::CreateUDiv(
+		input, builder.getInt32(proof.divisor)));
+	for (auto *instruction : slice) {
+		if (instruction == proof.wideShift) continue;
+		llvm::Value *replacement = nullptr;
+		if (auto *cast = llvm::dyn_cast<llvm::CastInst>(instruction)) {
+			auto *operand = cast->getOperand(0);
+			replacement = cast->getOpcode() == llvm::Instruction::SExt
+				&& operand->getType()->getIntegerBitWidth() < 32
+				? builder.CreateSExt(operand, builder.getInt32Ty()) : low32(operand);
+		} else {
+			auto *operation = llvm::cast<llvm::BinaryOperator>(instruction);
+			replacement = builder.Insert(llvm::BinaryOperator::Create(operation->getOpcode(),
+				low32(operation->getOperand(0)), low32(operation->getOperand(1))));
+		}
+		if (auto *replacementInstruction = llvm::dyn_cast<llvm::Instruction>(replacement))
+			if (replacement != instruction->getOperand(0)) {
+				replacementInstruction->setMetadata("insn.addr", instruction->getMetadata("insn.addr"));
+				replacementInstruction->setDebugLoc(instruction->getDebugLoc());
+			}
+		lowered[instruction] = replacement;
+	}
+	return low32(&value);
+}
+
+bool recoverUnsignedReciprocalSinks(llvm::Function &function) {
+	std::vector<llvm::WeakTrackingVH> sinks;
+	for (auto &block : function) for (auto &instruction : block)
+		if (instruction.getType()->isIntegerTy()
+				&& instruction.getType()->getIntegerBitWidth() <= 32
+				&& (llvm::isa<llvm::TruncInst>(instruction)
+					|| instruction.getOpcode() == llvm::Instruction::And)) sinks.emplace_back(&instruction);
+	bool changed = false;
+	for (auto &handle : sinks) {
+		llvm::Value *live = handle;
+		auto *sink = llvm::dyn_cast_or_null<llvm::Instruction>(live);
+		if (!sink || !sink->getParent()) continue;
+		auto *trunc = llvm::dyn_cast<llvm::TruncInst>(sink);
+		llvm::Value *expression = trunc ? trunc->getOperand(0) : sink;
+		std::vector<llvm::Instruction*> slice;
+		uint32_t mask = 0;
+		auto proof = proveMaskedUnsignedQuotient(*expression,
+			sink->getType()->getIntegerBitWidth(), mask, slice);
+		bool masked = bool(proof);
+		if (!masked) {
+			slice.clear();
+			std::set<llvm::Value*> seen;
+			if (!trunc || !collectLow32Slice(*expression, proof, slice, seen) || !proof) continue;
+		}
+		llvm::IRBuilder<> builder(sink);
+		llvm::Value *replacement = nullptr;
+		if (masked) {
+			auto *input = builder.CreateZExtOrTrunc(proof->unsignedInput, builder.getInt32Ty());
+			replacement = builder.Insert(llvm::BinaryOperator::CreateUDiv(input, builder.getInt32(proof->divisor)));
+			if (proof->discardedLowBits)
+				replacement = builder.Insert(llvm::BinaryOperator::CreateShl(
+					replacement, builder.getInt32(proof->discardedLowBits)));
+			replacement = builder.Insert(llvm::BinaryOperator::CreateAnd(replacement, builder.getInt32(mask)));
+		} else replacement = rebuildLow32(*expression, *proof, slice, builder);
+		replacement = builder.CreateTruncOrBitCast(replacement, sink->getType());
+		if (auto *instruction = llvm::dyn_cast<llvm::Instruction>(replacement)) {
+			instruction->copyMetadata(*sink);
+			instruction->setDebugLoc(sink->getDebugLoc());
+		}
+		auto *product = llvm::cast<llvm::BinaryOperator>(proof->wideShift->getOperand(0));
+		slice.push_back(product);
+		for (auto &operand : product->operands())
+			if (auto *extend = llvm::dyn_cast<llvm::ZExtInst>(operand)) slice.push_back(extend);
+		std::vector<llvm::WeakTrackingVH> cleanup;
+		for (auto *instruction : slice)
+			if (instruction != sink) cleanup.emplace_back(instruction);
+		sink->replaceAllUsesWith(replacement);
+		sink->eraseFromParent();
+		bool deleted = true;
+		while (deleted) {
+			deleted = false;
+			for (auto &candidate : cleanup) {
+				llvm::Value *value = candidate;
+				auto *instruction = llvm::dyn_cast_or_null<llvm::Instruction>(value);
+				if (instruction && llvm::isInstructionTriviallyDead(instruction)) {
+					instruction->eraseFromParent();
+					deleted = true;
+				}
+			}
+		}
+		changed = true;
+	}
+	return changed;
+}
+
 namespace original_expression {
 using Expression = common::OriginalSourceExpression;
 using Disposition = common::ReturnDisposition;
@@ -152,8 +392,13 @@ llvm::Argument* entryFor(llvm::Instruction& root, const Expression& expression,
 		&& registers[entry->getArgNo()] == expression.entryRegister ? entry : nullptr;
 }
 
-void recover(llvm::Function& function, common::Function& source) {
+void recover(llvm::Function& function, common::Function& source,
+		const std::optional<common::OriginalSourceForm>& form) {
 	source.originalSourceExpressions.clear();
+	if (form) {
+		source.originalSourceForms = std::vector<common::OriginalSourceFormApplication>{};
+		source.originalSourceFormFailures.clear();
+	}
 	if (!source.returnDisposition || !source.originalCallSummary) return;
 	auto& evidence = source.returnDisposition->evidence;
 	auto& obligations = evidence.obligations;
@@ -163,6 +408,16 @@ void recover(llvm::Function& function, common::Function& source) {
 	for (const auto& row : evidence.instructions) {
 		auto expression = bind(source, row.pc);
 		if (!expression) continue;
+		if (form) {
+			if (source.originalSourceExpressions.size() >= Disposition::RowLimit)
+				throw std::runtime_error("original-expression-witnesses-exhausted");
+			source.originalSourceForms->push_back({unsigned(source.originalSourceExpressions.size()),
+				common::SourceFormUnresolved{"source-form-census-not-run"}});
+			source.originalSourceExpressions.push_back(*expression);
+			if (obligations.size() >= Disposition::RowLimit)
+				throw std::runtime_error("original-expression-obligations-exhausted");
+			obligations.push_back({expression->rightPc, "source-expression", "source-form-census-not-run"});
+		}
 		llvm::Instruction* root = nullptr;
 		llvm::Argument* entry = nullptr;
 		unsigned matches = 0;
@@ -182,8 +437,20 @@ void recover(llvm::Function& function, common::Function& source) {
 					throw std::runtime_error("original-expression-replacement-unbound");
 				root->replaceAllUsesWith(extend);
 				root->eraseFromParent();
+				root = extend;
 			}
-			source.originalSourceExpressions.push_back(*expression);
+			if (form) {
+				auto& context = function.getContext();
+				auto number = [&](uint64_t value) -> llvm::Metadata* {
+					return llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+						llvm::Type::getInt64Ty(context), value));
+				};
+				root->setMetadata("retdec.original.source-expression", llvm::MDNode::get(context, {
+					llvm::MDString::get(context, source.getName()), number(expression->leftPc),
+					number(expression->rightPc), number(expression->leftDefinition),
+					number(expression->rightDefinition), number(expression->entryRegister),
+					number(expression->viewWidth), number(entry->getArgNo())}));
+			} else source.originalSourceExpressions.push_back(*expression);
 		} else {
 			if (obligations.size() >= Disposition::RowLimit)
 				throw std::runtime_error("original-expression-obligations-exhausted");
@@ -535,9 +802,12 @@ bool onlyLowBitsUsed(const llvm::Argument &arg, unsigned bits) {
 
 void recoverPointerExpressions(llvm::Module &module, config::Config &config) {
 	if (config.parameters.isOriginalOnlyReturnRecovery()) {
-		for (auto& function : module)
+		for (auto& function : module) {
+			if (config.architecture.isMipsOrPic32()) recoverUnsignedReciprocalSinks(function);
 			if (auto* source = config.functions.getFunctionByName(function.getName().str()))
-				original_expression::recover(function, const_cast<common::Function&>(*source));
+				original_expression::recover(function, const_cast<common::Function&>(*source),
+					config.parameters.getOriginalSourceForm());
+		}
 		return;
 	}
 	if (config.architecture.isMipsOrPic32()) {
@@ -588,6 +858,18 @@ void recoverSourceSignatures(ShPtr<Module> module, const config::Config &config)
 		auto function = *f;
 		auto *machine = module->getLLVMModule()->getFunction(function->getInitialName());
 		auto *source = config.functions.getFunctionByName(function->getInitialName());
+		if (source && source->originalBodyCandidate) {
+			if (!config.parameters.isOriginalOnlyReturnRecovery()
+					|| source->getStart() != config.parameters.getEntryPoint()
+					|| *source->originalBodyCandidate != common::OriginalBodyCandidate::EmptyVoid
+					|| !source->returnDisposition
+					|| source->returnDisposition->kind != common::ReturnDisposition::Kind::Unknown)
+				throw std::runtime_error("invalid-original-body-candidate-projection");
+			function->setRetType(VoidType::create());
+			function->setParams({}); function->setLocalVars({}); function->setVarArg(false);
+			function->setBody(EmptyStmt::create(nullptr, source->getStart()));
+			continue;
+		}
 		if (!machine || !source || machine->isDeclaration()
 				|| source->parameters.size() != function->getNumOfParams()) continue;
 		auto params = function->getParams();
@@ -603,6 +885,177 @@ void recoverSourceSignatures(ShPtr<Module> module, const config::Config &config)
 		}
 		function->setParams(params);
 	}
+}
+
+namespace {
+
+class OriginalSourceFormCensus final: public OrderedAllVisitor {
+public:
+	OriginalSourceFormCensus(ShPtr<Module> module, config::Config& config):
+		OrderedAllVisitor(true, true), module(module), retained(config),
+		form(*config.parameters.getOriginalSourceForm()),
+		values(ValueAnalysis::create(SimpleAliasAnalysis::create(), false)) {
+		values->initAliasAnalysis(module);
+		uses = VarUsesVisitor::create(values, false);
+	}
+
+	void run() {
+		for (const auto& source : retained.functions) {
+			auto& writable = const_cast<common::Function&>(source);
+			if (source.originalSourceExpressions.size() > common::ReturnDisposition::RowLimit)
+				throw std::runtime_error("original-source-form-census-exhausted");
+			writable.originalSourceForms = std::vector<common::OriginalSourceFormApplication>{};
+			writable.originalSourceFormFailures.clear();
+			rows[&writable].resize(source.originalSourceExpressions.size());
+			for (unsigned i = 0; i < source.originalSourceExpressions.size(); ++i)
+				writable.originalSourceForms->push_back({i, common::SourceFormUnresolved{"source-form-census-not-run"}});
+		}
+		for (auto i = module->global_var_begin(); i != module->global_var_end(); ++i) (*i)->accept(this);
+		for (auto i = module->func_begin(); i != module->func_end(); ++i) {
+			current = *i;
+			restart();
+			current->accept(this);
+		}
+		current.reset();
+		for (auto& entry : rows) {
+			auto& source = *entry.first;
+			for (unsigned i = 0; i < entry.second.size(); ++i) {
+				auto& row = entry.second[i];
+				const auto& witness = source.originalSourceExpressions[i];
+				if (source.returnDisposition) {
+					auto& obligations = source.returnDisposition->evidence.obligations;
+					obligations.erase(std::remove_if(obligations.begin(), obligations.end(), [&](const auto& item) {
+						return item.pc == witness.rightPc && item.domain == "source-expression"
+							&& item.reason == "source-form-census-not-run";
+					}), obligations.end());
+				}
+				auto rebound = original_expression::bind(source, witness.rightPc);
+				if (!rebound || !(*rebound == witness)
+						|| std::count(source.originalSourceExpressions.begin(),
+							source.originalSourceExpressions.end(), witness) != 1)
+					row.reason = "source-form-witness-unresolved";
+				if (row.reason.empty() && !row.occurrences) row.reason = "source-form-association-missing";
+				if (!row.reason.empty()) {
+					refuse(&source, witness.rightPc, row.reason);
+					source.originalSourceForms->at(i) = {i, common::SourceFormUnresolved{row.reason}};
+				} else source.originalSourceForms->at(i) = {i, common::SourceFormReady{row.occurrences}};
+			}
+		}
+		if (failed) throw std::runtime_error("original-source-form-census-unresolved");
+	}
+
+private:
+	using OrderedAllVisitor::visit;
+	struct Row { unsigned occurrences = 0; std::string reason; };
+	std::map<common::Function*, std::vector<Row>> rows;
+	std::map<ShPtr<Variable>, bool> safeParameters;
+	ShPtr<Module> module;
+	config::Config& retained;
+	common::OriginalSourceForm form;
+	ShPtr<ValueAnalysis> values;
+	ShPtr<VarUsesVisitor> uses;
+	ShPtr<Function> current;
+	ShPtr<TruncCastExpr> enclosedTrunc;
+	bool failed = false;
+	std::map<common::Function*, unsigned> actualOccurrences;
+
+	void refuse(common::Function* source, uint64_t pc, const std::string& reason) {
+		failed = true;
+		if (!source) return;
+		auto& failures = source->originalSourceFormFailures;
+		if (std::find(failures.begin(), failures.end(), reason) == failures.end()) failures.push_back(reason);
+		if (!source->returnDisposition) return;
+		auto& obligations = source->returnDisposition->evidence.obligations;
+		if (std::any_of(obligations.begin(), obligations.end(), [&](const auto& row) {
+			return row.pc == pc && row.domain == "source-expression" && row.reason == reason;
+		})) return;
+		if (obligations.size() >= common::ReturnDisposition::RowLimit)
+			throw std::runtime_error("original-expression-obligations-exhausted");
+		obligations.push_back({pc, "source-expression", reason});
+	}
+
+	Row* locate(Extraction association) {
+		auto* found = retained.functions.getFunctionByName(association->functionInitialName());
+		auto* source = const_cast<common::Function*>(found);
+		if (!source) { refuse(nullptr, association->witness().rightPc, "source-form-owner-missing"); return nullptr; }
+		auto& count = actualOccurrences[source];
+		if (++count > common::ReturnDisposition::ReferenceLimit)
+			throw std::runtime_error("original-source-form-occurrences-exhausted");
+		unsigned matches = 0, index = 0;
+		for (unsigned i = 0; i < source->originalSourceExpressions.size(); ++i)
+			if (source->originalSourceExpressions[i] == association->witness()) { ++matches; index = i; }
+		if (matches != 1) {
+			refuse(source, association->witness().rightPc, "source-form-witness-unresolved");
+			return nullptr;
+		}
+		return &rows.at(source)[index];
+	}
+
+	bool parameterIsSafe(ShPtr<Variable> parameter) {
+		auto cached = safeParameters.find(parameter);
+		if (cached != safeParameters.end()) return cached->second;
+		bool safe = !parameter->isVolatile() && !values->mayBePointed(parameter);
+		auto locations = uses->getUses(parameter, current);
+		auto check = [&](const StmtSet& statements) {
+			for (const auto& statement : statements) {
+				auto data = values->getValueData(statement);
+				if (data->isDirWritten(parameter) || data->mayBeIndirWritten(parameter)
+						|| data->mustBeIndirWritten(parameter) || data->hasAddressTaken(parameter)) safe = false;
+			}
+		};
+		check(locations->dirUses); check(locations->indirUses);
+		safeParameters.emplace(parameter, safe);
+		return safe;
+	}
+
+	void visit(ShPtr<ExtCastExpr> expression) override {
+		auto association = expression->getOriginalExtraction();
+		if (!association) { OrderedAllVisitor::visit(expression); return; }
+		auto* row = locate(association);
+		auto trunc = cast<TruncCastExpr>(expression->getOperand());
+		auto resultType = cast<IntType>(expression->getType());
+		auto viewType = trunc ? cast<IntType>(trunc->getType()) : nullptr;
+		auto parameter = association->parameter();
+		auto parameterType = cast<IntType>(parameter->getType());
+		auto* source = retained.functions.getFunctionByName(association->functionInitialName());
+		bool intact = current && current->isDefinition()
+			&& current->getInitialName() == association->functionInitialName()
+			&& source && source->originalCallSummary && source->originalCallSummary->declaration.isComplete()
+			&& source->originalCallSummary->parameterRegisters.size() == current->getParams().size()
+			&& association->form() == form && association->formalOrdinal() < current->getParams().size()
+			&& source->originalCallSummary->parameterRegisters[association->formalOrdinal()] == association->witness().entryRegister
+			&& current->getParams()[association->formalOrdinal()] == parameter
+			&& parameterType && parameterType->getSize() == 32
+			&& expression->getVariant() == ExtCastExpr::Variant::SExt
+			&& resultType && resultType->getSize() == 32 && resultType->isSigned()
+			&& trunc && trunc->getOriginalExtraction() == association && trunc->getOperand() == parameter
+			&& viewType && viewType->getSize() == association->witness().viewWidth && viewType->isSigned()
+			&& (viewType->getSize() == 8 || viewType->getSize() == 16);
+		if (intact) intact = parameterIsSafe(parameter);
+		if (row) {
+			if (intact) ++row->occurrences;
+			else row->reason = "source-form-association-altered-or-unqualified";
+		}
+		auto previous = enclosedTrunc;
+		enclosedTrunc = trunc;
+		OrderedAllVisitor::visit(expression);
+		enclosedTrunc = previous;
+	}
+
+	void visit(ShPtr<TruncCastExpr> expression) override {
+		if (auto association = expression->getOriginalExtraction()) {
+			auto* row = locate(association);
+			if (expression != enclosedTrunc && row) row->reason = "source-form-associated-truncation-orphaned";
+		}
+		OrderedAllVisitor::visit(expression);
+	}
+};
+
+}
+
+void validateOriginalSourceForms(ShPtr<Module> module, config::Config& config) {
+	if (!config.parameters.isOriginalOnlyReturnRecovery() || !config.parameters.getOriginalSourceForm()) return;
+	OriginalSourceFormCensus(module, config).run();
 }
 
 namespace {

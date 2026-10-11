@@ -75,6 +75,17 @@ struct OriginalNormalExit {
 	std::vector<uint64_t> equalityEvidence;
 	std::vector<OriginalTransfer> transfers;
 };
+struct OriginalFileBytes {
+	uint32_t mappingStart = 0;
+	uint64_t mappingBytes = 0, payloadOffset = 0;
+	std::vector<uint8_t> bytes;
+};
+struct OriginalFixedMemoryAddress {
+	uint32_t base = 0, value = 0;
+	std::vector<uint64_t> equalityEvidence;
+	OriginalFact alignment = OriginalFact::partial("access-alignment-unresolved");
+	std::variant<OriginalFact, OriginalFileBytes> fileBytes = OriginalFact::partial("physical-file-backing-unresolved");
+};
 struct OriginalMemoryAccess {
 	uint64_t pc = 0;
 	std::string kind, extension;
@@ -82,6 +93,16 @@ struct OriginalMemoryAccess {
 	bool delayed = false;
 	std::vector<unsigned> addressDefinitions, addressEntries, valueDefinitions, valueEntries;
 	OriginalFact obligation = OriginalFact::partial("contents-object-address-alias-effect-placement-unresolved");
+	std::variant<OriginalFact, OriginalFixedMemoryAddress> address = OriginalFact::partial("original-address-proof-unresolved");
+	OriginalFact objectExtent = OriginalFact::partial("whole-object-extent-unresolved");
+	OriginalFact initializedObject = OriginalFact::partial("whole-object-initializer-unresolved");
+	OriginalFact zeroInitializedObject = OriginalFact::partial("loader-zero-fill-unresolved");
+	OriginalFact constQualification = OriginalFact::partial("const-qualification-unresolved");
+	OriginalFact volatileQualification = OriginalFact::partial("volatile-qualification-unresolved");
+	OriginalFact restrictQualification = OriginalFact::partial("restrict-qualification-unresolved");
+	OriginalFact currentContents = OriginalFact::partial("runtime-contents-unresolved");
+	OriginalFact aliasEffects = OriginalFact::partial("alias-effects-unresolved");
+	OriginalFact placement = OriginalFact::partial("object-placement-unresolved");
 };
 struct OriginalFunctionSummary {
 	std::string function;
@@ -205,6 +226,40 @@ struct OriginalSourceExpression {
 	uint64_t leftPc = 0, rightPc = 0;
 	unsigned leftDefinition = 0, rightDefinition = 0;
 	unsigned entryRegister = 0, viewWidth = 0;
+	bool operator==(const OriginalSourceExpression& other) const {
+		return leftPc == other.leftPc && rightPc == other.rightPc
+			&& leftDefinition == other.leftDefinition && rightDefinition == other.rightDefinition
+			&& entryRegister == other.entryRegister && viewWidth == other.viewWidth;
+	}
+};
+
+enum class OriginalSourceForm { SignedNarrowCast, UnsignedMaskSubtract };
+enum class OriginalBodyCandidate { EmptyVoid };
+
+inline const char* originalSourceFormName(OriginalSourceForm form) {
+	switch (form) {
+		case OriginalSourceForm::SignedNarrowCast: return "signed-narrow-cast";
+		case OriginalSourceForm::UnsignedMaskSubtract: return "unsigned-mask-subtract";
+	}
+	throw std::runtime_error("invalid-original-source-form");
+}
+
+inline OriginalSourceForm parseOriginalSourceForm(const std::string& input) {
+	if (input == "signed-narrow-cast") return OriginalSourceForm::SignedNarrowCast;
+	if (input == "unsigned-mask-subtract") return OriginalSourceForm::UnsignedMaskSubtract;
+	throw std::runtime_error("invalid-original-source-form");
+}
+
+struct SourceFormReady { unsigned occurrences; };
+struct SourceFormUnresolved { std::string reason; };
+struct OriginalSourceFormApplication {
+	unsigned witnessIndex;
+	std::variant<SourceFormReady, SourceFormUnresolved> outcome;
+};
+struct OriginalSourceRecoveryView {
+	OriginalSourceForm form;
+	const std::vector<OriginalSourceExpression>& witnesses;
+	const std::vector<unsigned>& parameterRegisters;
 };
 
 /**
@@ -323,7 +378,10 @@ class Function : public retdec::common::AddressRange
 		common::Type returnType;
 		std::optional<ReturnDisposition> returnDisposition;
 		std::optional<OriginalFunctionSummary> originalCallSummary;
+		std::optional<OriginalBodyCandidate> originalBodyCandidate;
 		std::vector<OriginalSourceExpression> originalSourceExpressions;
+		std::optional<std::vector<OriginalSourceFormApplication>> originalSourceForms;
+		std::vector<std::string> originalSourceFormFailures;
 		common::ObjectSequentialContainer parameters;
 		common::ObjectSetContainer locals;
 		std::set<std::string> usedCryptoConstants;

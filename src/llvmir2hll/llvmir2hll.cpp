@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 
 #include "retdec/llvmir2hll/llvmir2hll.h"
 #include "retdec/llvmir2hll/llvm/source_recovery.h"
@@ -241,6 +242,7 @@ bool LlvmIr2Hll::runOnModule(llvm::Module &m)
 
 	llvmir2hll::applyDeclaredAccessQualifiers(resModule, *globalConfig);
 	llvmir2hll::recoverSourceSignatures(resModule, *globalConfig);
+	llvmir2hll::validateOriginalSourceForms(resModule, *globalConfig);
 	Log::phase("emission of the target code [" + hllWriter->getId() + "]");
 	emitTargetHLLCode();
 
@@ -689,7 +691,9 @@ void LlvmIr2Hll::emitTargetHLLCode()
 	hllWriter->setOptionUseCompoundOperators(
 		!globalConfig->parameters.isBackendNoCompoundOperators()
 	);
-	hllWriter->emitTargetCode(resModule);
+	bool emitted = hllWriter->emitTargetCode(resModule);
+	if (globalConfig->parameters.getOriginalSourceForm() && !emitted)
+		throw std::runtime_error("original-source-form-emission-incomplete");
 }
 
 /**

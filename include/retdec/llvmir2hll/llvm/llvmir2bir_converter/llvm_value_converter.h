@@ -10,6 +10,7 @@
 #include <llvm/ADT/ArrayRef.h>
 
 #include "retdec/llvmir2hll/support/smart_ptr.h"
+#include "retdec/llvmir2hll/ir/cast_expr.h"
 #include "retdec/utils/non_copyable.h"
 
 namespace llvm {
@@ -19,6 +20,7 @@ class CompositeType;
 class Constant;
 class GlobalVariable;
 class Instruction;
+class SExtInst;
 class Type;
 class Value;
 
@@ -82,6 +84,8 @@ public:
 	/// @}
 
 private:
+	friend class LLVMInstructionConverter;
+	Extraction bindOriginalExtraction(llvm::SExtInst& instruction);
 	bool isConsideredAsPointer(const llvm::Value *value) const;
 	bool shouldBeConvertedAsConst(const llvm::Constant *constant) const;
 	bool shouldBeConvertedAsInst(const llvm::Instruction *inst) const;

@@ -13,6 +13,7 @@
 #include <string>
 
 #include "retdec/llvmir2hll/support/types.h"
+#include "retdec/common/function.h"
 #include "retdec/utils/non_copyable.h"
 
 namespace retdec {
@@ -39,6 +40,9 @@ private:
 class Config: private retdec::utils::NonCopyable {
 public:
 	virtual ~Config() = default;
+	virtual bool isOriginalOnlyReturnRecovery() const { return false; }
+	virtual std::optional<common::OriginalSourceRecoveryView> getOriginalSourceRecovery(
+		const std::string&) const { return {}; }
 
 	/// @name Loading and Saving
 	/// @{

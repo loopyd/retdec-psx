@@ -19,6 +19,7 @@ namespace llvmir2hll {
 
 class BracketManager;
 class CastExpr;
+class OriginalExtraction;
 class CompoundOpManager;
 class OutputManager;
 class StructType;
@@ -50,6 +51,7 @@ private:
 	CHLLWriter(
 		llvm::raw_ostream &out,
 		const std::string& outputFormat = "");
+	void emitOriginalExtraction(const OriginalExtraction& association);
 
 	virtual std::string getCommentPrefix() override;
 	virtual bool emitFileHeader() override;
@@ -165,6 +167,7 @@ private:
 	void emitNameOfVarIfExists(ShPtr<Variable> var);
 	void emitAssignment(ShPtr<Expression> lhs, ShPtr<Expression> rhs);
 	void emitWrappingArithmetic(const std::string &op, ShPtr<BinaryOpExpr> expr);
+	bool emitUnsignedIntegerBinary(const std::string &op, ShPtr<BinaryOpExpr> expr);
 	void emitBitPatternEquality(const std::string &op, ShPtr<BinaryOpExpr> expr);
 	void emitInitVarDefWhenNeeded(ShPtr<UForLoopStmt> loop);
 	void emitConstStruct(ShPtr<ConstStruct> constant, bool emitCast = true);

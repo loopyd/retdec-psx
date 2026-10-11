@@ -9,6 +9,7 @@ namespace llvmir2hll {
 class Module;
 void recoverPointerExpressions(llvm::Module &module, config::Config &config);
 void recoverSourceSignatures(ShPtr<Module> module, const config::Config &config);
+void validateOriginalSourceForms(ShPtr<Module> module, config::Config &config);
 void applyDeclaredAccessQualifiers(ShPtr<Module> module, const config::Config &config);
 }
 }

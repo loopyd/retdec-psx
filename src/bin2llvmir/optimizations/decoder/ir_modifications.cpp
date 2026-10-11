@@ -240,6 +240,27 @@ void Decoder::getOrCreateBranchTarget(
 	tFnc = nullptr;
 
 	auto* fromFnc = from->getFunction();
+	if (const auto* reviewed = getReviewedOriginalFunction(addr))
+	{
+		if (addr.getValue() != reviewed->start)
+		{
+			auto* owner = getFunctionAtAddress(common::Address(reviewed->start));
+			if (owner != fromFnc) refuseOriginalOwnership(addr);
+			if (auto* block = getBasicBlockAtAddress(addr))
+			{
+				if (block->getParent() != owner) refuseOriginalOwnership(addr);
+			}
+			else if (auto* block = getBasicBlockContainingAddress(addr))
+			{
+				if (block->getParent() != owner) refuseOriginalOwnership(addr);
+			}
+			else if (auto* block = getBasicBlockBeforeAddress(addr))
+			{
+				if (block->getParent() != owner) refuseOriginalOwnership(addr);
+			}
+			if (getFunctionAtAddress(addr)) refuseOriginalOwnership(addr);
+		}
+	}
 
 	if (auto* bb = getBasicBlockAtAddress(addr))
 	{
@@ -469,6 +490,12 @@ bool Decoder::canSplitFunctionOn(
  */
 llvm::Function* Decoder::splitFunctionOn(common::Address addr)
 {
+	if (const auto* reviewed = getReviewedOriginalFunction(addr))
+	{
+		if (addr.getValue() != reviewed->start) refuseOriginalOwnership(addr);
+		if (auto* block = getBasicBlockAtAddress(addr))
+			if (block->getParent() != getFunctionAtAddress(addr)) refuseOriginalOwnership(addr);
+	}
 	if (auto* bb = getBasicBlockAtAddress(addr))
 	{
 		LOG << "\t\t\t\t" << "S: splitFunctionOn @ " << addr << std::endl;
@@ -511,6 +538,12 @@ llvm::Function* Decoder::splitFunctionOn(
 		common::Address addr,
 		llvm::BasicBlock* splitOnBb)
 {
+	if (const auto* reviewed = getReviewedOriginalFunction(addr))
+	{
+		if (addr.getValue() != reviewed->start
+				|| splitOnBb->getParent() != getFunctionAtAddress(addr))
+			refuseOriginalOwnership(addr);
+	}
 	LOG << "\t\t\t\t" << "S: splitFunctionOn @ " << addr << " on "
 			<< splitOnBb->getName().str() << std::endl;
 
@@ -524,6 +557,18 @@ llvm::Function* Decoder::splitFunctionOn(
 	{
 		LOG << "\t\t\t\t" << "S: !canSplitFunctionOn() @ " << addr << std::endl;
 		return nullptr;
+	}
+
+	for (auto* splitBb : newFncStarts)
+	{
+		auto splitAddr = getBasicBlockAddress(splitBb);
+		if (splitAddr.isUndefined()
+				&& _config->getConfig().parameters.isOriginalOnlyReturnRecovery()
+				&& _config->getConfig().parameters.getOriginalCallScope())
+			refuseOriginalOwnership(addr);
+		if (const auto* reviewed = getReviewedOriginalFunction(splitAddr))
+			if (splitAddr.getValue() != reviewed->start || getFunctionAtAddress(splitAddr))
+				refuseOriginalOwnership(splitAddr);
 	}
 
 	llvm::Function* ret = nullptr;

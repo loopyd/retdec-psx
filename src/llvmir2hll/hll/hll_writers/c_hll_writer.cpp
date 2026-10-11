@@ -4,15 +4,18 @@
 * @copyright (c) 2017 Avast Software, licensed under the MIT license
 */
 
+#include <algorithm>
 #include <cctype>
 #include <llvm/IR/Module.h>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 
 #include "retdec/llvmir2hll/analysis/indirect_func_ref_analysis.h"
 #include "retdec/llvmir2hll/analysis/null_pointer_analysis.h"
 #include "retdec/llvmir2hll/analysis/special_fp_analysis.h"
 #include "retdec/llvmir2hll/analysis/used_types_visitor.h"
+#include "retdec/llvmir2hll/config/config.h"
 #include "retdec/llvmir2hll/hll/bracket_managers/c_bracket_manager.h"
 #include "retdec/llvmir2hll/hll/bracket_managers/no_bracket_manager.h"
 #include "retdec/llvmir2hll/hll/compound_op_manager.h"
@@ -279,9 +282,12 @@ bool CHLLWriter::emitFileHeader() {
 	//
 	ShPtr<UsedTypes> usedTypes(UsedTypesVisitor::getUsedTypes(module));
 	StringSet headerFiles;
+	auto config = module->getConfig();
+	const bool originalOnly = config && config->isOriginalOnlyReturnRecovery();
 
-	// If the module uses the bool type, we have to #include stdbool.h.
-	if (usedTypes->isUsedBool()) {
+	if (usedTypes->isUsedBool() && (!originalOnly
+			|| std::any_of(usedTypes->int_begin(), usedTypes->int_end(),
+				[](const ShPtr<Type>& type) { return cast<IntType>(type)->isBool(); }))) {
 		headerFiles.insert("stdbool.h");
 	}
 
@@ -776,11 +782,8 @@ void CHLLWriter::visit(ShPtr<MulOpExpr> expr) {
 	emitWrappingArithmetic("*", expr);
 }
 
-void CHLLWriter::visit(ShPtr<ModOpExpr> expr) {
-	emitBinaryOpExpr("%", expr);
-}
-
-void CHLLWriter::visit(ShPtr<DivOpExpr> expr) {
+bool CHLLWriter::emitUnsignedIntegerBinary(const std::string &op,
+		ShPtr<BinaryOpExpr> expr) {
 	ShPtr<IntType> types[2];
 	for (unsigned i = 0; i < 2; ++i) {
 		auto operand = i ? expr->getSecondOperand() : expr->getFirstOperand();
@@ -791,21 +794,36 @@ void CHLLWriter::visit(ShPtr<DivOpExpr> expr) {
 		}
 		types[i] = cast<IntType>(operandType);
 	}
-	if (expr->getVariant() != DivOpExpr::Variant::UDiv || !types[0] || !types[1]) {
-		emitBinaryOpExpr("/", expr);
-		return;
+	if (!types[0] || !types[1]) {
+		return false;
 	}
-	// Unsigned IR division must not inherit a recovered signed C type.
 	out->punctuation('(');
 	for (unsigned i = 0; i < 2; ++i) {
 		auto unsignedType = IntType::create(types[i]->getSize(), false);
-		if (i) out->operatorX("/", true, true);
+		if (i) out->operatorX(op, true, true);
 		out->punctuation('('); out->punctuation('(');
 		unsignedType->accept(this); out->punctuation(')'); out->punctuation('(');
 		(i ? expr->getSecondOperand() : expr->getFirstOperand())->accept(this);
 		out->punctuation(')'); out->punctuation(')');
 	}
 	out->punctuation(')');
+	return true;
+}
+
+void CHLLWriter::visit(ShPtr<ModOpExpr> expr) {
+	if (expr->getVariant() == ModOpExpr::Variant::UMod
+			&& emitUnsignedIntegerBinary("%", expr)) {
+		return;
+	}
+	emitBinaryOpExpr("%", expr);
+}
+
+void CHLLWriter::visit(ShPtr<DivOpExpr> expr) {
+	if (expr->getVariant() == DivOpExpr::Variant::UDiv
+			&& emitUnsignedIntegerBinary("/", expr)) {
+		return;
+	}
+	emitBinaryOpExpr("/", expr);
 }
 
 void CHLLWriter::visit(ShPtr<AndOpExpr> expr) {
@@ -922,6 +940,10 @@ void CHLLWriter::visit(ShPtr<BitCastExpr> expr) {
 }
 
 void CHLLWriter::visit(ShPtr<ExtCastExpr> expr) {
+	if (auto association = expr->getOriginalExtraction()) {
+		emitOriginalExtraction(*association);
+		return;
+	}
 	auto sourceType = expr->getOperand()->getType();
 	if (auto deref = cast<DerefOpExpr>(expr->getOperand())) {
 		if (auto pointer = cast<PointerType>(deref->getOperand()->getType())) {
@@ -946,6 +968,40 @@ void CHLLWriter::visit(ShPtr<ExtCastExpr> expr) {
 		return;
 	}
 	emitCastInStandardWay(expr);
+}
+
+void CHLLWriter::emitOriginalExtraction(const OriginalExtraction& association) {
+	unsigned width = association.witness().viewWidth;
+	if (width != 8 && width != 16) throw std::runtime_error("source-form-emission-width-unresolved");
+	auto emitCast = [&](unsigned bits, bool isSigned) {
+		out->punctuation('(');
+		IntType::create(bits, isSigned)->accept(this);
+		out->punctuation(')');
+	};
+	out->punctuation('(');
+	switch (association.form()) {
+		case common::OriginalSourceForm::SignedNarrowCast:
+			emitCast(32, true);
+			emitCast(width, true);
+			association.parameter()->accept(this);
+			break;
+		case common::OriginalSourceForm::UnsignedMaskSubtract: {
+			uint32_t sign = uint32_t(1) << (width - 1);
+			for (unsigned i = 0; i < 2; ++i) {
+				if (i) out->operatorX("-", true, true);
+				emitCast(32, true);
+				out->punctuation('(');
+				emitCast(32, false);
+				association.parameter()->accept(this);
+				out->operatorX("&", true, true);
+				out->constantInt(std::to_string(i ? sign : sign - 1) + "U");
+				out->punctuation(')');
+			}
+			break;
+		}
+		default: throw std::runtime_error("source-form-emission-choice-unresolved");
+	}
+	out->punctuation(')');
 }
 
 void CHLLWriter::visit(ShPtr<TruncCastExpr> expr) {
@@ -987,7 +1043,11 @@ void CHLLWriter::visit(ShPtr<PtrToIntCastExpr> expr) {
 }
 
 void CHLLWriter::visit(ShPtr<ConstBool> constant) {
-	// from stdbool.h
+	auto config = module->getConfig();
+	if (config && config->isOriginalOnlyReturnRecovery()) {
+		out->constantBool(constant->getValue() ? "1" : "0");
+		return;
+	}
 	constant->getValue() ? out->constantBool("true") : out->constantBool("false");
 }
 
@@ -1066,9 +1126,13 @@ void CHLLWriter::visit(ShPtr<AssignStmt> stmt) {
 * @brief Emits the given assignment (without leading or trailing whitespace).
 */
 void CHLLWriter::emitAssignment(ShPtr<Expression> lhs, ShPtr<Expression> rhs) {
+	auto mod = cast<ModOpExpr>(rhs);
+	auto div = cast<DivOpExpr>(rhs);
 	CompoundOpManager::CompoundOp compoundOp(
 		(isa<BitShlOpExpr>(rhs) || isa<BitShrOpExpr>(rhs)
-			|| isa<AddOpExpr>(rhs) || isa<SubOpExpr>(rhs) || isa<MulOpExpr>(rhs))
+			|| isa<AddOpExpr>(rhs) || isa<SubOpExpr>(rhs) || isa<MulOpExpr>(rhs)
+			|| (mod && mod->getVariant() == ModOpExpr::Variant::UMod)
+			|| (div && div->getVariant() == DivOpExpr::Variant::UDiv))
 		? CompoundOpManager::CompoundOp("=", rhs)
 		: compoundOpManager->tryOptimizeToCompoundOp(lhs, rhs));
 	lhs->accept(this);

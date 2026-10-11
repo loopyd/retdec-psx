@@ -405,6 +405,23 @@ void Decoder::admitOriginalDirectTarget(uint64_t callPc, uint64_t target)
 	}
 }
 
+void Decoder::refuseOriginalOwnership(common::Address addr)
+{
+	auto pc = addr.isDefined() ? addr.getValue()
+			: _config->getConfig().parameters.getEntryPoint().getValue();
+	auto extent = _originalExtents.upper_bound(pc);
+	if (extent != _originalExtents.begin() && pc < std::prev(extent)->second)
+		--extent;
+	else
+		extent = _originalExtents.find(_config->getConfig().parameters.getEntryPoint().getValue());
+	if (extent != _originalExtents.end()) {
+		auto& obligations = _originalDispositions[extent->first].evidence.obligations;
+		if (obligations.size() < common::ReturnDisposition::RowLimit)
+			obligations.push_back({pc, "architectural", "original-function-owner-conflict"});
+	}
+	throw std::runtime_error("original-function-owner-conflict");
+}
+
 void Decoder::publishOriginalDecodeCoverage(const std::string& failure)
 {
 	auto& c = _config->getConfig();
@@ -471,6 +488,7 @@ bool Decoder::getJumpTarget(JumpTarget& jt)
 void Decoder::decodeJumpTarget(const JumpTarget& jt)
 {
 	const Address start = jt.getAddress();
+	auto originalExtent = _originalExtents.end();
 	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery() && start.isDefined()) {
 		auto extent = _originalExtents.upper_bound(start.getValue());
 		if (extent == _originalExtents.begin() || start.getValue() >= std::prev(extent)->second) return;
@@ -480,6 +498,9 @@ void Decoder::decodeJumpTarget(const JumpTarget& jt)
 			_originalDispositions[extent->first].evidence.obligations.push_back({start.getValue(), "architectural", "cross-function-decode-edge"});
 			return;
 		}
+		if (jt.getType() == JumpTarget::eType::LEFTOVER
+				&& _config->getConfig().parameters.getOriginalCallScope())
+			originalExtent = extent;
 	}
 	if (start.isUndefined())
 	{
@@ -520,6 +541,10 @@ void Decoder::decodeJumpTarget(const JumpTarget& jt)
 	auto toRangeEnd = range->getEnd() - start;
 
 	bytes.second = toRangeEnd < bytes.second ? toRangeEnd : bytes.second;
+	if (originalExtent != _originalExtents.end()) {
+		auto toOriginalEnd = originalExtent->second - start.getValue();
+		bytes.second = toOriginalEnd < bytes.second ? toOriginalEnd : bytes.second;
+	}
 
 	if (jt.hasSize() && jt.getSize() < bytes.second)
 	{
@@ -555,7 +580,28 @@ void Decoder::decodeJumpTarget(const JumpTarget& jt)
 	}
 
 	llvm::BasicBlock* bb = getBasicBlockAtAddress(start);
-	if (bb == nullptr)
+	if (originalExtent != _originalExtents.end())
+	{
+		auto* owner = getFunctionAtAddress(Address(originalExtent->first));
+		if (!owner || owner->empty()) refuseOriginalOwnership(start);
+		auto interior = _addr2fnc.upper_bound(Address(originalExtent->first));
+		if (interior != _addr2fnc.end() && interior->first.getValue() < originalExtent->second)
+			refuseOriginalOwnership(interior->first);
+		if (AsmInstruction(_module, start)) refuseOriginalOwnership(start);
+		if (bb)
+		{
+			if (bb->getParent() != owner) refuseOriginalOwnership(start);
+		}
+		else
+		{
+			if (getBasicBlockContainingAddress(start))
+				refuseOriginalOwnership(start);
+			auto* before = getBasicBlockBeforeAddress(start);
+			if (!before || before->getParent() != owner) refuseOriginalOwnership(start);
+			bb = createBasicBlock(start, owner, before);
+		}
+	}
+	else if (bb == nullptr)
 	{
 		if (jt.getType() != JumpTarget::eType::LEFTOVER)
 		{
@@ -834,6 +880,8 @@ bool Decoder::getJumpTargetsFromInstruction(
 				return false;
 			}
 
+			if (const auto* reviewed = getReviewedOriginalFunction(t))
+				if (t.getValue() != reviewed->start) refuseOriginalOwnership(t);
 			if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery()
 				&& tr.capstoneInsn->size == 4 && (tr.capstoneInsn->bytes[3] >> 2) == 3)
 				admitOriginalDirectTarget(addr.getValue(), t.getValue());

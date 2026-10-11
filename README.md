@@ -8,16 +8,16 @@ It supplies the customized backend for the
 ## Scope
 
 The fork develops static recovery and C output for little-endian, 32-bit PS1 MIPS
-code in the BOF3 reverse-engineering workspace. Its customized decoder,
+code. Its customized decoder,
 parameter and return recovery, and C writer support the plugin's bounded
 original-only generation path.
 
 The two repositories have separate roles:
 
-| Repository | Workspace path | Role |
+| Repository | Sibling directory | Role |
 | --- | --- | --- |
-| [rz-psxdec](https://github.com/loopyd/rz-psxdec) | `third_party/rz-psxdec` | Rizin plugin and console commands |
-| [retdec-psx](https://github.com/loopyd/retdec-psx) | `third_party/retdec-psx` | Customized RetDec backend linked into the plugin |
+| [rz-psxdec](https://github.com/loopyd/rz-psxdec) | `rz-psxdec` | Rizin plugin and console commands |
+| [retdec-psx](https://github.com/loopyd/retdec-psx) | `retdec-psx` | Customized RetDec backend linked into the plugin |
 
 RetDec's upstream architecture and executable-format components remain in the
 source tree. Their presence does not establish this fork's acceptance scope.
@@ -41,19 +41,6 @@ The backend retains RetDec's 5.0 CMake package and `retdec::` APIs. Its displaye
 identity is `retdec-psx 5.0` with its actual Git commit. The plugin's generated
 version records both full source commits and rejects mismatched explicit
 `RZ_PSXDEC_REVISION` or `RETDEC_PSX_REVISION` configure arguments.
-
-In the BOF3 workspace, both forks occupy the registered sibling paths above.
-Its existing lifecycle builds and verifies the plugin:
-
-```sh
-bin/harness setup --component rz-psxdec --force
-bin/harness doctor --component rz-psxdec
-```
-
-Setup prints the verified `rz-psxdec.so` and `native-build.json` paths under a
-fresh `build/third_party/rz-psxdec/attempt-*` directory. RetDec support cleanup
-stays under that attempt's disposable install prefix. The lifecycle does not run
-a top-level install. Its guide is `tools/retdec-psx/README.md` in the workspace.
 
 Native test builds use the GoogleTest submodule at `deps/googletest/src`, pinned
 to commit `90a443f9c2437ca8a682a1ac625eba64e1d74a8a`. Initialize it from the
@@ -83,17 +70,14 @@ uses the current Rizin analysis and supplied context.
 
 For original-only generation, the absolute workspace must contain the validated
 request, original image bytes and fixed configuration expected by `pdzar`.
-The BOF3 harness supplies those inputs and keeps authored evaluator answers
-outside generation. Its guides are `tools/retdec-psx/preparation.md` and
-`tools/retdec-psx/reconstruction.md` in the workspace.
 
 ## Evidence limits
 
 Generated C and inferred declarations require independent review. A successful
 plugin invocation, compilation or preservation comparison does not prove original
-bytes, calling contracts, associated data or placement. Full PS1 instruction and
-GTE behavior, runtime fidelity and the 118-function reconstruction milestone remain
-unproved. Held call-contract production retains its separate admission gates.
+bytes, calling contracts, associated data or placement. Unsupported instruction,
+control or memory facts remain explicit obligations. Inferred machine values
+alone do not establish source C declarations.
 
 Keep private original images, authored evaluator references and byte-bearing
 captures local. Original-only generation withholds authored answers, names, maps

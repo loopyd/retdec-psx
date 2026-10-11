@@ -115,7 +115,16 @@ bool Parameters::isKeepAllFunctions() const
  */
 bool Parameters::isSelectedDecodeOnly() const { return _selectedDecodeOnly; }
 bool Parameters::isOriginalOnlyReturnRecovery() const { return _originalOnlyReturnRecovery; }
-void Parameters::setIsOriginalOnlyReturnRecovery(bool b) { _originalOnlyReturnRecovery = b; }
+void Parameters::setIsOriginalOnlyReturnRecovery(bool b) {
+	_originalOnlyReturnRecovery = b;
+	if (!b) _originalSourceForm.reset();
+}
+
+void Parameters::setOriginalSourceForm(common::OriginalSourceForm form) {
+	if (!_originalOnlyReturnRecovery) throw std::runtime_error("source-form-requires-original-only-recovery");
+	common::originalSourceFormName(form);
+	_originalSourceForm = form;
+}
 
 /**
  * Find out if some functions or ranges were selected in selective decompilation.
@@ -512,6 +521,9 @@ void Parameters::serialize(Writer& writer) const
 	serdes::serializeBool(writer, JSON_keepAllFuncs, isKeepAllFunctions());
 	serdes::serializeBool(writer, JSON_selectedDecodeOnly, isSelectedDecodeOnly());
 	serdes::serializeBool(writer, JSON_originalOnlyReturnRecovery, isOriginalOnlyReturnRecovery(), false);
+	if (_originalSourceForm) {
+		writer.Key("originalSourceForm"); writer.String(common::originalSourceFormName(*_originalSourceForm));
+	}
 	if (_originalCallScope) {
 		const auto& scope = *_originalCallScope;
 		writer.Key("originalCallScope"); writer.StartObject();
@@ -590,6 +602,9 @@ template void Parameters::serialize(
 void Parameters::deserialize(const rapidjson::Value& val)
 {
 	_originalCallScope.reset();
+	_originalSourceForm.reset();
+	if (val.IsObject() && val.HasMember("originalSourceForm"))
+		throw std::runtime_error("original-source-form-requires-validated-command");
 	if (val.IsObject() && val.HasMember("originalCallScope"))
 		throw std::runtime_error("original-call-scope-requires-validated-command");
 	if ( val.IsNull() || !val.IsObject() )

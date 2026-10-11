@@ -136,6 +136,29 @@ void contract(Writer& writer, const retdec::common::OriginalCallContract& value)
 }
 
 template<typename Writer>
+void memoryAddress(Writer& writer, const retdec::common::OriginalMemoryAccess& access)
+{
+    if (auto* partial = std::get_if<retdec::common::OriginalFact>(&access.address)) {
+        if (partial->isComplete()) throw std::runtime_error("invalid-complete-memory-address-fact");
+        fact(writer, "address", *partial); return;
+    }
+    const auto& address = std::get<retdec::common::OriginalFixedMemoryAddress>(access.address);
+    writer.Key("address"); writer.StartObject(); writer.Key("kind"); writer.String("entry-fallthrough-prefix/v1");
+    writer.Key("base"); writer.Uint(address.base); writer.Key("value"); writer.Uint(address.value);
+    numbers(writer, "equalityEvidence", address.equalityEvidence); fact(writer, "alignment", address.alignment);
+    if (auto* partial = std::get_if<retdec::common::OriginalFact>(&address.fileBytes)) {
+        if (partial->isComplete()) throw std::runtime_error("invalid-complete-file-bytes-fact");
+        fact(writer, "fileBytes", *partial);
+    } else {
+        const auto& bytes = std::get<retdec::common::OriginalFileBytes>(address.fileBytes);
+        writer.Key("fileBytes"); writer.StartObject(); writer.Key("kind"); writer.String("file-backed-initial-bytes");
+        writer.Key("mappingStart"); writer.Uint(bytes.mappingStart); writer.Key("mappingBytes"); writer.Uint64(bytes.mappingBytes);
+        writer.Key("payloadOffset"); writer.Uint64(bytes.payloadOffset); numbers(writer, "bytes", bytes.bytes); writer.EndObject();
+    }
+    writer.EndObject();
+}
+
+template<typename Writer>
 void summary(Writer& writer, const retdec::common::OriginalFunctionSummary& value)
 {
     writer.Key("originalCallSummary"); writer.StartObject(); writer.Key("function"); writer.String(value.function);
@@ -163,7 +186,12 @@ void summary(Writer& writer, const retdec::common::OriginalFunctionSummary& valu
         writer.Key("delayed"); writer.Bool(row.delayed);
         numbers(writer, "addressDefinitions", row.addressDefinitions); numbers(writer, "addressEntries", row.addressEntries);
         numbers(writer, "valueDefinitions", row.valueDefinitions); numbers(writer, "valueEntries", row.valueEntries);
-        fact(writer, "obligation", row.obligation); writer.EndObject();
+        fact(writer, "obligation", row.obligation); memoryAddress(writer, row);
+        fact(writer, "objectExtent", row.objectExtent); fact(writer, "initializedObject", row.initializedObject);
+        fact(writer, "zeroInitializedObject", row.zeroInitializedObject); fact(writer, "constQualification", row.constQualification);
+        fact(writer, "volatileQualification", row.volatileQualification); fact(writer, "restrictQualification", row.restrictQualification);
+        fact(writer, "currentContents", row.currentContents); fact(writer, "aliasEffects", row.aliasEffects);
+        fact(writer, "placement", row.placement); writer.EndObject();
     }
     writer.EndArray(); writer.EndObject();
 }
@@ -399,6 +427,11 @@ void serialize(Writer& writer, const common::Function& f)
     bool concreteReturn = !f.returnDisposition || f.returnDisposition->kind == common::ReturnDisposition::Kind::Value;
     if (f.returnDisposition) disposition(writer, *f.returnDisposition);
     if (f.originalCallSummary) summary(writer, *f.originalCallSummary);
+	if (f.originalBodyCandidate) {
+		if (*f.originalBodyCandidate != common::OriginalBodyCandidate::EmptyVoid)
+			throw std::runtime_error("invalid-original-body-candidate");
+		writer.Key("originalBodyCandidate"); writer.String("mips-empty-body/v1");
+	}
 	if (!f.originalSourceExpressions.empty()) {
 		writer.Key("originalSourceExpressions"); writer.StartArray();
 		for (const auto& expression : f.originalSourceExpressions) {
@@ -411,6 +444,34 @@ void serialize(Writer& writer, const common::Function& f)
 			writer.EndObject();
 		}
 		writer.EndArray();
+	}
+	if (f.originalSourceForms) {
+		bool unresolved = !f.originalSourceFormFailures.empty();
+		for (const auto& application : *f.originalSourceForms)
+			unresolved |= std::holds_alternative<common::SourceFormUnresolved>(application.outcome);
+		writer.Key("originalSourceForms"); writer.StartObject();
+		writer.Key("status"); writer.String(unresolved ? "unresolved"
+			: f.originalSourceForms->empty() ? "no-bound-sites" : "census");
+		writer.Key("remaining"); writer.StartArray();
+		for (const auto& reason : f.originalSourceFormFailures) writer.String(reason);
+		writer.EndArray();
+		writer.Key("applications"); writer.StartArray();
+		for (const auto& application : *f.originalSourceForms) {
+			if (application.witnessIndex >= f.originalSourceExpressions.size())
+				throw std::runtime_error("original-source-form-witness-index-unresolved");
+			writer.StartObject(); writer.Key("witnessIndex"); writer.Uint(application.witnessIndex);
+			if (auto ready = std::get_if<common::SourceFormReady>(&application.outcome)) {
+				if (!ready->occurrences || ready->occurrences > common::ReturnDisposition::ReferenceLimit)
+					throw std::runtime_error("original-source-form-occurrence-count-unresolved");
+				writer.Key("status"); writer.String("ready");
+				writer.Key("occurrences"); writer.Uint(ready->occurrences);
+			} else {
+				writer.Key("status"); writer.String("unresolved");
+				writer.Key("reason"); writer.String(std::get<common::SourceFormUnresolved>(application.outcome).reason);
+			}
+			writer.EndObject();
+		}
+		writer.EndArray(); writer.EndObject();
 	}
 	serialize(writer, JSON_returnStorage, f.returnStorage, concreteReturn && f.returnStorage.isDefined());
 	serialize(writer, JSON_fbStorage, f.frameBaseStorage, f.frameBaseStorage.isDefined());
@@ -469,7 +530,12 @@ void deserialize(const rapidjson::Value& val, common::Function& f)
 	deserialize(val, JSON_returnType, f.returnType);
     f.originalCallSummary.reset();
     if (val.HasMember("originalCallSummary")) throw std::runtime_error("original-call-summary-is-invocation-output-only");
+	f.originalBodyCandidate.reset();
+	if (val.HasMember("originalBodyCandidate")) throw std::runtime_error("original-body-candidate-is-invocation-output-only");
 	f.originalSourceExpressions.clear();
+	f.originalSourceForms.reset();
+	f.originalSourceFormFailures.clear();
+	if (val.HasMember("originalSourceForms")) throw std::runtime_error("original-source-forms-is-invocation-output-only");
 	if (val.HasMember("originalSourceExpressions")) throw std::runtime_error("original-source-expressions-is-invocation-output-only");
     f.returnDisposition.reset();
     auto nativeReturn = val.FindMember("returnDisposition");

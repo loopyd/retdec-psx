@@ -22,6 +22,8 @@ TruncCastExpr::TruncCastExpr(ShPtr<Expression> op, ShPtr<Type> dstType):
 bool TruncCastExpr::isEqualTo(ShPtr<Value> otherValue) const {
 	// Both types and values of all operands have to be equal.
 	if (ShPtr<TruncCastExpr> otherCastExpr = cast<TruncCastExpr>(otherValue)) {
+		if ((getOriginalExtraction() || otherCastExpr->getOriginalExtraction())
+				&& !hasSameOriginalExtraction(*otherCastExpr)) return false;
 		return dstType->isEqualTo(otherCastExpr->getType()) &&
 			op->isEqualTo(otherCastExpr->getOperand());
 	}
@@ -34,6 +36,7 @@ bool TruncCastExpr::isEqualTo(ShPtr<Value> otherValue) const {
 ShPtr<Value> TruncCastExpr::clone() {
 	ShPtr<TruncCastExpr> castExpr(TruncCastExpr::create(
 		ucast<Expression>(op->clone()), dstType));
+	copyOriginalExtractionTo(*castExpr);
 	castExpr->setMetadata(getMetadata());
 	return castExpr;
 }

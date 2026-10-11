@@ -23,14 +23,15 @@ DivOpExpr::DivOpExpr(ShPtr<Expression> op1, ShPtr<Expression> op2,
 bool DivOpExpr::isEqualTo(ShPtr<Value> otherValue) const {
 	if (ShPtr<DivOpExpr> otherValueDivOpExpr = cast<DivOpExpr>(otherValue)) {
 		return op1->isEqualTo(otherValueDivOpExpr->getFirstOperand()) &&
-			op2->isEqualTo(otherValueDivOpExpr->getSecondOperand());
+			op2->isEqualTo(otherValueDivOpExpr->getSecondOperand()) &&
+			variant == otherValueDivOpExpr->getVariant();
 	}
 	return false;
 }
 
 ShPtr<Value> DivOpExpr::clone() {
 	ShPtr<DivOpExpr> divOpExpr(DivOpExpr::create(
-		ucast<Expression>(op1->clone()), ucast<Expression>(op2->clone())));
+		ucast<Expression>(op1->clone()), ucast<Expression>(op2->clone()), variant));
 	divOpExpr->setMetadata(getMetadata());
 	return divOpExpr;
 }

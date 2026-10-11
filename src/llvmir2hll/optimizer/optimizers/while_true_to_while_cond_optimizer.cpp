@@ -4,12 +4,14 @@
 * @copyright (c) 2017 Avast Software, licensed under the MIT license
 */
 
+#include "retdec/llvmir2hll/config/config.h"
 #include "retdec/llvmir2hll/ir/assign_stmt.h"
 #include "retdec/llvmir2hll/ir/break_stmt.h"
 #include "retdec/llvmir2hll/ir/const_bool.h"
 #include "retdec/llvmir2hll/ir/empty_stmt.h"
 #include "retdec/llvmir2hll/ir/expression.h"
 #include "retdec/llvmir2hll/ir/if_stmt.h"
+#include "retdec/llvmir2hll/ir/module.h"
 #include "retdec/llvmir2hll/ir/not_op_expr.h"
 #include "retdec/llvmir2hll/ir/return_stmt.h"
 #include "retdec/llvmir2hll/ir/statement.h"
@@ -57,6 +59,13 @@ void WhileTrueToWhileCondOptimizer::visit(ShPtr<WhileLoopStmt> stmt) {
 	ShPtr<SplittedWhileTrueLoop> splittedLoop(splitWhileTrueLoop(stmt));
 	if (!splittedLoop) {
 		// The loop cannot be optimized.
+		return;
+	}
+
+	auto config = module->getConfig();
+	if (config && config->isOriginalOnlyReturnRecovery()
+			&& skipEmptyStmts(splittedLoop->beforeLoopEndStmts)
+			&& !skipEmptyStmts(splittedLoop->afterLoopEndStmts)) {
 		return;
 	}
 

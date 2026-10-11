@@ -67,6 +67,8 @@ class Decoder : public llvm::ModulePass
 		std::map<uint64_t, common::ReturnDisposition> _originalDispositions;
 		std::map<uint64_t, uint64_t> _originalExtents;
 		void admitOriginalDirectTarget(uint64_t callPc, uint64_t target);
+		const common::ReviewedOriginalFunction* getReviewedOriginalFunction(common::Address addr) const;
+		[[noreturn]] void refuseOriginalOwnership(common::Address addr);
 
 	// Initializations.
 	//

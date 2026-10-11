@@ -24,6 +24,8 @@ ExtCastExpr::ExtCastExpr(ShPtr<Expression> op, ShPtr<Type> dstType,
 bool ExtCastExpr::isEqualTo(ShPtr<Value> otherValue) const {
 	// Both types and values of all operands have to be equal.
 	if (ShPtr<ExtCastExpr> otherCastExpr = cast<ExtCastExpr>(otherValue)) {
+		if ((getOriginalExtraction() || otherCastExpr->getOriginalExtraction())
+				&& (!hasSameOriginalExtraction(*otherCastExpr) || variant != otherCastExpr->variant)) return false;
 		return dstType->isEqualTo(otherCastExpr->getType()) &&
 			op->isEqualTo(otherCastExpr->getOperand());
 	}
@@ -35,7 +37,9 @@ bool ExtCastExpr::isEqualTo(ShPtr<Value> otherValue) const {
 */
 ShPtr<Value> ExtCastExpr::clone() {
 	ShPtr<ExtCastExpr> castExpr(ExtCastExpr::create(
-		ucast<Expression>(op->clone()), dstType));
+		ucast<Expression>(op->clone()), dstType,
+		getOriginalExtraction() ? variant : Variant::ZExt));
+	copyOriginalExtractionTo(*castExpr);
 	castExpr->setMetadata(getMetadata());
 	return castExpr;
 }

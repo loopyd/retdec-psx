@@ -23,14 +23,15 @@ ModOpExpr::ModOpExpr(ShPtr<Expression> op1, ShPtr<Expression> op2,
 bool ModOpExpr::isEqualTo(ShPtr<Value> otherValue) const {
 	if (ShPtr<ModOpExpr> otherValueModOpExpr = cast<ModOpExpr>(otherValue)) {
 		return op1->isEqualTo(otherValueModOpExpr->getFirstOperand()) &&
-			op2->isEqualTo(otherValueModOpExpr->getSecondOperand());
+			op2->isEqualTo(otherValueModOpExpr->getSecondOperand()) &&
+			variant == otherValueModOpExpr->getVariant();
 	}
 	return false;
 }
 
 ShPtr<Value> ModOpExpr::clone() {
 	ShPtr<ModOpExpr> modOpExpr(ModOpExpr::create(
-		ucast<Expression>(op1->clone()), ucast<Expression>(op2->clone())));
+		ucast<Expression>(op1->clone()), ucast<Expression>(op2->clone()), variant));
 	modOpExpr->setMetadata(getMetadata());
 	return modOpExpr;
 }

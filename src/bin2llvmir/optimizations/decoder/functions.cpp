@@ -102,12 +102,31 @@ llvm::Function* Decoder::getFunctionContainingAddress(common::Address a)
 	return nullptr;
 }
 
+const common::ReviewedOriginalFunction* Decoder::getReviewedOriginalFunction(
+		common::Address addr) const
+{
+	if (!_config || addr.isUndefined()
+			|| !_config->getConfig().parameters.isOriginalOnlyReturnRecovery())
+		return nullptr;
+	const auto& scope = _config->getConfig().parameters.getOriginalCallScope();
+	if (!scope) return nullptr;
+	auto contains = [&](const common::ReviewedOriginalFunction& function) {
+		return function.start <= addr.getValue() && addr.getValue() < function.end;
+	};
+	if (contains(scope->root)) return &scope->root;
+	for (const auto& function : scope->callees)
+		if (contains(function)) return &function;
+	return nullptr;
+}
+
 /**
  * Create function at address \p a.
  * \return Created function.
  */
 llvm::Function* Decoder::createFunction(common::Address a, bool declaration)
 {
+	if (const auto* reviewed = getReviewedOriginalFunction(a))
+		if (a.getValue() != reviewed->start) refuseOriginalOwnership(a);
 	auto existing = _addr2fnc.find(a);
 	if (existing != _addr2fnc.end())
 	{

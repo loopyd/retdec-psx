@@ -11,6 +11,10 @@
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/Metadata.h>
+#include <limits>
+#include <stdexcept>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Value.h>
 
@@ -20,6 +24,8 @@
 #include "retdec/llvmir2hll/ir/deref_op_expr.h"
 #include "retdec/llvmir2hll/ir/expression.h"
 #include "retdec/llvmir2hll/ir/module.h"
+#include "retdec/llvmir2hll/ir/function.h"
+#include "retdec/llvmir2hll/config/config.h"
 #include "retdec/llvmir2hll/ir/unknown_type.h"
 #include "retdec/llvmir2hll/ir/variable.h"
 #include "retdec/llvmir2hll/llvm/llvm_support.h"
@@ -33,6 +39,51 @@
 
 namespace retdec {
 namespace llvmir2hll {
+
+Extraction LLVMValueConverter::bindOriginalExtraction(llvm::SExtInst& instruction) {
+	auto* marker = instruction.getMetadata("retdec.original.source-expression");
+	if (!marker) return {};
+	auto config = resModule->getConfig();
+	if (!config || !instruction.getParent()) return {};
+	auto* owner = instruction.getFunction();
+	if (!owner) return {};
+	auto view = config->getOriginalSourceRecovery(owner->getName().str());
+	if (!view) return {};
+	auto fail = []() { throw std::runtime_error("original-source-expression-association-unresolved"); };
+	if (marker->getNumOperands() != 8) { fail(); return {}; }
+	auto* name = llvm::dyn_cast<llvm::MDString>(marker->getOperand(0).get());
+	uint64_t values[7];
+	for (unsigned i = 0; i < 7; ++i) {
+		auto* value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(marker->getOperand(i + 1));
+		if (!value || !value->getType()->isIntegerTy(64)) { fail(); return {}; }
+		values[i] = value->getZExtValue();
+		if (i >= 2 && values[i] > std::numeric_limits<unsigned>::max()) { fail(); return {}; }
+	}
+	common::OriginalSourceExpression witness{values[0], values[1], unsigned(values[2]),
+		unsigned(values[3]), unsigned(values[4]), unsigned(values[5])};
+	unsigned matches = 0;
+	for (const auto& expected : view->witnesses) if (witness == expected) ++matches;
+	auto* trunc = llvm::dyn_cast<llvm::TruncInst>(instruction.getOperand(0));
+	auto* argument = trunc ? llvm::dyn_cast<llvm::Argument>(trunc->getOperand(0)) : nullptr;
+	auto* pcNode = instruction.getMetadata("insn.addr");
+	auto* pc = pcNode && pcNode->getNumOperands() == 1
+		? llvm::mdconst::dyn_extract<llvm::ConstantInt>(pcNode->getOperand(0)) : nullptr;
+	auto function = resModule->getFuncByName(owner->getName().str());
+	if (!name || name->getString() != owner->getName() || matches != 1
+			|| (witness.viewWidth != 8 && witness.viewWidth != 16)
+			|| !instruction.getType()->isIntegerTy(32) || !trunc
+			|| trunc->getFunction() != owner || !trunc->getType()->isIntegerTy(witness.viewWidth)
+			|| !argument || !argument->getType()->isIntegerTy(32) || argument->getParent() != owner
+			|| !pc || !pc->getType()->isIntegerTy(64) || pc->getZExtValue() != witness.rightPc
+			|| argument->getArgNo() != values[6] || view->parameterRegisters.size() != owner->arg_size()
+			|| values[6] >= view->parameterRegisters.size()
+			|| view->parameterRegisters[values[6]] != witness.entryRegister
+			|| !function || function->getParams().size() != owner->arg_size()) { fail(); return {}; }
+	auto parameter = convertValueToVariable(argument);
+	if (function->getParams()[values[6]] != parameter) { fail(); return {}; }
+	return Extraction(new OriginalExtraction(witness, view->form, function->getInitialName(),
+		unsigned(values[6]), parameter));
+}
 
 /**
 * @brief Constructs a new converter.

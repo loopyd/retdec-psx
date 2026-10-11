@@ -53,6 +53,7 @@ bool RemoveUselessCastsOptimizer::tryOptimizationCase1(ShPtr<AssignStmt> stmt) {
 	}
 
 	ShPtr<CastExpr> rhsCast(cast<CastExpr>(stmt->getRhs()));
+	if (rhsCast && rhsCast->getOriginalExtraction()) return false;
 	if (!rhsCast) {
 		// The statement is not of the form `a = cast<>(...)`.
 		return false;

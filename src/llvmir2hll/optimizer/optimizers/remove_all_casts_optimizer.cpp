@@ -72,7 +72,12 @@ void RemoveAllCastsOptimizer::visit(ShPtr<PtrToIntCastExpr> expr) {
 * @brief Removes the given cast.
 */
 void RemoveAllCastsOptimizer::removeCast(ShPtr<CastExpr> castExpr) {
-	ShPtr<Expression> nonCastExpr(skipCasts(castExpr));
+	if (castExpr->getOriginalExtraction()) return;
+	ShPtr<Expression> nonCastExpr = castExpr->getOperand();
+	while (auto nested = cast<CastExpr>(nonCastExpr)) {
+		if (nested->getOriginalExtraction()) break;
+		nonCastExpr = nested->getOperand();
+	}
 	Expression::replaceExpression(castExpr, nonCastExpr);
 }
 

@@ -148,6 +148,25 @@ UPtr<JSONConfig> JSONConfig::fromConfig(const retdec::config::Config &source) {
 	return config;
 }
 
+bool JSONConfig::isOriginalOnlyReturnRecovery() const {
+	return impl->config.parameters.isOriginalOnlyReturnRecovery();
+}
+
+std::optional<common::OriginalSourceRecoveryView> JSONConfig::getOriginalSourceRecovery(
+		const std::string& functionInitialName) const {
+	const auto& parameters = impl->config.parameters;
+	const auto* source = impl->getConfigFunctionByName(functionInitialName);
+	if (!parameters.isOriginalOnlyReturnRecovery() || !parameters.getOriginalSourceForm()
+			|| !source || !source->originalCallSummary || !source->returnDisposition
+			|| source->returnDisposition->kind != common::ReturnDisposition::Kind::Value
+			|| !source->originalCallSummary->declaration.isComplete()
+			|| !source->returnDisposition->evidence.decodeComplete
+			|| !source->returnDisposition->evidence.analysisComplete
+			|| source->returnDisposition->evidence.symbol != functionInitialName) return {};
+	return common::OriginalSourceRecoveryView{*parameters.getOriginalSourceForm(),
+		source->originalSourceExpressions, source->originalCallSummary->parameterRegisters};
+}
+
 /**
 * @brief Returns an empty config.
 */
