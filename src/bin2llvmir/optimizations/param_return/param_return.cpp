@@ -255,18 +255,20 @@ bool canProposeOrdinaryBody(const common::Function& function)
 		const auto& row = rows[i];
 		unsigned op = row.word >> 26, rs = (row.word >> 21) & 31, rt = (row.word >> 16) & 31;
 		bool call = op == 3, terminal = row.word == 0x03e00008;
+		bool load = op == 35 || op == 36, store = op == 40 || op == 41 || op == 43;
+		bool writesRegister = op == 9 || op == 15 || load;
 		if (row.pc != evidence.start + 4 * i || row.owner != evidence.symbol || row.bytes != 4
-			|| !row.mapped || row.undef || (row.word && op != 9 && op != 15 && op != 35 && op != 43 && !call && !terminal)
+			|| !row.mapped || row.undef || (row.word && !writesRegister && !store && !call && !terminal)
 			|| (op == 15 && rs) || (terminal && i != rows.size() - 2)
 			|| (i && (rows[i - 1].word >> 26 == 3 || rows[i - 1].word == 0x03e00008)
-				&& (call || terminal || (op == 35 && rt)))) return false;
+				&& (call || terminal || (load && rt)))) return false;
 		std::set<unsigned> reads;
-		if (op == 9 || op == 35 || op == 43) reads.insert(rs);
-		if (op == 43) reads.insert(rt);
+		if (op == 9 || load || store) reads.insert(rs);
+		if (store) reads.insert(rt);
 		if (terminal) reads.insert(31);
 		if (pendingLoad && reads.count(*pendingLoad)) return false;
-		pendingLoad = op == 35 && rt ? std::optional<unsigned>(rt) : std::nullopt;
-		if ((op == 9 || op == 15 || op == 35) && rt
+		pendingLoad = load && rt ? std::optional<unsigned>(rt) : std::nullopt;
+		if (writesRegister && rt
 			&& std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), rt) == row.fullWidthRegisters.end()) return false;
 		if (call && std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), 31) == row.fullWidthRegisters.end()) return false;
 		bool stackAdjustment = frame && (i == 0 || i == rows.size() - 1) && op == 9 && rs == 29 && rt == 29;
@@ -280,8 +282,8 @@ bool canProposeOrdinaryBody(const common::Function& function)
 			} else if (!savedLink || *savedLink != offset || loadedCount++ || i >= rows.size() - 2) return false;
 		}
 		if (!stackAdjustment && !linkAccess
-			&& (reads.count(29) || (op != 43 && (op == 9 || op == 15 || op == 35) && rt == 29)
-				|| (!terminal && reads.count(31)) || ((op == 9 || op == 15 || op == 35) && rt == 31))) return false;
+			&& (reads.count(29) || (writesRegister && rt == 29)
+				|| (!terminal && reads.count(31)) || (writesRegister && rt == 31))) return false;
 		if (call) {
 			if (loadedCount || i + 2 >= rows.size() || callIndex >= evidence.calls.size()) return false;
 			const auto& observed = evidence.calls[callIndex++];
@@ -1328,11 +1330,11 @@ void ParamReturn::projectOriginalBody()
 	for (unsigned i = 0; i < instructions.size(); ++i) {
 		auto word = instructions[i].word;
 		unsigned op = word >> 26, rt = (word >> 16) & 31;
-		if ((op == 9 || op == 15 || op == 35) && rt >= 4 && rt <= 7) count = std::max(count, rt - 3);
+		if ((op == 9 || op == 15 || op == 35 || op == 36) && rt >= 4 && rt <= 7) count = std::max(count, rt - 3);
 		if (op == 3) {
 			auto slot = instructions[i + 1].word;
 			unsigned slotOp = slot >> 26, slotRt = (slot >> 16) & 31;
-			if ((slotOp == 9 || slotOp == 15 || slotOp == 35) && slotRt >= 4 && slotRt <= 7)
+			if ((slotOp == 9 || slotOp == 15 || slotOp == 35 || slotOp == 36) && slotRt >= 4 && slotRt <= 7)
 				count = std::max(count, slotRt - 3);
 			arguments.emplace(instructions[i].pc, count);
 			targets.emplace(instructions[i].pc, ((instructions[i].pc + 4) & 0xf0000000u) | ((word & 0x03ffffffu) << 2));
