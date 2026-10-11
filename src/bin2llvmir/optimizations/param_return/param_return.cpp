@@ -247,7 +247,10 @@ bool canProposeOrdinaryBody(const common::Function& function)
 		|| evidence.end != evidence.start + 4 * rows.size() || evidence.edges.size() != rows.size() - 1
 		|| evidence.exits.size() != 1 || rows[rows.size() - 2].word != 0x03e00008) return false;
 	const int frame = rows.front().word >> 16 == 0x27bd ? -int(int16_t(rows.front().word)) : 0;
-	if (frame && (frame < 8 || frame > 32767 || frame % 8 || rows.back().word != (0x27bd0000u | unsigned(frame)))) return false;
+	const bool slotRestore = frame && rows.back().word == (0x27bd0000u | unsigned(frame));
+	const bool earlyRestore = frame && rows.size() >= 3 && rows.back().word == 0
+		&& rows[rows.size() - 3].word == (0x27bd0000u | unsigned(frame));
+	if (frame && (frame < 8 || frame > 32767 || frame % 8 || (!slotRestore && !earlyRestore))) return false;
 	std::optional<int> savedLink;
 	unsigned savedCount = 0, loadedCount = 0, callIndex = 0;
 	std::optional<unsigned> pendingLoad;
@@ -271,7 +274,8 @@ bool canProposeOrdinaryBody(const common::Function& function)
 		if (writesRegister && rt
 			&& std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), rt) == row.fullWidthRegisters.end()) return false;
 		if (call && std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), 31) == row.fullWidthRegisters.end()) return false;
-		bool stackAdjustment = frame && (i == 0 || i == rows.size() - 1) && op == 9 && rs == 29 && rt == 29;
+		bool stackAdjustment = frame && op == 9 && rs == 29 && rt == 29
+			&& (i == 0 || (slotRestore && i == rows.size() - 1) || (earlyRestore && i == rows.size() - 3));
 		bool linkAccess = frame && rs == 29 && rt == 31 && (op == 35 || op == 43);
 		if (linkAccess) {
 			int offset = int16_t(row.word);
