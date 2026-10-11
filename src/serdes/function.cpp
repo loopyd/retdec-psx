@@ -142,6 +142,13 @@ void memoryAddress(Writer& writer, const retdec::common::OriginalMemoryAccess& a
         if (partial->isComplete()) throw std::runtime_error("invalid-complete-memory-address-fact");
         fact(writer, "address", *partial); return;
     }
+    if (const auto* address = std::get_if<retdec::common::OriginalEntryRelativeMemoryAddress>(&access.address)) {
+        if (!address->entryRegister || address->entryRegister > 31)
+            throw std::runtime_error("invalid-entry-relative-memory-register");
+        writer.Key("address"); writer.StartObject(); writer.Key("kind"); writer.String("entry-register-relative-prefix/v1");
+        writer.Key("entryRegister"); writer.Uint(address->entryRegister); writer.Key("offset"); writer.Uint(address->offset);
+        numbers(writer, "equalityEvidence", address->equalityEvidence); writer.EndObject(); return;
+    }
     const auto& address = std::get<retdec::common::OriginalFixedMemoryAddress>(access.address);
     writer.Key("address"); writer.StartObject(); writer.Key("kind"); writer.String("entry-fallthrough-prefix/v1");
     writer.Key("base"); writer.Uint(address.base); writer.Key("value"); writer.Uint(address.value);

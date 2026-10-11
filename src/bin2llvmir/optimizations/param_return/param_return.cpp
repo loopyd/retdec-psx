@@ -39,6 +39,13 @@ using namespace llvm;
 namespace retdec {
 namespace bin2llvmir {
 
+namespace {
+class OriginalContractRefusal : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+}
+
 //
 //=============================================================================
 //  ParamReturn
@@ -122,6 +129,9 @@ bool ParamReturn::run()
 				applyToIr();
 			}
 			retainSelectedDefinitionOnly();
+		} catch (const OriginalContractRefusal&) {
+			_RDA.clear();
+			throw;
 		} catch (...) {
 			if (!syntaxOnly) {
 				for (const auto& function : _config->getConfig().functions)
@@ -644,13 +654,13 @@ bool originalMemoryPrefix(const Disposition::Evidence& evidence,
     const std::map<uint64_t, const Disposition::Instruction*>& instructions,
     const std::multimap<uint64_t, const Disposition::Edge*>& outgoingEdges,
     const std::multimap<uint64_t, const Disposition::Edge*>& incomingEdges, uint64_t accessPc,
-    const common::OriginalFixedMemoryAddress& constantAddress)
+    const std::vector<uint64_t>& equalityEvidence, unsigned entryRegister = 0)
 {
-    std::set<unsigned> protectedRegisters{(instructions.at(accessPc)->word >> 21) & 31};
-    for (auto pc : constantAddress.equalityEvidence) {
-        auto word = instructions.at(pc)->word;
-        protectedRegisters.insert((word >> 16) & 31);
-        if ((word >> 26) != 15) protectedRegisters.insert((word >> 21) & 31);
+    std::set<unsigned> protectedRegisters{(instructions.at(accessPc)->word >> 21) & 31, entryRegister};
+    for (auto pc : equalityEvidence) {
+        auto operation = originalOperation(*instructions.at(pc));
+        protectedRegisters.insert(operation.inputs.begin(), operation.inputs.end());
+        protectedRegisters.insert(operation.destinations.begin(), operation.destinations.end());
     }
     protectedRegisters.erase(0);
     for (const auto& pair : instructions) {
@@ -693,9 +703,8 @@ bool originalMemoryPrefix(const Disposition::Evidence& evidence,
     return true;
 }
 
-const Disposition::Definition* originalMemoryLatest(
+const Disposition::Instruction* originalMemoryLatestWriter(
     const std::map<uint64_t, const Disposition::Instruction*>& instructions,
-    const std::map<std::pair<uint64_t, unsigned>, const Disposition::Definition*>& definitions,
     uint64_t before, unsigned reg)
 {
     if (!reg) return nullptr;
@@ -705,10 +714,32 @@ const Disposition::Definition* originalMemoryLatest(
         const auto& row = *position->second;
         auto operation = originalOperation(row);
         if (std::find(operation.destinations.begin(), operation.destinations.end(), reg) == operation.destinations.end()) continue;
-        auto definition = definitions.find({row.pc, reg});
-        return definition == definitions.end() ? nullptr : definition->second;
+        return &row;
     }
     return nullptr;
+}
+
+const Disposition::Definition* originalMemoryLatest(
+    const std::map<uint64_t, const Disposition::Instruction*>& instructions,
+    const std::map<std::pair<uint64_t, unsigned>, const Disposition::Definition*>& definitions,
+    uint64_t before, unsigned reg)
+{
+    const auto* writer = originalMemoryLatestWriter(instructions, before, reg);
+    if (!writer) return nullptr;
+    auto definition = definitions.find({writer->pc, reg});
+    return definition == definitions.end() ? nullptr : definition->second;
+}
+
+bool originalMemoryAccessMatches(const common::OriginalMemoryAccess& access,
+    const Disposition::Instruction& instruction, const MipsOperation& operation)
+{
+    unsigned opcode = instruction.word >> 26;
+    unsigned width = opcode == 32 || opcode == 36 || opcode == 40 ? 8 : opcode == 33 || opcode == 37 || opcode == 41 ? 16 : 32;
+    std::string kind = operation.kind == MipsOperation::Load ? "read" : "write";
+    std::string extension = kind == "write" || width == 32 ? "none" : opcode == 32 || opcode == 33 ? "sign" : "zero";
+    return !operation.merge && (operation.kind == MipsOperation::Load || operation.kind == MipsOperation::Store)
+        && access.kind == kind && access.width == width && access.extension == extension
+        && access.delayed == (operation.kind == MipsOperation::Load);
 }
 
 std::optional<common::OriginalFixedMemoryAddress> originalMemoryAddress(
@@ -718,14 +749,7 @@ std::optional<common::OriginalFixedMemoryAddress> originalMemoryAddress(
 {
     const auto& instruction = *instructions.at(access.pc);
     auto operation = originalOperation(instruction);
-    if (operation.merge) return {};
-    unsigned opcode = instruction.word >> 26;
-    unsigned width = opcode == 32 || opcode == 36 || opcode == 40 ? 8 : opcode == 33 || opcode == 37 || opcode == 41 ? 16 : 32;
-    std::string kind = operation.kind == MipsOperation::Load ? "read" : "write";
-    std::string extension = kind == "write" || width == 32 ? "none" : opcode == 32 || opcode == 33 ? "sign" : "zero";
-    if ((operation.kind != MipsOperation::Load && operation.kind != MipsOperation::Store)
-        || access.kind != kind || access.width != width || access.extension != extension
-        || access.delayed != (operation.kind == MipsOperation::Load) || !access.addressEntries.empty()) return {};
+    if (!originalMemoryAccessMatches(access, instruction, operation) || !access.addressEntries.empty()) return {};
     unsigned reg = (instruction.word >> 21) & 31;
     auto* definition = originalMemoryLatest(instructions, definitions, access.pc, reg);
     if ((reg && !definition) || access.addressDefinitions != (reg ? std::vector<unsigned>{definition->id} : std::vector<unsigned>{})) return {};
@@ -763,7 +787,67 @@ std::optional<common::OriginalFixedMemoryAddress> originalMemoryAddress(
         if (proof.constant != std::optional<uint32_t>{address.base} || proof.equalityEvidence != storedEquality) return {};
     }
     address.value = address.base + uint32_t(int32_t(int16_t(instruction.word & 0xffff)));
-    if (address.value % (width / 8) == 0) address.alignment = common::OriginalFact::complete();
+    if (address.value % (access.width / 8) == 0) address.alignment = common::OriginalFact::complete();
+    return address;
+}
+
+std::optional<common::OriginalEntryRelativeMemoryAddress> originalEntryRelativeMemoryAddress(
+    const common::OriginalMemoryAccess& access,
+    const std::map<uint64_t, const Disposition::Instruction*>& instructions,
+    const std::map<std::pair<uint64_t, unsigned>, const Disposition::Definition*>& definitions)
+{
+    const auto& instruction = *instructions.at(access.pc);
+    auto operation = originalOperation(instruction);
+    if (!originalMemoryAccessMatches(access, instruction, operation)) return {};
+    unsigned reg = (instruction.word >> 21) & 31;
+    if (!reg) return {};
+    uint64_t before = access.pc;
+    std::vector<const Disposition::Definition*> chain;
+    while (const auto* writer = originalMemoryLatestWriter(instructions, before, reg)) {
+        if (chain.size() >= 128) return {};
+        auto found = definitions.find({writer->pc, reg});
+        if (found == definitions.end()) return {};
+        const auto* definition = found->second;
+        auto word = writer->word;
+        unsigned op = word >> 26, rs = (word >> 21) & 31, rt = (word >> 16) & 31;
+        bool copy = op == 0 && (word & 63) == 33 && ((word >> 6) & 31) == 0 && bool(rs) != bool(rt);
+        unsigned source = op == 9 ? rs : rs ? rs : rt;
+        unsigned destination = op == 9 ? rt : (word >> 11) & 31;
+        if ((op != 9 && !copy) || !source || destination != reg || definition->reg != reg
+            || definition->pc != writer->pc || !definition->id || definition->width != 32
+            || definition->delayed || definition->origin != "instruction" || definition->constant
+            || definition->operation != (op == 9 ? "integer-immediate" : "integer-binary")
+            || std::count(writer->fullWidthRegisters.begin(), writer->fullWidthRegisters.end(), destination) != 1) return {};
+        chain.push_back(definition);
+        before = writer->pc; reg = source;
+    }
+    common::OriginalEntryRelativeMemoryAddress address;
+    address.entryRegister = reg;
+    std::vector<unsigned> entries{reg}, formals;
+    if (4 <= reg && reg <= 7) formals = entries;
+    std::vector<std::string> bad;
+    if (reg == 2) bad = {"incoming-v0"};
+    else if (reg == 1 || reg == 3 || (8 <= reg && reg <= 30))
+        bad = {"unproved-entry-register-" + std::to_string(reg)};
+    std::optional<unsigned> equalEntry = reg;
+    std::vector<uint64_t> identityEvidence;
+    const Disposition::Definition* previous = nullptr;
+    for (auto position = chain.rbegin(); position != chain.rend(); ++position) {
+        const auto& definition = **position;
+        auto word = instructions.at(definition.pc)->word;
+        if (definition.inputs != (previous ? std::vector<unsigned>{previous->id} : std::vector<unsigned>{})
+            || definition.entries != entries || definition.formals != formals || definition.bad != bad) return {};
+        if ((word >> 26) == 9 && (word & 0xffff)) {
+            address.offset += uint32_t(int32_t(int16_t(word & 0xffff)));
+            equalEntry.reset(); identityEvidence.clear();
+        } else identityEvidence.push_back(definition.pc);
+        if (definition.equalEntry != equalEntry || definition.equalityEvidence != identityEvidence) return {};
+        address.equalityEvidence.push_back(definition.pc);
+        previous = &definition;
+    }
+    if (access.addressEntries != entries
+        || access.addressDefinitions != (previous ? std::vector<unsigned>{previous->id} : std::vector<unsigned>{})) return {};
+    address.offset += uint32_t(int32_t(int16_t(instruction.word & 0xffff)));
     return address;
 }
 
@@ -828,7 +912,13 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
     for (auto& access : summary.accesses) {
         if (!instructions.count(access.pc)) continue;
         auto address = originalMemoryAddress(access, instructions, definitions);
-        if (!address || !originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc, *address)) continue;
+        if (!address) {
+            auto relative = originalEntryRelativeMemoryAddress(access, instructions, definitions);
+            if (relative && originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc,
+                    relative->equalityEvidence, relative->entryRegister)) access.address = std::move(*relative);
+            continue;
+        }
+        if (!originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc, address->equalityEvidence)) continue;
         uint64_t count = access.width / 8, value = address->value;
         if (physical && address->alignment.isComplete() && value >= load
             && value + count <= (uint64_t(1) << 32) && value - load <= payload.size()
@@ -1353,12 +1443,12 @@ void ParamReturn::requireSelectedContracts() const
 		&& ((*cf->originalBodyCandidate == common::OriginalBodyCandidate::EmptyVoid && canProposeEmptyBody(*cf))
 			|| (*cf->originalBodyCandidate == common::OriginalBodyCandidate::OrdinaryC && canProposeOrdinaryBody(*cf)))) return;
 	if (!cf || !cf->returnDisposition || cf->returnDisposition->kind != Disposition::Kind::Value)
-		throw std::runtime_error("original-only selected return contract is unknown");
+		throw OriginalContractRefusal("original-only selected return contract is unknown");
     if (p.getOriginalCallScope() && (!cf->originalCallSummary || !cf->originalCallSummary->declaration.isComplete()))
-        throw std::runtime_error("original-only selected declaration contract is unknown");
+        throw OriginalContractRefusal("original-only selected declaration contract is unknown");
 	for (const auto& call : cf->returnDisposition->evidence.calls)
 		if (call.required && !call.qualified)
-			throw std::runtime_error("original-only required call contract is unknown");
+			throw OriginalContractRefusal("original-only required call contract is unknown");
 }
 
 void ParamReturn::projectOriginalBody()
