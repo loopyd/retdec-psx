@@ -268,6 +268,7 @@ struct RegisterState {
     std::array<RegisterFact, Disposition::GprCount> pending;
     std::array<bool, Disposition::GprCount> mayPending{}, mayNoPending{};
     std::set<uint64_t> conditionalTables;
+    std::set<uint64_t> conditionalCallees;
     RegisterFact& operator[](unsigned reg) { return registers[reg]; }
     const RegisterFact& operator[](unsigned reg) const { return registers[reg]; }
 };
@@ -540,6 +541,11 @@ bool joinState(RegisterState& destination, const RegisterState& incoming)
     changed |= conditions != destination.conditionalTables.size();
     if (destination.conditionalTables.size() > Disposition::ReferenceLimit)
         throw std::runtime_error("conditional-table-references-exhausted");
+    conditions = destination.conditionalCallees.size();
+    destination.conditionalCallees.insert(incoming.conditionalCallees.begin(), incoming.conditionalCallees.end());
+    changed |= conditions != destination.conditionalCallees.size();
+    if (destination.conditionalCallees.size() > Disposition::ReferenceLimit)
+        throw std::runtime_error("conditional-callee-references-exhausted");
     for (unsigned reg = 0; reg < Disposition::RegisterCount; ++reg) {
         changed |= joinFact(destination[reg], incoming[reg]);
         if (reg >= Disposition::GprCount) continue;
@@ -1091,6 +1097,73 @@ std::optional<OriginalImageView> originalImageView(const FileImage* image,
     return view;
 }
 
+using OriginalCalleePreservation = std::map<uint64_t, uint32_t>;
+
+OriginalCalleePreservation originalCalleePreservation(
+    const std::optional<common::OriginalCalleeContexts>& contexts,
+    const config::Parameters& parameters, const Disposition::Evidence& evidence,
+    const std::map<uint64_t, const Disposition::Instruction*>& instructions,
+    const std::optional<OriginalImageView>& image)
+{
+    const auto& scope = parameters.getOriginalCallScope();
+    if (!parameters.isOriginalOnlyReturnRecovery() || !scope || !contexts || !image || !image->physical
+        || evidence.selection != "selected-root" || evidence.start != scope->root.start
+        || evidence.end != scope->root.end || contexts->imageId != scope->root.imageId
+        || contexts->payloadHash != scope->payloadHash || contexts->mappingStart != image->mappingStart
+        || contexts->mappingBytes != image->payload.size() || contexts->candidates.size() > 32) return {};
+    std::size_t retained = 0;
+    std::set<uint64_t> owners;
+    for (const auto& context : contexts->candidates) {
+        if (context.words.size() > 256 || context.callPcs.size() > instructions.size()) return {};
+        retained += context.words.size();
+        if (retained > 4096) return {};
+        for (auto pc : context.callPcs) if (!owners.insert(pc).second) return {};
+    }
+    OriginalCalleePreservation result;
+    for (const auto& context : contexts->candidates) {
+        if (!context.mayWriteGprs || (*context.mayWriteGprs & ((uint32_t(1) << 31) | 1))
+            || context.entry % 4 || context.entry > UINT32_MAX - 1024
+            || !context.words.count(context.entry) || context.normalReturnPcs.empty()) continue;
+        bool valid = true;
+        for (const auto& word : context.words) {
+            auto overlaps = [&](const auto& member) { return member.start <= word.first && word.first < member.end; };
+            valid &= word.first % 4 == 0 && word.first >= context.entry
+                && uint64_t(word.first) - context.entry < 1024 && image->contains(word.first, 4)
+                && image->word(word.first) == word.second && !overlaps(scope->root)
+                && std::none_of(scope->callees.begin(), scope->callees.end(), overlaps);
+        }
+        std::set<uint32_t> returns;
+        for (auto pc : context.normalReturnPcs) {
+            auto ret = context.words.find(pc), delay = context.words.find(pc + 4);
+            if (!returns.insert(pc).second || ret == context.words.end() || ret->second != 0x03e00008
+                || delay == context.words.end()) { valid = false; continue; }
+            Disposition::Instruction row; row.pc = pc + 4; row.word = delay->second;
+            valid &= originalOperation(row).kind == MipsOperation::Compute;
+        }
+        if (!valid) continue;
+        auto trusted = [&](const Disposition::Instruction* row) {
+            return row && row->mapped && !row->undef && row->bytes == 4 && row->owner == evidence.symbol
+                && row->pc % 4 == 0 && row->pc >= evidence.start && row->pc < evidence.end;
+        };
+        for (auto pc : context.callPcs) {
+            auto call = instructions.find(pc), delay = instructions.find(pc + 4);
+            if (call == instructions.end() || delay == instructions.end()
+                || !trusted(call->second) || !trusted(delay->second) || call->second->word >> 26 != 3
+                || originalOperation(*call->second).target != std::optional<uint64_t>{context.entry}) continue;
+            auto operation = originalOperation(*delay->second);
+            if (operation.kind != MipsOperation::Compute && operation.kind != MipsOperation::Multiply
+                && operation.kind != MipsOperation::Divide && operation.kind != MipsOperation::Load
+                && operation.kind != MipsOperation::Store) continue;
+            bool width = true;
+            for (auto reg : operation.destinations)
+                width &= !reg || std::count(delay->second->fullWidthRegisters.begin(),
+                    delay->second->fullWidthRegisters.end(), reg) == 1;
+            if (width) result.emplace(pc, *context.mayWriteGprs);
+        }
+    }
+    return result;
+}
+
 struct OriginalDispatchSite {
     uint64_t jumpPc;
     const Disposition::Evidence& evidence;
@@ -1337,7 +1410,7 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     std::map<unsigned, Disposition::Definition>& definitions,
     std::map<std::tuple<uint64_t, unsigned, bool>, unsigned>& ids,
     std::set<std::tuple<uint64_t, unsigned, std::string>>& demands,
-    Disposition::Evidence& evidence, Config& config)
+    Disposition::Evidence& evidence, Config& config, const OriginalCalleePreservation& preservation)
 {
     common::OriginalPartialCall proof;
     proof.delay = call.pc + 4; proof.continuation = call.pc + 8;
@@ -1356,6 +1429,9 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
         }
     }
     auto before = state;
+    auto preserved = preservation.find(call.pc);
+    bool conditionalPreservation = !summary && preserved != preservation.end() && !pending
+        && proof.actualIncomingLink == std::optional<uint32_t>{uint32_t(proof.continuation)};
     bool bindings = summary && summary->entry.isComplete() && !pending;
     if (summary) {
         std::map<unsigned, std::set<uint64_t>> uses;
@@ -1386,6 +1462,8 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
             if (before.mayPending[reg]) state.pending[reg].bad.insert("pending-call-boundary-load-unresolved");
             state.mayPending[reg] = before.mayPending[reg]; state.mayNoPending[reg] = before.mayNoPending[reg];
         }
+        if (conditionalPreservation && reg < Disposition::GprCount
+            && !(preserved->second & (uint32_t(1) << reg))) { state[reg] = before[reg]; continue; }
         const common::OriginalTransfer* transfer = summary && summary->transfers.size() == Disposition::RegisterCount ? &summary->transfers[reg] : nullptr;
         if (transfer && transfer->pending && reg < Disposition::GprCount) {
             state.mayPending[reg] = true; state.mayNoPending[reg] = transfer->mayNoPending;
@@ -1431,16 +1509,36 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     if (summary && !proof.effects.isComplete() && evidence.obligations.size() < Disposition::RowLimit
         && std::none_of(evidence.obligations.begin(), evidence.obligations.end(), [&](const auto& row) { return row.pc == call.pc && row.reason == "callee-memory-effects-unresolved"; }))
         evidence.obligations.push_back({call.pc, "memory", "callee-memory-effects-unresolved"});
-    proof.remaining.clear();
-    for (const auto* dimension : {&proof.identity, &proof.inputs, &proof.transfers, &proof.result, &proof.control, &proof.effects, &proof.declaration})
-        if (!dimension->isComplete()) proof.remaining.insert(proof.remaining.end(), dimension->remaining.begin(), dimension->remaining.end());
+    if (conditionalPreservation) {
+        state.conditionalCallees.insert(call.pc);
+        if (state.conditionalCallees.size() > Disposition::ReferenceLimit)
+            throw std::runtime_error("conditional-callee-references-exhausted");
+        if (std::none_of(evidence.obligations.begin(), evidence.obligations.end(), [&](const auto& row) {
+            return row.pc == call.pc && row.domain == "architectural" && row.reason == "conditional-callee-preservation-unresolved";
+        })) {
+            if (evidence.obligations.size() >= Disposition::RowLimit)
+                throw std::runtime_error("return-obligations-exhausted");
+            evidence.obligations.push_back({call.pc, "architectural", "conditional-callee-preservation-unresolved"});
+        }
+    }
     for (auto jumpPc : state.conditionalTables) {
         auto condition = "conditional-jump-table-" + std::to_string(jumpPc);
         proof.inputs.kind = common::OriginalFact::Kind::Partial;
-        proof.inputs.remaining.push_back(condition); proof.remaining.push_back(std::move(condition));
+        proof.inputs.remaining.push_back(std::move(condition));
+    }
+    for (auto callPc : state.conditionalCallees) {
+        auto condition = "conditional-callee-preservation-" + std::to_string(callPc);
+        proof.inputs.kind = common::OriginalFact::Kind::Partial;
+        proof.transfers.kind = common::OriginalFact::Kind::Partial;
+        proof.inputs.remaining.push_back(condition); proof.transfers.remaining.push_back(std::move(condition));
     }
     std::sort(proof.inputs.remaining.begin(), proof.inputs.remaining.end());
     proof.inputs.remaining.erase(std::unique(proof.inputs.remaining.begin(), proof.inputs.remaining.end()), proof.inputs.remaining.end());
+    std::sort(proof.transfers.remaining.begin(), proof.transfers.remaining.end());
+    proof.transfers.remaining.erase(std::unique(proof.transfers.remaining.begin(), proof.transfers.remaining.end()), proof.transfers.remaining.end());
+    proof.remaining.clear();
+    for (const auto* dimension : {&proof.identity, &proof.inputs, &proof.transfers, &proof.result, &proof.control, &proof.effects, &proof.declaration})
+        if (!dimension->isComplete()) proof.remaining.insert(proof.remaining.end(), dimension->remaining.begin(), dimension->remaining.end());
     std::sort(proof.remaining.begin(), proof.remaining.end()); proof.remaining.erase(std::unique(proof.remaining.begin(), proof.remaining.end()), proof.remaining.end());
     call.unresolved = proof.remaining; call.qualified = false; call.contract = std::move(proof);
 }
@@ -1554,6 +1652,8 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 			}
 			auto imageView = revised ? originalImageView(_image, *scope, _config->getConfig().parameters,
 				evidence, summary.function) : std::optional<OriginalImageView>{};
+            const auto calleePreservation = originalCalleePreservation(cf->originalCalleeContexts,
+                _config->getConfig().parameters, evidence, instructions, imageView);
 			RegisterState entry;
             entry.mayNoPending.fill(true);
 			for (unsigned reg = 0; reg < Disposition::RegisterCount; ++reg)
@@ -1777,7 +1877,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 					}
 					else if (branch.kind == MipsOperation::Call) {
 						auto& call = calls[owner]; call.pc = owner; call.target = branch.target;
-                        if (revised) composeOriginalCall(call, state, graph, definitions, ids, demands, evidence, *_config);
+                        if (revised) composeOriginalCall(call, state, graph, definitions, ids, demands, evidence, *_config, calleePreservation);
                         else {
                             call.unresolved = {"argument-result-effect-contract-unresolved"};
                             for (unsigned reg = 1; reg < Disposition::RegisterCount; ++reg) {
