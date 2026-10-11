@@ -250,12 +250,15 @@ struct RegisterFact {
 	std::set<unsigned> definitions, formals, entries;
 	std::optional<unsigned> equalEntry;
 	std::optional<uint32_t> constant;
+	uint32_t possibleOneBits = UINT32_MAX;
 	std::set<uint64_t> equalityEvidence;
 	std::set<std::string> bad;
+	uint32_t possibleOnes() const { return constant.value_or(possibleOneBits); }
 	bool operator==(const RegisterFact& other) const {
 		return missing == other.missing && definitions == other.definitions
 			&& formals == other.formals && entries == other.entries && bad == other.bad
 			&& equalEntry == other.equalEntry && constant == other.constant
+			&& possibleOneBits == other.possibleOneBits
 			&& equalityEvidence == other.equalityEvidence;
 	}
 };
@@ -513,6 +516,7 @@ RegisterFact inputFact(const RegisterState& state, const MipsOperation& operatio
 bool joinFact(RegisterFact& fact, const RegisterFact& incoming)
 {
     auto old = fact;
+    fact.possibleOneBits = fact.possibleOnes() | incoming.possibleOnes();
     fact.missing |= incoming.missing;
     fact.definitions.insert(incoming.definitions.begin(), incoming.definitions.end());
     fact.formals.insert(incoming.formals.begin(), incoming.formals.end());
@@ -547,10 +551,12 @@ void establishIdentity(RegisterFact& output, const RegisterState& state,
     const Disposition::Instruction& row, unsigned destination)
 {
     output.equalEntry.reset(); output.constant.reset(); output.equalityEvidence.clear();
+    output.possibleOneBits = UINT32_MAX;
     unsigned op = row.word >> 26, rs = (row.word >> 21) & 31, rt = (row.word >> 16) & 31;
     unsigned fn = row.word & 63, shift = (row.word >> 6) & 31;
     auto copy = [&](unsigned reg) {
         output.equalEntry = state[reg].equalEntry; output.constant = state[reg].constant;
+        output.possibleOneBits = state[reg].possibleOnes();
         output.equalityEvidence = state[reg].equalityEvidence; output.equalityEvidence.insert(row.pc);
     };
     if (op == 3 && destination == 31) output.constant = uint32_t(row.pc + 8);
@@ -565,7 +571,24 @@ void establishIdentity(RegisterFact& output, const RegisterState& state,
         output.constant = op == 9 ? value + uint32_t(int32_t(int16_t(row.word & 0xffff)))
             : op == 12 ? value & (row.word & 0xffff) : op == 13 ? value | (row.word & 0xffff) : value ^ (row.word & 0xffff);
     }
+    if (op == 12) output.possibleOneBits = state[rs].possibleOnes() & (row.word & 0xffff);
     if (output.constant) output.equalityEvidence.insert(row.pc);
+}
+
+enum OriginalBranchPath { BranchTaken = 1, BranchFallthrough = 2, BothBranchPaths = 3 };
+
+unsigned originalBranchPaths(const Disposition::Instruction& row, const RegisterState& before)
+{
+    unsigned opcode = row.word >> 26;
+    if (opcode != 4 && opcode != 5) return BothBranchPaths;
+    const auto& left = before[(row.word >> 21) & 31];
+    const auto& right = before[(row.word >> 16) & 31];
+    bool equal;
+    if (left.constant && right.constant) equal = *left.constant == *right.constant;
+    else if ((left.constant && (*left.constant & ~right.possibleOnes()))
+        || (right.constant && (*right.constant & ~left.possibleOnes()))) equal = false;
+    else return BothBranchPaths;
+    return equal == (opcode == 4) ? BranchTaken : BranchFallthrough;
 }
 
 struct OriginalEntryOffset {
@@ -1183,6 +1206,7 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
             output.definitions = {id};
             if (transfer->equalEntry) {
                 output.equalEntry = before[*transfer->equalEntry].equalEntry; output.constant = before[*transfer->equalEntry].constant;
+                output.possibleOneBits = before[*transfer->equalEntry].possibleOnes();
                 output.equalityEvidence = before[*transfer->equalEntry].equalityEvidence;
             }
             else output.constant = transfer->constant;
@@ -1348,6 +1372,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 			std::set<std::tuple<uint64_t, unsigned, std::string>> demands;
 			std::map<uint64_t, common::OriginalMemoryAccess> accesses;
 			std::set<std::tuple<uint64_t, uint64_t, uint64_t, std::string>> edges;
+			std::map<uint64_t, unsigned> branchPaths;
 			unsigned iterations = 0;
 			while (!work.empty()) {
 				if (++iterations > 262144) throw std::runtime_error("return-flow-exhausted");
@@ -1362,10 +1387,20 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                 if (revised && ((row.word >> 26) == 8 || ((row.word >> 26) == 0 && ((row.word & 63) == 32 || (row.word & 63) == 34))))
                     obligation(pc, "effect", "integer-overflow-exception-unresolved");
 				auto state = states.at(node);
-				if (!row.mapped || row.owner != evidence.symbol || row.bytes != 4 || row.pc % 4 || row.undef)
+				bool trustedInstruction = row.mapped && row.owner == evidence.symbol
+					&& row.bytes == 4 && row.pc % 4 == 0 && !row.undef;
+				if (!trustedInstruction)
 					obligation(pc, "architectural", "unsupported-pc-ir-join");
 				if (operation.kind == MipsOperation::Unsupported)
 					obligation(pc, "architectural", "unsupported-machine-operation");
+                if (revised && (!trustedInstruction || operation.kind == MipsOperation::Unsupported)) {
+                    for (unsigned reg = 1; reg < Disposition::RegisterCount; ++reg) {
+                        state[reg].constant.reset(); state[reg].possibleOneBits = UINT32_MAX;
+                        if (reg < Disposition::GprCount) {
+                            state.pending[reg].constant.reset(); state.pending[reg].possibleOneBits = UINT32_MAX;
+                        }
+                    }
+                }
 				if (operation.kind == MipsOperation::Trap) {
 					obligation(pc, "architectural", "break-exception-control-unresolved");
 					obligation(pc, "effect", "break-exception-effects-unresolved");
@@ -1376,6 +1411,12 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 				if (owner && control) {
 					obligation(pc, "architectural", "control-in-delay-slot"); continue;
 				}
+                bool branchPathsChanged = false;
+                if (revised && operation.conditional) {
+                    auto& paths = branchPaths[pc];
+                    unsigned widened = paths | (trustedInstruction ? originalBranchPaths(row, state) : BothBranchPaths);
+                    branchPathsChanged = widened != paths; paths = widened;
+                }
 				auto inputs = inputFact(state, operation);
                 auto retainedMask = revised ? retainedLoadMask(operation, row, state) : std::optional<uint32_t>{};
                 if (revised) {
@@ -1452,7 +1493,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 					append(definition.bad, output.bad);
 					output.definitions = {id}; output.missing = false;
 					if (revised) {
-                        establishIdentity(output, identityState, row, destination);
+                        if (trustedInstruction && width) establishIdentity(output, identityState, row, destination);
                         definition.equalEntry = output.equalEntry; definition.constant = output.constant;
                         definition.equalityEvidence.assign(output.equalityEvidence.begin(), output.equalityEvidence.end());
                     }
@@ -1464,7 +1505,8 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 				}
 				if (operation.kind == MipsOperation::Load || operation.kind == MipsOperation::Store)
 					obligation(pc, "memory", "contents-object-address-alias-effect-placement-unresolved");
-				if ((operation.kind == MipsOperation::Store || operation.kind == MipsOperation::Branch)
+				if ((operation.kind == MipsOperation::Store || (operation.kind == MipsOperation::Branch
+                    && (!revised || !operation.conditional || branchPaths.at(pc) == BothBranchPaths)))
 					&& !inputs.bad.empty()) {
 					bool entryInput = revised && !inputs.missing
 						&& std::all_of(inputs.bad.begin(), inputs.bad.end(), [&](const auto& reason) {
@@ -1475,13 +1517,13 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 						});
 					obligation(pc, entryInput ? "entry" : "architectural", "unproved-control-or-effect-input");
 				}
-				auto send = [&](uint64_t target, uint64_t delayOwner, const std::string& kind) {
+				auto send = [&](uint64_t target, uint64_t delayOwner, const std::string& kind, bool forceQueue = false) {
 					edges.emplace(pc, target, delayOwner, kind);
 					if (edges.size() > Disposition::RowLimit) throw std::runtime_error("return-edges-exhausted");
 					Node next{target, delayOwner};
 					auto insertion = states.emplace(next, state);
 					if (states.size() > Disposition::RowLimit) throw std::runtime_error("return-states-exhausted");
-					if (insertion.second || joinState(insertion.first->second, state)) work.push_back(next);
+					if (insertion.second || joinState(insertion.first->second, state) || forceQueue) work.push_back(next);
 				};
 				if (owner) {
 					auto branch = originalOperation(*instructions.at(owner));
@@ -1511,12 +1553,15 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 						send(owner + 8, 0, "call-continuation");
 					}
 					else {
-						if (branch.target) send(*branch.target, 0, "branch");
-						else obligation(owner, "architectural", "unresolved-branch-target");
-						if (branch.conditional) send(owner + 8, 0, "fallthrough");
+                        unsigned paths = revised && branch.conditional ? branchPaths.at(owner) : BothBranchPaths;
+                        if (paths & BranchTaken) {
+                            if (branch.target) send(*branch.target, 0, "branch");
+                            else obligation(owner, "architectural", "unresolved-branch-target");
+                        }
+						if (branch.conditional && (paths & BranchFallthrough)) send(owner + 8, 0, "fallthrough");
 					}
 				}
-				else if (control) send(pc + 4, pc, "delay-slot");
+				else if (control) send(pc + 4, pc, "delay-slot", branchPathsChanged);
 				else send(pc + 4, 0, "fallthrough");
 			}
 			for (const auto& edge : edges) evidence.edges.push_back({std::get<0>(edge), std::get<1>(edge),
