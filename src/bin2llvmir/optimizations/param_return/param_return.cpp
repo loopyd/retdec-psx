@@ -1321,8 +1321,10 @@ void ParamReturn::projectOriginalBody()
 	auto* selected = original.getFunctionByStartAddress(_config->getConfig().parameters.getEntryPoint());
 	if (!selected || !canProposeOrdinaryBody(*selected)) throw std::runtime_error("original-body-proposal-scope-differs");
 	std::map<uint64_t, unsigned> arguments;
+	std::map<uint64_t, uint64_t> targets;
 	unsigned count = 0;
-	const auto& instructions = selected->returnDisposition->evidence.instructions;
+	const auto& evidence = selected->returnDisposition->evidence;
+	const auto& instructions = evidence.instructions;
 	for (unsigned i = 0; i < instructions.size(); ++i) {
 		auto word = instructions[i].word;
 		unsigned op = word >> 26, rt = (word >> 16) & 31;
@@ -1333,6 +1335,7 @@ void ParamReturn::projectOriginalBody()
 			if ((slotOp == 9 || slotOp == 15 || slotOp == 35) && slotRt >= 4 && slotRt <= 7)
 				count = std::max(count, slotRt - 3);
 			arguments.emplace(instructions[i].pc, count);
+			targets.emplace(instructions[i].pc, ((instructions[i].pc + 4) & 0xf0000000u) | ((word & 0x03ffffffu) << 2));
 			count = 0; ++i;
 		}
 	}
@@ -1345,8 +1348,20 @@ void ParamReturn::projectOriginalBody()
 				auto* instruction = call.getCallInstruction();
 				if (_config->getFunctionAddress(instruction->getFunction()) != selected->getStart()) continue;
 				auto address = AsmInstruction(instruction).getAddress();
-				if (!address.isDefined() || !arguments.count(address.getValue())
-					|| !observed.insert(address.getValue()).second || call.args().size() < arguments.at(address.getValue())
+				if (!address.isDefined()) throw std::runtime_error("original-body-proposal-call-owner-unresolved");
+				auto pc = address.getValue();
+				if (!arguments.count(pc)) {
+					auto owner = std::find_if(evidence.edges.begin(), evidence.edges.end(), [&](const auto& edge) {
+						return edge.to == pc && edge.from + 4 == pc && edge.kind == "delay-slot"
+							&& edge.delayOwner == edge.from && arguments.count(edge.from);
+					});
+					if (owner != evidence.edges.end()) pc = owner->from;
+				}
+				auto* callee = instruction->getCalledFunction();
+				if (!callee || !targets.count(pc) || _config->getFunctionAddress(callee) != targets.at(pc))
+					throw std::runtime_error("original-body-proposal-call-target-differs");
+				if (!arguments.count(pc)
+					|| !observed.insert(pc).second || call.args().size() < arguments.at(pc)
 					|| std::find(call.args().begin(), call.args().end(), nullptr) != call.args().end())
 					throw std::runtime_error("original-body-proposal-call-arguments-unresolved");
 			}
