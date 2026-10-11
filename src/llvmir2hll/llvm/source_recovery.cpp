@@ -51,6 +51,60 @@
 namespace retdec {
 namespace llvmir2hll {
 namespace {
+void recoverSignedScaledPredicates(llvm::Function &function) {
+	for (auto &block : function) for (auto &instruction : block) {
+		auto *comparison = llvm::dyn_cast<llvm::ICmpInst>(&instruction);
+		if (!comparison || !comparison->getOperand(0)->getType()->isIntegerTy(32)) continue;
+		auto predicate = comparison->getPredicate();
+		if (predicate != llvm::ICmpInst::ICMP_SLT && predicate != llvm::ICmpInst::ICMP_SGE
+				&& predicate != llvm::ICmpInst::ICMP_SGT && predicate != llvm::ICmpInst::ICMP_SLE) continue;
+		auto *constant = llvm::dyn_cast<llvm::ConstantInt>(comparison->getOperand(1));
+		auto *scaled = llvm::dyn_cast<llvm::BinaryOperator>(comparison->getOperand(0));
+		if (!constant) {
+			constant = llvm::dyn_cast<llvm::ConstantInt>(comparison->getOperand(0));
+			scaled = llvm::dyn_cast<llvm::BinaryOperator>(comparison->getOperand(1));
+			predicate = llvm::ICmpInst::getSwappedPredicate(predicate);
+		}
+		if (!constant || !scaled || !scaled->getType()->isIntegerTy(32)) continue;
+		unsigned shift = 0;
+		llvm::Value *input = nullptr;
+		if (scaled->getOpcode() == llvm::Instruction::Mul) {
+			for (unsigned i = 0; i < 2; ++i) {
+				auto *factor = llvm::dyn_cast<llvm::ConstantInt>(scaled->getOperand(i));
+				if (!factor) continue;
+				if (factor->getValue() == llvm::APInt(32, 0x10000)) shift = 16;
+				else if (factor->getValue() == llvm::APInt(32, 0x1000000)) shift = 24;
+				else continue;
+				input = scaled->getOperand(1 - i);
+				break;
+			}
+		} else if (scaled->getOpcode() == llvm::Instruction::Shl) {
+			auto *count = llvm::dyn_cast<llvm::ConstantInt>(scaled->getOperand(1));
+			if (!count || (count->getValue() != llvm::APInt(32, 16)
+					&& count->getValue() != llvm::APInt(32, 24))) continue;
+			shift = unsigned(count->getZExtValue());
+			input = scaled->getOperand(0);
+		}
+		if (!input || !input->getType()->isIntegerTy(32) || llvm::isa<llvm::UndefValue>(input)
+				|| scaled->hasNoSignedWrap() || scaled->hasNoUnsignedWrap()) continue;
+		llvm::APInt boundary = constant->getValue();
+		if (predicate == llvm::ICmpInst::ICMP_SGT || predicate == llvm::ICmpInst::ICMP_SLE) {
+			if (boundary.isMaxSignedValue()) continue;
+			boundary += llvm::APInt(32, 1);
+			predicate = predicate == llvm::ICmpInst::ICMP_SGT
+				? llvm::ICmpInst::ICMP_SGE : llvm::ICmpInst::ICMP_SLT;
+		}
+		if (!(boundary & llvm::APInt::getLowBitsSet(32, shift)).isNullValue()) continue;
+		auto *narrow = new llvm::TruncInst(input,
+			llvm::Type::getIntNTy(function.getContext(), 32 - shift), "", comparison);
+		auto *extended = new llvm::SExtInst(narrow, input->getType(), "", comparison);
+		comparison->setOperand(0, extended);
+		comparison->setOperand(1, llvm::ConstantInt::get(function.getContext(), boundary.ashr(shift)));
+		comparison->setPredicate(predicate);
+		if (scaled->use_empty()) scaled->eraseFromParent();
+	}
+}
+
 struct ProvenUnsignedQuotient {
 	llvm::Value *unsignedInput;
 	llvm::BinaryOperator *wideShift;
@@ -923,7 +977,10 @@ bool onlyLowBitsUsed(const llvm::Argument &arg, unsigned bits) {
 void recoverPointerExpressions(llvm::Module &module, config::Config &config) {
 	if (config.parameters.isOriginalOnlyReturnRecovery()) {
 		for (auto& function : module) {
-			if (config.architecture.isMipsOrPic32()) recoverUnsignedReciprocalSinks(function);
+			if (config.architecture.isMipsOrPic32()) {
+				recoverUnsignedReciprocalSinks(function);
+				recoverSignedScaledPredicates(function);
+			}
 			if (auto* source = config.functions.getFunctionByName(function.getName().str())) {
 				original_expression::recover(function, const_cast<common::Function&>(*source),
 					config.parameters.getOriginalSourceForm());
