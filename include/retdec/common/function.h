@@ -119,6 +119,11 @@ struct OriginalEntryRelativeMemoryAddress {
 	std::vector<uint64_t> equalityEvidence;
 	Derivation derivation = Derivation::Prefix;
 };
+struct OriginalBoundedEntryMemoryAddress {
+	unsigned entryRegister = 0;
+	uint32_t offset = 0, indexLower = 0, indexUpper = 0;
+	std::vector<uint64_t> boundEvidence;
+};
 struct OriginalMemoryAccess {
 	uint64_t pc = 0;
 	std::string kind, extension;
@@ -126,7 +131,7 @@ struct OriginalMemoryAccess {
 	bool delayed = false;
 	std::vector<unsigned> addressDefinitions, addressEntries, valueDefinitions, valueEntries;
 	OriginalFact obligation = OriginalFact::partial("contents-object-address-alias-effect-placement-unresolved");
-	std::variant<OriginalFact, OriginalFixedMemoryAddress, OriginalEntryRelativeMemoryAddress> address = OriginalFact::partial("original-address-proof-unresolved");
+	std::variant<OriginalFact, OriginalFixedMemoryAddress, OriginalEntryRelativeMemoryAddress, OriginalBoundedEntryMemoryAddress> address = OriginalFact::partial("original-address-proof-unresolved");
 	OriginalFact objectExtent = OriginalFact::partial("whole-object-extent-unresolved");
 	OriginalFact initializedObject = OriginalFact::partial("whole-object-initializer-unresolved");
 	OriginalFact zeroInitializedObject = OriginalFact::partial("loader-zero-fill-unresolved");

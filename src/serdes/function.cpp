@@ -4,6 +4,7 @@
  * @copyright (c) 2019 Avast Software, licensed under the MIT license
  */
 
+#include <algorithm>
 #include <stdexcept>
 #include <rapidjson/prettywriter.h>
 #include <rapidjson/stringbuffer.h>
@@ -150,6 +151,17 @@ void memoryAddress(Writer& writer, const retdec::common::OriginalMemoryAccess& a
             ? "entry-register-relative-flow/v1" : "entry-register-relative-prefix/v1");
         writer.Key("entryRegister"); writer.Uint(address->entryRegister); writer.Key("offset"); writer.Uint(address->offset);
         numbers(writer, "equalityEvidence", address->equalityEvidence); writer.EndObject(); return;
+    }
+    if (const auto* address = std::get_if<retdec::common::OriginalBoundedEntryMemoryAddress>(&access.address)) {
+        if (address->entryRegister != 29 || address->indexLower > address->indexUpper
+            || address->boundEvidence.empty() || address->boundEvidence.size() > retdec::common::ReturnDisposition::ReferenceLimit
+            || !std::is_sorted(address->boundEvidence.begin(), address->boundEvidence.end())
+            || std::adjacent_find(address->boundEvidence.begin(), address->boundEvidence.end()) != address->boundEvidence.end())
+            throw std::runtime_error("invalid-bounded-entry-memory-address");
+        writer.Key("address"); writer.StartObject(); writer.Key("kind"); writer.String("entry-register-bounded-flow/v1");
+        writer.Key("entryRegister"); writer.Uint(address->entryRegister); writer.Key("offset"); writer.Uint(address->offset);
+        writer.Key("indexLower"); writer.Uint(address->indexLower); writer.Key("indexUpper"); writer.Uint(address->indexUpper);
+        numbers(writer, "boundEvidence", address->boundEvidence); writer.EndObject(); return;
     }
     const auto& address = std::get<retdec::common::OriginalFixedMemoryAddress>(access.address);
     writer.Key("address"); writer.StartObject(); writer.Key("kind"); writer.String("entry-fallthrough-prefix/v1");

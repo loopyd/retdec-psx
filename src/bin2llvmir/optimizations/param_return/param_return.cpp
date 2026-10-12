@@ -1052,6 +1052,166 @@ std::optional<common::OriginalEntryRelativeMemoryAddress> originalFlowMemoryAddr
     return address;
 }
 
+std::map<uint64_t, common::OriginalBoundedEntryMemoryAddress> recoverOriginalStackRanges(
+    const OriginalIdentityFlow& flow, const std::map<uint64_t, common::OriginalMemoryAccess>& accesses)
+{
+    using Edge = std::tuple<uint64_t, uint64_t, std::optional<uint64_t>, std::string>;
+    std::map<uint64_t, common::OriginalBoundedEntryMemoryAddress> result;
+    auto word = [&](uint64_t pc) {
+        auto found = flow.instructions.find(pc);
+        return found == flow.instructions.end() ? uint32_t{0xffffffff} : found->second->word;
+    };
+    auto ready = [&](uint64_t pc, unsigned reg) {
+        const auto* state = originalIdentityState(flow, pc);
+        return state && reg && reg < Disposition::GprCount && !(*state)[reg].missing
+            && !state->mayPending[reg] && state->mayNoPending[reg];
+    };
+    auto definition = [&](uint64_t pc, unsigned reg) -> const Disposition::Definition* {
+        const Disposition::Definition* found = nullptr;
+        for (const auto& pair : flow.definitions) if (pair.second.pc == pc && pair.second.reg == reg) {
+            if (found) return nullptr;
+            found = &pair.second;
+        }
+        return found;
+    };
+    auto closed = [&](uint64_t begin, uint64_t end, const std::set<Edge>& expected) {
+        std::set<Edge> observed;
+        for (const auto& pair : flow.incoming) {
+            const auto& edge = *pair.second;
+            if ((begin <= edge.from && edge.from <= end) || (begin <= edge.to && edge.to <= end))
+                if (!observed.emplace(edge.from, edge.to, edge.delayOwner, edge.kind).second) return false;
+        }
+        if (observed != expected || observed.size() > Disposition::ReferenceLimit) return false;
+        for (uint64_t pc = begin; pc <= end; pc += 4) {
+            auto found = flow.instructions.find(pc);
+            if (found == flow.instructions.end()) return false;
+            const auto& row = *found->second;
+            auto operation = originalOperation(row);
+            if (!row.mapped || row.undef || row.bytes != 4 || pc % 4 || row.owner != flow.symbol
+                || operation.merge || operation.kind == MipsOperation::Call || operation.kind == MipsOperation::Trap
+                || operation.kind == MipsOperation::Unsupported) return false;
+            for (auto reg : operation.destinations)
+                if (reg && std::count(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), reg) != 1) return false;
+        }
+        return true;
+    };
+    auto publish = [&](uint64_t pc, unsigned pointer, uint32_t offset, uint32_t count,
+        const std::set<uint64_t>& evidence, const std::set<unsigned>& expectedDefinitions) {
+        auto access = accesses.find(pc);
+        const auto* state = originalIdentityState(flow, pc);
+        if (access == accesses.end() || !state || !ready(pc, pointer) || access->second.width != 8
+            || (word(pc) & 0xffff) || ((word(pc) >> 21) & 31) != pointer
+            || access->second.addressEntries != std::vector<unsigned>{29}
+            || (*state)[pointer].definitions != expectedDefinitions
+            || access->second.addressDefinitions != std::vector<unsigned>(expectedDefinitions.begin(), expectedDefinitions.end())
+            || evidence.empty() || evidence.size() > Disposition::ReferenceLimit) return;
+        common::OriginalBoundedEntryMemoryAddress address;
+        address.entryRegister = 29; address.offset = offset; address.indexUpper = count - 1;
+        address.boundEvidence.assign(evidence.begin(), evidence.end());
+        result.emplace(pc, std::move(address));
+    };
+    for (const auto& pair : accesses) {
+        uint64_t h = pair.first;
+        uint32_t load = word(h), compare = word(h + 20), increment = word(h + 28), mask = word(h + 12);
+        unsigned pointer = (load >> 21) & 31, loaded = (load >> 16) & 31;
+        unsigned endpoint = (compare >> 16) & 31, comparison = (compare >> 11) & 31;
+        unsigned counter = (increment >> 21) & 31, countRegister = (mask >> 16) & 31;
+        std::set<unsigned> registers{pointer, loaded, endpoint, counter, countRegister};
+        if (h < flow.start + 4 || pair.second.width != 8 || load >> 26 != 36 || (load & 0xffff)
+            || registers.size() != 5 || registers.count(0) || comparison != loaded
+            || word(h + 4) != 0 || word(h + 8) != ((4u << 26) | (loaded << 21) | 6u)
+            || word(h + 16) != ((9u << 26) | (pointer << 21) | (pointer << 16) | 1u)
+            || compare != ((pointer << 21) | (endpoint << 16) | (comparison << 11) | 42u)
+            || word(h + 24) != ((5u << 26) | (comparison << 21) | 0xfff9u)
+            || increment != ((9u << 26) | (counter << 21) | (counter << 16) | 1u)
+            || mask >> 26 != 12 || ((mask >> 21) & 31) != counter || word(h + 32) != mask) continue;
+        const auto* seed = originalMemoryLatestWriter(flow.instructions, h, pointer);
+        const auto* counterSeed = originalMemoryLatestWriter(flow.instructions, h, counter);
+        const auto* initial = seed ? definition(seed->pc, pointer) : nullptr;
+        const auto* recurrence = definition(h + 16, pointer);
+        const auto* counterInitial = counterSeed ? definition(counterSeed->pc, counter) : nullptr;
+        const auto* endState = originalIdentityState(flow, h + 20);
+        if (!initial || !recurrence || !counterInitial || !endState || !ready(h + 20, endpoint)
+            || (*endState)[endpoint].definitions.size() != 1 || !ready(h - 4, pointer) || !ready(h - 4, counter)
+            || !ready(counterSeed->pc, counter) || counterSeed->pc >= h - 4
+            || originalIdentityState(flow, h - 4)->operator[](counter).definitions != std::set<unsigned>{counterInitial->id}
+            || originalIdentityState(flow, h - 4)->operator[](counter).constant != std::optional<uint32_t>{0}
+            || counterSeed->word != ((counter << 11) | 33u)
+            || !originalIdentityWriter(flow, h - 4, pointer, seed->pc, true)
+            || !originalIdentityWriter(flow, h - 4, counter, counterSeed->pc, true)) continue;
+        auto start = originalEntryOffset(initial->id, flow);
+        auto endId = *(*endState)[endpoint].definitions.begin();
+        auto end = originalEntryOffset(endId, flow);
+        if (!start || !end || start->entry != 29 || end->entry != 29
+            || !originalIdentityWriter(flow, h + 20, endpoint, flow.definitions.at(endId).pc)) continue;
+        uint32_t count = end->offset - start->offset, maskBits = mask & 0xffff;
+        if (!count || count > Disposition::RowLimit || count > maskBits || (maskBits & (maskBits + 1))) continue;
+        std::set<Edge> edges{
+            {h - 4, h, {}, "fallthrough"}, {h, h + 4, {}, "fallthrough"},
+            {h + 4, h + 8, {}, "fallthrough"}, {h + 8, h + 12, h + 8, "delay-slot"},
+            {h + 12, h + 16, {}, "fallthrough"}, {h + 12, h + 36, {}, "branch"},
+            {h + 16, h + 20, {}, "fallthrough"}, {h + 20, h + 24, {}, "fallthrough"},
+            {h + 24, h + 28, h + 24, "delay-slot"}, {h + 28, h, {}, "branch"},
+            {h + 28, h + 32, {}, "fallthrough"}, {h + 32, h + 36, {}, "fallthrough"}};
+        if (!closed(h, h + 32, edges)) continue;
+        std::set<uint64_t> evidence = start->evidence;
+        evidence.insert(end->evidence.begin(), end->evidence.end());
+        evidence.insert(counterSeed->pc); evidence.insert(h - 4);
+        for (uint64_t pc = h; pc <= h + 32; pc += 4) evidence.insert(pc);
+        // Endpoint equality stops the scan even when signed pointer order changes at wrap.
+        publish(h, pointer, start->offset, count, evidence, {initial->id, recurrence->id});
+
+        uint64_t guard = h + 36, body = guard + 12;
+        uint32_t guardWord = word(guard), bodyLoad = word(body), bodyCompare = word(body + 24);
+        unsigned index = (word(guard + 4) >> 11) & 31, bodyPointer = (bodyLoad >> 21) & 31;
+        unsigned bodyValue = (bodyLoad >> 16) & 31, bodyComparison = (bodyCompare >> 11) & 31;
+        std::set<unsigned> bodyRegisters{index, bodyPointer, countRegister, bodyComparison};
+        if (bodyRegisters.size() != 4 || bodyRegisters.count(0) || bodyValue != bodyComparison
+            || guardWord != ((6u << 26) | (countRegister << 21) | 11u)
+            || word(guard + 4) != ((index << 11) | 33u)
+            || bodyLoad != ((36u << 26) | (bodyPointer << 21) | (bodyValue << 16))
+            || word(body + 16) != ((9u << 26) | (index << 21) | (index << 16) | 1u)
+            || word(body + 20) != ((40u << 26) | (bodyPointer << 21) | (bodyValue << 16))
+            || bodyCompare != ((index << 21) | (countRegister << 16) | (bodyComparison << 11) | 42u)
+            || word(body + 28) != ((5u << 26) | (bodyComparison << 21) | 0xfff8u)
+            || word(body + 32) != ((9u << 26) | (bodyPointer << 21) | (bodyPointer << 16) | 1u)) continue;
+        const auto* bodySeed = definition(guard + 8, bodyPointer);
+        const auto* bodyRecurrence = definition(body + 32, bodyPointer);
+        const auto* earlyMask = definition(h + 12, countRegister);
+        const auto* finalMask = definition(h + 32, countRegister);
+        const auto* guardState = originalIdentityState(flow, guard);
+        if (!bodySeed || !bodyRecurrence || !earlyMask || !finalMask || !guardState || !ready(guard, countRegister)
+            || (*guardState)[countRegister].definitions != std::set<unsigned>{earlyMask->id, finalMask->id}) continue;
+        auto bodyBase = originalEntryOffset(bodySeed->id, flow);
+        if (!bodyBase || bodyBase->entry != 29 || bodyBase->offset != start->offset) continue;
+        bool unmodified = true;
+        for (uint64_t pc = body + 4; pc <= body + 12; pc += 4) {
+            auto found = flow.instructions.find(pc);
+            if (found == flow.instructions.end()) { unmodified = false; break; }
+            auto operation = originalOperation(*found->second);
+            if (operation.kind != MipsOperation::Load && operation.kind != MipsOperation::Store
+                && operation.kind != MipsOperation::Compute) { unmodified = false; break; }
+            for (auto reg : operation.destinations)
+                if (reg == bodyPointer || reg == index || reg == countRegister) unmodified = false;
+        }
+        if (!unmodified) continue;
+        std::set<Edge> bodyEdges{
+            {h + 12, guard, {}, "branch"}, {h + 32, guard, {}, "fallthrough"},
+            {guard, guard + 4, guard, "delay-slot"}, {guard + 4, guard + 8, {}, "fallthrough"},
+            {guard + 4, body + 36, {}, "branch"}, {guard + 8, body, {}, "fallthrough"},
+            {body + 28, body + 32, body + 28, "delay-slot"},
+            {body + 32, body, {}, "branch"}, {body + 32, body + 36, {}, "fallthrough"}};
+        for (uint64_t pc = body; pc < body + 28; pc += 4) bodyEdges.emplace(pc, pc + 4, std::nullopt, "fallthrough");
+        if (!closed(guard, body + 32, bodyEdges)) continue;
+        for (uint64_t pc = guard; pc <= body + 32; pc += 4) evidence.insert(pc);
+        evidence.insert(bodyBase->evidence.begin(), bodyBase->evidence.end());
+        std::set<unsigned> writers{bodySeed->id, bodyRecurrence->id};
+        publish(body, bodyPointer, start->offset, count, evidence, writers);
+        publish(body + 20, bodyPointer, start->offset, count, evidence, writers);
+    }
+    return result;
+}
+
 struct OriginalImageView {
     uint32_t mappingStart;
     const std::vector<uint8_t>& payload;
@@ -1395,6 +1555,8 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
                 const auto* flow = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&candidate->second.address);
                 if (flow && flow->derivation == common::OriginalEntryRelativeMemoryAddress::Derivation::Flow)
                     access.address = *flow;
+                else if (const auto* bounded = std::get_if<common::OriginalBoundedEntryMemoryAddress>(&candidate->second.address))
+                    access.address = *bounded;
             }
             continue;
         }
@@ -2070,6 +2232,9 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     auto address = originalFlowMemoryAddress(pair.second, flow);
                     if (address) pair.second.address = std::move(*address);
                 }
+                for (auto& pair : recoverOriginalStackRanges(flow, accesses))
+                    if (std::holds_alternative<common::OriginalFact>(accesses.at(pair.first).address))
+                        accesses.at(pair.first).address = std::move(pair.second);
             }
 			std::size_t references = 0;
 			for (const auto& pair : sampledDispatches) {
