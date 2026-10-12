@@ -89,6 +89,14 @@ normal accesses, settled load delays and no external interference. Those
 conditions remain unresolved. Physical frame writes stay in the access report,
 and conditional frame flow refuses ordinary C body admission.
 
+The `entry-register-relative-first-use/v1` address report describes an operand's
+first reach from the original entry through checked instructions and call
+bindings. It records the entry, operand boundary, arithmetic evidence and crossed
+calls. Recovery refuses any path with an unproved control crossing before that
+operand, including branches that bypass it. Later reentry remains unresolved.
+The report retains conditional frame obligations and establishes no ordinary
+memory effects, object declarations or C admission.
+
 ## Overlay state
 
 The backend owns ordered PS1 image mounts through

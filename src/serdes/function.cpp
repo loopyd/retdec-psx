@@ -147,11 +147,33 @@ void memoryAddress(Writer& writer, const retdec::common::OriginalMemoryAccess& a
     if (const auto* address = std::get_if<retdec::common::OriginalEntryRelativeMemoryAddress>(&access.address)) {
         if (!address->entryRegister || address->entryRegister > 31)
             throw std::runtime_error("invalid-entry-relative-memory-register");
+        bool firstUse = address->derivation == retdec::common::OriginalEntryRelativeMemoryAddress::Derivation::EntryFirstUse;
+        if (firstUse != bool(address->firstUse)) throw std::runtime_error("invalid-first-use-memory-domain");
+        if (firstUse) {
+            const auto& domain = *address->firstUse;
+            if (domain.entryPc > UINT32_MAX || domain.usePc > UINT32_MAX || domain.entryPc % 4
+                || domain.usePc % 4 || domain.usePc != access.pc
+                || domain.callPcs.size() > retdec::common::ReturnDisposition::ReferenceLimit
+                || !std::is_sorted(domain.callPcs.begin(), domain.callPcs.end())
+                || std::adjacent_find(domain.callPcs.begin(), domain.callPcs.end()) != domain.callPcs.end()
+                || std::any_of(domain.callPcs.begin(), domain.callPcs.end(),
+                    [](uint64_t pc) { return pc > UINT32_MAX - 8 || pc % 4; }))
+                throw std::runtime_error("invalid-first-use-memory-domain");
+        }
         writer.Key("address"); writer.StartObject(); writer.Key("kind");
-        writer.String(address->derivation == retdec::common::OriginalEntryRelativeMemoryAddress::Derivation::Flow
+        writer.String(firstUse ? "entry-register-relative-first-use/v1"
+            : address->derivation == retdec::common::OriginalEntryRelativeMemoryAddress::Derivation::Flow
             ? "entry-register-relative-flow/v1" : "entry-register-relative-prefix/v1");
         writer.Key("entryRegister"); writer.Uint(address->entryRegister); writer.Key("offset"); writer.Uint(address->offset);
-        numbers(writer, "equalityEvidence", address->equalityEvidence); writer.EndObject(); return;
+        numbers(writer, "equalityEvidence", address->equalityEvidence);
+        if (firstUse) {
+            writer.Key("entryPc"); writer.Uint64(address->firstUse->entryPc);
+            writer.Key("usePc"); writer.Uint64(address->firstUse->usePc);
+            writer.Key("operandPhase"); writer.String("before-instruction");
+            numbers(writer, "callPcs", address->firstUse->callPcs);
+            strings(writer, "conditions", std::vector<std::string>{"first-reach-from-original-entry-before-unproved-control-crossing"});
+        }
+        writer.EndObject(); return;
     }
     if (const auto* address = std::get_if<retdec::common::OriginalBoundedEntryMemoryAddress>(&access.address)) {
         if (address->entryRegister != 29 || address->indexLower > address->indexUpper

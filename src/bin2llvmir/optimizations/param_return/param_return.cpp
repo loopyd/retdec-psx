@@ -715,18 +715,6 @@ const Disposition::Definition* originalMemoryLatest(
     return definition == definitions.end() ? nullptr : definition->second;
 }
 
-bool originalMemoryAccessMatches(const common::OriginalMemoryAccess& access,
-    const Disposition::Instruction& instruction, const MipsOperation& operation)
-{
-    unsigned opcode = instruction.word >> 26;
-    unsigned width = opcode == 32 || opcode == 36 || opcode == 40 ? 8 : opcode == 33 || opcode == 37 || opcode == 41 ? 16 : 32;
-    std::string kind = operation.kind == MipsOperation::Load ? "read" : "write";
-    std::string extension = kind == "write" || width == 32 ? "none" : opcode == 32 || opcode == 33 ? "sign" : "zero";
-    return !operation.merge && (operation.kind == MipsOperation::Load || operation.kind == MipsOperation::Store)
-        && access.kind == kind && access.width == width && access.extension == extension
-        && access.delayed == (operation.kind == MipsOperation::Load);
-}
-
 std::optional<common::OriginalFixedMemoryAddress> originalMemoryAddress(
     const common::OriginalMemoryAccess& access,
     const std::map<uint64_t, const Disposition::Instruction*>& instructions,
@@ -906,40 +894,6 @@ std::optional<common::OriginalEntryRelativeMemoryAddress> originalEntryRelativeM
     if (access.addressEntries != entries
         || access.addressDefinitions != (previous ? std::vector<unsigned>{previous->id} : std::vector<unsigned>{})) return {};
     address.offset += uint32_t(int32_t(int16_t(instruction.word & 0xffff)));
-    return address;
-}
-
-std::optional<common::OriginalEntryRelativeMemoryAddress> originalFlowMemoryAddress(
-    const common::OriginalMemoryAccess& access, const OriginalIdentityFlow& flow)
-{
-    auto instruction = flow.instructions.find(access.pc);
-    const auto* state = originalIdentityState(flow, access.pc);
-    if (instruction == flow.instructions.end() || !state
-        || !originalMemoryAccessMatches(access, *instruction->second, originalOperation(*instruction->second))) return {};
-    unsigned reg = (instruction->second->word >> 21) & 31;
-    const auto& value = (*state)[reg];
-    if (!reg || value.missing || value.constant || value.definitions.size() > 1
-        || state->mayPending[reg] || !state->mayNoPending[reg]
-        || access.addressDefinitions != std::vector<unsigned>(value.definitions.begin(), value.definitions.end())
-        || access.addressEntries != std::vector<unsigned>(value.entries.begin(), value.entries.end())) return {};
-    OriginalEntryOffset identity{}; identity.entry = reg;
-    std::optional<uint64_t> writer;
-    if (!value.definitions.empty()) {
-        auto id = *value.definitions.begin();
-        auto recovered = originalEntryOffset(id, flow);
-        if (!recovered || flow.definitions.at(id).reg != reg) return {};
-        identity = std::move(*recovered); writer = flow.definitions.at(id).pc;
-    } else if (value.equalEntry != std::optional<unsigned>{reg}) return {};
-    const auto& entry = flow.states.at({flow.start, 0})[identity.entry];
-    if (entry.missing || entry.equalEntry != std::optional<unsigned>{identity.entry}
-        || value.entries != std::set<unsigned>{identity.entry}
-        || value.formals != entry.formals || value.bad != entry.bad
-        || !originalIdentityWriter(flow, access.pc, reg, writer)) return {};
-    common::OriginalEntryRelativeMemoryAddress address;
-    address.entryRegister = identity.entry;
-    address.offset = identity.offset + uint32_t(int32_t(int16_t(instruction->second->word & 0xffff)));
-    address.equalityEvidence.assign(identity.evidence.begin(), identity.evidence.end());
-    address.derivation = common::OriginalEntryRelativeMemoryAddress::Derivation::Flow;
     return address;
 }
 
@@ -1445,7 +1399,8 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
     for (auto& access : summary.accesses) {
         const auto* flow = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&access.address);
         const auto* fixed = std::get_if<common::OriginalFixedMemoryAddress>(&access.address);
-        if ((!flow || flow->derivation != common::OriginalEntryRelativeMemoryAddress::Derivation::Flow)
+        if ((!flow || (flow->derivation != common::OriginalEntryRelativeMemoryAddress::Derivation::Flow
+            && flow->derivation != common::OriginalEntryRelativeMemoryAddress::Derivation::EntryFirstUse))
             && (!fixed || fixed->derivation != common::OriginalFixedMemoryAddress::Derivation::Flow))
             access.address = common::OriginalFact::partial("original-address-proof-unresolved");
     }
@@ -1493,7 +1448,8 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
                 auto candidate = flowAccesses.find(access.pc);
                 if (candidate != flowAccesses.end()) {
                     const auto* flow = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&candidate->second.address);
-                    if (flow && flow->derivation == common::OriginalEntryRelativeMemoryAddress::Derivation::Flow)
+                    if (flow && (flow->derivation == common::OriginalEntryRelativeMemoryAddress::Derivation::Flow
+                        || flow->derivation == common::OriginalEntryRelativeMemoryAddress::Derivation::EntryFirstUse))
                         access.address = *flow;
                     else if (const auto* bounded = std::get_if<common::OriginalBoundedEntryMemoryAddress>(&candidate->second.address))
                         access.address = *bounded;
@@ -2285,6 +2241,17 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     if ((flow && flow->derivation == common::OriginalEntryRelativeMemoryAddress::Derivation::Flow)
                         || (fixed && fixed->derivation == common::OriginalFixedMemoryAddress::Derivation::Flow))
                         pair.second.address = common::OriginalFact::partial("original-address-proof-unresolved");
+                }
+                if (imageView && !observation && summary.pendingEntry == "requires-no-pending-gpr-loads") {
+                    std::multimap<uint64_t, const Disposition::Edge*> incoming;
+                    for (const auto& edge : evidence.edges) incoming.emplace(edge.to, &edge);
+                    OriginalIdentityFlow flow{evidence.start, evidence.symbol, instructions, definitions, states,
+                        incoming, calls, originalOperation, &frameUses};
+                    for (auto& pair : accesses) {
+                        if (!std::holds_alternative<common::OriginalFact>(pair.second.address)) continue;
+                        auto address = OriginalEntryAddressRegion::recover(flow, evidence, pair.second);
+                        if (address) pair.second.address = std::move(*address);
+                    }
                 }
                 summarizeOriginal(summary, disposition, exitStates, sampledTargets, demands, accesses, graph.unavailable.count(evidence.start));
                 if (flowComplete && summary.entry.isComplete()) {

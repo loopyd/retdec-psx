@@ -3,6 +3,7 @@
 #include <iterator>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include "retdec/common/psx_memory.h"
 
 namespace retdec { namespace bin2llvmir {
@@ -75,13 +76,17 @@ bool originalIdentityWriter(const OriginalIdentityFlow& flow, uint64_t pc, unsig
         const auto& row = *instruction->second;
         if (!row.mapped || row.undef || row.bytes != 4 || pc % 4 || row.owner != flow.symbol) return false;
         auto operation = flow.operation(row);
-        if (operation.kind == MipsOperation::Call && !originalIdentityCall(flow, pc, reg)) return false;
+        if (!flow.firstUseCalls && operation.kind == MipsOperation::Call
+            && !originalIdentityCall(flow, pc, reg)) return false;
         auto context = flow.states.lower_bound({pc, 0})->first.second;
         if (context) {
             auto owner = flow.instructions.find(context);
-            if (owner == flow.instructions.end()
-                || (flow.operation(*owner->second).kind == MipsOperation::Call
-                    && !originalIdentityCall(flow, context, reg))) return false;
+            if (owner == flow.instructions.end()) return false;
+            if (flow.operation(*owner->second).kind == MipsOperation::Call
+                && (!flow.firstUseCalls || point.second)) {
+                if ((flow.firstUseCalls && !flow.firstUseCalls->count(context))
+                    || !originalIdentityCall(flow, context, reg)) return false;
+            }
         }
         if (point.second) {
             if (operation.kind == MipsOperation::Trap || operation.kind == MipsOperation::Unsupported) return false;
@@ -107,6 +112,18 @@ bool originalIdentityWriter(const OriginalIdentityFlow& flow, uint64_t pc, unsig
         }
     }
     return terminals != 0;
+}
+
+bool originalMemoryAccessMatches(const common::OriginalMemoryAccess& access,
+    const Disposition::Instruction& instruction, const MipsOperation& operation)
+{
+    unsigned opcode = instruction.word >> 26;
+    unsigned width = opcode == 32 || opcode == 36 || opcode == 40 ? 8 : opcode == 33 || opcode == 37 || opcode == 41 ? 16 : 32;
+    std::string kind = operation.kind == MipsOperation::Load ? "read" : "write";
+    std::string extension = kind == "write" || width == 32 ? "none" : opcode == 32 || opcode == 33 ? "sign" : "zero";
+    return !operation.merge && (operation.kind == MipsOperation::Load || operation.kind == MipsOperation::Store)
+        && access.kind == kind && access.width == width && access.extension == extension
+        && access.delayed == (operation.kind == MipsOperation::Load);
 }
 
 std::optional<OriginalEntryOffset> originalEntryOffset(unsigned id, const OriginalIdentityFlow& flow)
@@ -158,6 +175,142 @@ std::optional<OriginalEntryOffset> originalEntryOffset(unsigned id, const Origin
                 || member->bad != std::vector<std::string>(entry.bad.begin(), entry.bad.end())) return {};
         result.entry = source; return result;
     }
+}
+
+std::optional<common::OriginalEntryRelativeMemoryAddress> originalFlowMemoryAddress(
+    const common::OriginalMemoryAccess& access, const OriginalIdentityFlow& flow)
+{
+    auto instruction = flow.instructions.find(access.pc);
+    const auto* state = originalIdentityState(flow, access.pc);
+    if (instruction == flow.instructions.end() || !state
+        || !originalMemoryAccessMatches(access, *instruction->second, flow.operation(*instruction->second))) return {};
+    unsigned reg = (instruction->second->word >> 21) & 31;
+    const auto& value = (*state)[reg];
+    if (!reg || value.missing || value.constant || value.definitions.size() > 1
+        || state->mayPending[reg] || !state->mayNoPending[reg]
+        || access.addressDefinitions != std::vector<unsigned>(value.definitions.begin(), value.definitions.end())
+        || access.addressEntries != std::vector<unsigned>(value.entries.begin(), value.entries.end())) return {};
+    OriginalEntryOffset identity{}; identity.entry = reg;
+    std::optional<uint64_t> writer;
+    if (!value.definitions.empty()) {
+        auto id = *value.definitions.begin();
+        auto recovered = originalEntryOffset(id, flow);
+        if (!recovered || flow.definitions.at(id).reg != reg) return {};
+        identity = std::move(*recovered); writer = flow.definitions.at(id).pc;
+    } else if (value.equalEntry != std::optional<unsigned>{reg}) return {};
+    const auto& entry = flow.states.at({flow.start, 0})[identity.entry];
+    if (entry.missing || entry.equalEntry != std::optional<unsigned>{identity.entry}
+        || value.entries != std::set<unsigned>{identity.entry}
+        || value.formals != entry.formals || value.bad != entry.bad
+        || !originalIdentityWriter(flow, access.pc, reg, writer)) return {};
+    common::OriginalEntryRelativeMemoryAddress address;
+    address.entryRegister = identity.entry;
+    address.offset = identity.offset + uint32_t(int32_t(int16_t(instruction->second->word & 0xffff)));
+    address.equalityEvidence.assign(identity.evidence.begin(), identity.evidence.end());
+    address.derivation = common::OriginalEntryRelativeMemoryAddress::Derivation::Flow;
+    return address;
+}
+
+std::optional<common::OriginalEntryRelativeMemoryAddress> OriginalEntryAddressRegion::recover(
+    const OriginalIdentityFlow& flow, const Disposition::Evidence& evidence,
+    const common::OriginalMemoryAccess& access)
+{
+    using Edge = std::tuple<uint64_t, uint64_t, std::optional<uint64_t>, std::string>;
+    if (!evidence.analysisComplete || evidence.start != flow.start || evidence.symbol != flow.symbol
+        || evidence.start % 4 || evidence.end % 4 || evidence.start >= evidence.end
+        || evidence.end > uint64_t(UINT32_MAX) + 1 || !flow.states.count({flow.start, 0})
+        || !flow.instructions.count(access.pc)) return {};
+    const auto& use = *flow.instructions.at(access.pc);
+    unsigned reg = (use.word >> 21) & 31;
+    if (!reg || !originalMemoryAccessMatches(access, use, flow.operation(use))) return {};
+    std::multimap<uint64_t, const Disposition::Edge*> outgoing, incoming;
+    for (const auto& edge : evidence.edges) outgoing.emplace(edge.from, &edge);
+    std::map<uint64_t, uint64_t> owners;
+    std::map<uint64_t, std::vector<uint64_t>> successors;
+    std::set<uint64_t> crossed;
+    std::vector<std::pair<uint64_t, uint64_t>> pending{{flow.start, 0}};
+    size_t references = 0;
+    while (!pending.empty()) {
+        auto point = pending.back(); pending.pop_back();
+        uint64_t pc = point.first, owner = point.second;
+        auto known = owners.find(pc);
+        if (known != owners.end()) {
+            if (known->second != owner) return {};
+            continue;
+        }
+        owners.emplace(pc, owner);
+        const auto* state = originalIdentityState(flow, pc);
+        auto row = flow.instructions.find(pc);
+        if (owners.size() > Disposition::RowLimit || !state || row == flow.instructions.end()
+            || flow.states.lower_bound({pc, 0})->first.second != owner
+            || pc < evidence.start || pc >= evidence.end || pc % 4 || pc > UINT32_MAX - 4
+            || !row->second->mapped || row->second->undef || row->second->bytes != 4
+            || row->second->owner != flow.symbol) return {};
+        const auto operation = flow.operation(*row->second);
+        bool control = operation.kind == MipsOperation::Branch || operation.kind == MipsOperation::Call
+            || operation.kind == MipsOperation::Return;
+        if (owner && (owner > UINT32_MAX - 8 || owner + 4 != pc || !flow.instructions.count(owner)
+            || control)) return {};
+        successors.emplace(pc, std::vector<uint64_t>{});
+        if (pc == access.pc) continue;
+        if (operation.kind == MipsOperation::Unsupported || operation.kind == MipsOperation::Trap
+            || operation.kind == MipsOperation::Return
+            || (operation.kind == MipsOperation::Branch && !operation.target)
+            || (operation.kind == MipsOperation::Call && (row->second->word >> 26 != 3 || !operation.target))) return {};
+        std::set<Edge> derived, reported;
+        auto add = [&](uint64_t target, uint64_t delayOwner, const std::string& kind) {
+            derived.emplace(pc, target, delayOwner ? std::optional<uint64_t>{delayOwner} : std::nullopt, kind);
+        };
+        if (!owner) add(pc + 4, control ? pc : 0, control ? "delay-slot" : "fallthrough");
+        else {
+            const auto branch = flow.operation(*flow.instructions.at(owner));
+            if (branch.kind == MipsOperation::Call) {
+                auto call = flow.calls.find(owner);
+                bool bound = flow.frameUses && flow.frameUses->count(owner);
+                bool complete = call != flow.calls.end() && call->second.contract
+                    && std::holds_alternative<common::OriginalCompleteCall>(*call->second.contract);
+                if ((!bound && !complete) || !originalIdentityCall(flow, owner, reg)) return {};
+                crossed.insert(owner); add(owner + 8, 0, "call-continuation");
+            } else if (branch.kind == MipsOperation::Branch && branch.target) {
+                add(*branch.target, 0, "branch");
+                if (branch.conditional) add(owner + 8, 0, "fallthrough");
+            } else return {};
+        }
+        auto edges = outgoing.equal_range(pc);
+        for (auto edge = edges.first; edge != edges.second; ++edge) {
+            const auto& item = *edge->second;
+            if (!reported.emplace(item.from, item.to, item.delayOwner, item.kind).second) return {};
+        }
+        if (derived != reported) return {};
+        for (auto edge = edges.first; edge != edges.second; ++edge) {
+            if (++references > Disposition::ReferenceLimit) return {};
+            incoming.emplace(edge->second->to, edge->second);
+            successors.at(pc).push_back(edge->second->to);
+            pending.emplace_back(edge->second->to, edge->second->delayOwner.value_or(0));
+        }
+    }
+    if (!owners.count(access.pc)) return {};
+    std::map<uint64_t, unsigned> indegrees;
+    for (const auto& point : owners) indegrees.emplace(point.first, 0);
+    for (const auto& point : successors) for (auto target : point.second) ++indegrees.at(target);
+    std::vector<uint64_t> ready;
+    for (const auto& point : indegrees) if (!point.second) ready.push_back(point.first);
+    if (ready != std::vector<uint64_t>{flow.start}) return {};
+    size_t consumed = 0;
+    while (!ready.empty()) {
+        auto pc = ready.back(); ready.pop_back(); ++consumed;
+        for (auto target : successors.at(pc)) if (!--indegrees.at(target)) ready.push_back(target);
+    }
+    if (consumed != owners.size()) return {};
+    OriginalIdentityFlow prefix{flow.start, flow.symbol, flow.instructions, flow.definitions,
+        flow.states, incoming, flow.calls, flow.operation, flow.frameUses, &crossed};
+    auto address = originalFlowMemoryAddress(access, prefix);
+    if (!address) return {};
+    address->derivation = common::OriginalEntryRelativeMemoryAddress::Derivation::EntryFirstUse;
+    common::OriginalEntryRelativeMemoryAddress::FirstUse domain;
+    domain.entryPc = flow.start; domain.usePc = access.pc;
+    domain.callPcs.assign(crossed.begin(), crossed.end()); address->firstUse = std::move(domain);
+    return address;
 }
 
 

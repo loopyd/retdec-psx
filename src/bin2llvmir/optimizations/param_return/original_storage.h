@@ -118,7 +118,18 @@ struct OriginalIdentityFlow {
     const std::map<uint64_t, Disposition::Call>& calls;
     MipsOperation (*operation)(const Disposition::Instruction&);
     const std::map<uint64_t, OriginalFrameContract>* frameUses = nullptr;
+    const std::set<uint64_t>* firstUseCalls = nullptr;
 };
+class OriginalEntryAddressRegion {
+public:
+    static std::optional<common::OriginalEntryRelativeMemoryAddress> recover(
+        const OriginalIdentityFlow& flow, const Disposition::Evidence& evidence,
+        const common::OriginalMemoryAccess& access);
+};
+bool originalMemoryAccessMatches(const common::OriginalMemoryAccess& access,
+    const Disposition::Instruction& instruction, const MipsOperation& operation);
+std::optional<common::OriginalEntryRelativeMemoryAddress> originalFlowMemoryAddress(
+    const common::OriginalMemoryAccess& access, const OriginalIdentityFlow& flow);
 const RegisterState* originalIdentityState(const OriginalIdentityFlow& flow, uint64_t pc);
 bool originalIdentityCall(const OriginalIdentityFlow& flow, uint64_t pc, unsigned reg);
 bool originalIdentityWriter(const OriginalIdentityFlow& flow, uint64_t pc, unsigned reg,
