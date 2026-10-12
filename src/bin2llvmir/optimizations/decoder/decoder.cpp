@@ -88,6 +88,8 @@ static void preserveMipsOneLoadDelay(llvm::Module* module, FileImage* image,
 						independent = rs != destination;
 					if (op == 4 || op == 5 || op == 40 || op == 41 || op == 43)
 						independent = rs != destination && rt != destination;
+					if (((op == 6 || op == 7) && rt == 0) || (op == 1 && (rt == 0 || rt == 1)))
+						independent = rs != destination;
 					if (op == 0) {
 						unsigned fn = bits & 63;
 						if (fn == 0 || fn == 2 || fn == 3) independent = rt != destination;
