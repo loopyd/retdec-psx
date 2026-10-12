@@ -23,6 +23,7 @@
 #include "retdec/utils/container.h"
 #include "retdec/utils/string.h"
 #include "retdec/common/psx_memory.h"
+#include "original_storage.h"
 #include "retdec/bin2llvmir/optimizations/param_return/filter/filter.h"
 #include "retdec/bin2llvmir/optimizations/param_return/param_return.h"
 #define debug_enabled false
@@ -262,42 +263,7 @@ bool canProposeEmptyBody(const common::Function& function)
 	return true;
 }
 
-struct RegisterFact {
-	bool missing = true;
-	std::set<unsigned> definitions, formals, entries;
-	std::optional<unsigned> equalEntry;
-	std::optional<uint32_t> constant;
-	uint32_t possibleOneBits = UINT32_MAX;
-	std::set<uint64_t> equalityEvidence;
-	std::set<std::string> bad;
-	uint32_t possibleOnes() const { return constant.value_or(possibleOneBits); }
-	bool operator==(const RegisterFact& other) const {
-		return missing == other.missing && definitions == other.definitions
-			&& formals == other.formals && entries == other.entries && bad == other.bad
-			&& equalEntry == other.equalEntry && constant == other.constant
-			&& possibleOneBits == other.possibleOneBits
-			&& equalityEvidence == other.equalityEvidence;
-	}
-};
-struct RegisterState {
-    std::array<RegisterFact, Disposition::RegisterCount> registers;
-    std::array<RegisterFact, Disposition::GprCount> pending;
-    std::array<bool, Disposition::GprCount> mayPending{}, mayNoPending{};
-    std::set<uint64_t> conditionalTables;
-    std::set<uint64_t> conditionalCallees;
-    RegisterFact& operator[](unsigned reg) { return registers[reg]; }
-    const RegisterFact& operator[](unsigned reg) const { return registers[reg]; }
-};
-struct MipsOperation {
-	enum Kind { Compute, Multiply, Divide, Load, Store, Branch, Return, Call, Trap, Unsupported } kind = Unsupported;
-	enum class MergeMemory { Lwl, Lwr, Swl, Swr };
-	std::vector<unsigned> destinations;
-	std::vector<unsigned> inputs;
-	std::optional<uint64_t> target;
-	std::optional<MergeMemory> merge;
-	bool conditional = false;
-	std::string name = "unsupported";
-};
+
 
 MipsOperation originalOperation(const Disposition::Instruction& instruction)
 {
@@ -536,50 +502,6 @@ RegisterFact inputFact(const RegisterState& state, const MipsOperation& operatio
 	return fact;
 }
 
-bool joinFact(RegisterFact& fact, const RegisterFact& incoming)
-{
-    auto old = fact;
-    fact.possibleOneBits = fact.possibleOnes() | incoming.possibleOnes();
-    fact.missing |= incoming.missing;
-    fact.definitions.insert(incoming.definitions.begin(), incoming.definitions.end());
-    fact.formals.insert(incoming.formals.begin(), incoming.formals.end());
-    fact.entries.insert(incoming.entries.begin(), incoming.entries.end());
-    if (fact.equalEntry != incoming.equalEntry) fact.equalEntry.reset();
-    if (fact.constant != incoming.constant) fact.constant.reset();
-    fact.equalityEvidence.insert(incoming.equalityEvidence.begin(), incoming.equalityEvidence.end());
-    fact.bad.insert(incoming.bad.begin(), incoming.bad.end());
-    if (fact.definitions.size() > 128 || fact.bad.size() > 64)
-        throw std::runtime_error("return-flow-evidence-exhausted");
-    return !(old == fact);
-}
-
-bool joinState(RegisterState& destination, const RegisterState& incoming)
-{
-    bool changed = false;
-    auto conditions = destination.conditionalTables.size();
-    destination.conditionalTables.insert(incoming.conditionalTables.begin(), incoming.conditionalTables.end());
-    changed |= conditions != destination.conditionalTables.size();
-    if (destination.conditionalTables.size() > Disposition::ReferenceLimit)
-        throw std::runtime_error("conditional-table-references-exhausted");
-    conditions = destination.conditionalCallees.size();
-    destination.conditionalCallees.insert(incoming.conditionalCallees.begin(), incoming.conditionalCallees.end());
-    changed |= conditions != destination.conditionalCallees.size();
-    if (destination.conditionalCallees.size() > Disposition::ReferenceLimit)
-        throw std::runtime_error("conditional-callee-references-exhausted");
-    for (unsigned reg = 0; reg < Disposition::RegisterCount; ++reg) {
-        changed |= joinFact(destination[reg], incoming[reg]);
-        if (reg >= Disposition::GprCount) continue;
-        if (incoming.mayPending[reg]) {
-            if (destination.mayPending[reg]) changed |= joinFact(destination.pending[reg], incoming.pending[reg]);
-            else { destination.pending[reg] = incoming.pending[reg]; changed = true; }
-        }
-        changed |= destination.mayPending[reg] != (destination.mayPending[reg] || incoming.mayPending[reg]);
-        changed |= destination.mayNoPending[reg] != (destination.mayNoPending[reg] || incoming.mayNoPending[reg]);
-        destination.mayPending[reg] |= incoming.mayPending[reg];
-        destination.mayNoPending[reg] |= incoming.mayNoPending[reg];
-    }
-    return changed;
-}
 void establishIdentity(RegisterFact& output, const RegisterState& state,
     const Disposition::Instruction& row, unsigned destination)
 {
@@ -2164,6 +2086,9 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
             const auto calleePreservation = originalCalleePreservation(cf->originalCalleeContexts,
                 _config->getConfig().parameters, evidence, instructions, imageView);
 			RegisterState entry;
+            const auto& observation = _config->getConfig().parameters.getOriginalEntryObservation();
+            entry.storage = OriginalMemoryState::bind(observation ? &*observation : nullptr,
+                summary.function, extent.imageId, imageView && imageView->owner ? imageView->owner->fileHash : "", evidence);
             entry.mayNoPending.fill(true);
 			for (unsigned reg = 0; reg < Disposition::RegisterCount; ++reg)
 				entry[reg].bad.insert(reg == 2 ? "incoming-v0"
@@ -2294,6 +2219,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     inputs = RegisterFact{}; inputs.missing = false;
                 }
                 auto identityState = state;
+                state.storage.step(row, operation, state);
                 auto immediateDestination = operation.kind != MipsOperation::Load && operation.destinations.size() == 1
                     ? std::optional<unsigned>{operation.destinations.front()} : std::optional<unsigned>{};
                 for (unsigned reg = 1; reg < Disposition::GprCount; ++reg) {
@@ -2398,6 +2324,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                                 state[reg].bad.insert(reg == 2 ? "unknown-call-result" : "unknown-call-clobber");
                             }
                         }
+						state.storage.call(owner, call.contract ? &*call.contract : nullptr);
 						send(owner + 8, 0, "call-continuation");
 					}
 					else {
@@ -2492,6 +2419,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                         pair.second.address = common::OriginalFact::partial("original-address-proof-unresolved");
                 }
                 summarizeOriginal(summary, disposition, exitStates, sampledTargets, demands, accesses, graph.unavailable.count(evidence.start));
+                if (flowComplete && summary.entry.isComplete()) OriginalMemoryState::summarize(summary, exitStates);
             }
             auto* v0 = _abi->getRegister(MIPS_REG_V0);
 			value &= v0 && v0->getValueType()->isIntegerTy(32);
@@ -2566,6 +2494,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
             evidence.decodeComplete = false; evidence.analysisComplete = false;
             evidence.definitions.clear(); evidence.edges.clear(); evidence.exits.clear(); evidence.calls.clear();
             cf->originalJumpTables.clear();
+            summary.scopedRestoration.reset();
             summary.noMemoryWrites = common::OriginalFact::partial("native-analysis-failed");
             for (auto& access : summary.accesses) access.address = common::OriginalFact::partial("native-analysis-failed");
             if (evidence.obligations.size() < Disposition::RowLimit)

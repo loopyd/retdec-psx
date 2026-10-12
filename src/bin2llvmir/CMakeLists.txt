@@ -49,6 +49,7 @@ add_library(bin2llvmir STATIC
 	optimizations/param_return/filter/filter.cpp
 	optimizations/param_return/filter/ms_x64.cpp
 	optimizations/param_return/param_return.cpp
+	optimizations/param_return/original_storage.cpp
 	optimizations/param_return/data_entries.cpp
 	optimizations/phi_remover/phi_remover.cpp
 	optimizations/provider_init/provider_init.cpp

@@ -190,6 +190,30 @@ void summary(Writer& writer, const retdec::common::OriginalFunctionSummary& valu
     fact(writer, "entry", value.entry); fact(writer, "result", value.result); fact(writer, "control", value.control);
     fact(writer, "effects", value.effects); fact(writer, "declaration", value.declaration);
     fact(writer, "noMemoryWrites", value.noMemoryWrites);
+    if (value.scopedRestoration) {
+        const auto& scoped = *value.scopedRestoration;
+        writer.Key("scopedRestoration"); writer.StartObject();
+        writer.Key("kind"); writer.String("mips-observed-frame-restoration/v1");
+        writer.Key("observation"); writer.String(scoped.observation);
+        writer.Key("stateHash"); writer.String(scoped.stateHash);
+        writer.Key("entryPc"); writer.Uint(scoped.entryPc);
+        writer.Key("entrySp"); writer.Uint(scoped.entrySp);
+        writer.Key("frameBytes"); writer.Uint(scoped.frameBytes);
+        strings(writer, "conditions", std::vector<std::string>{"captured-entry-sp-and-settled-load-state",
+            "ordinary-ram-mapping-and-cache-mode-remain-active", "original-instructions-remain-active",
+            "accesses-and-instruction-fetches-complete-normally",
+            "no-asynchronous-or-external-state-interference", "mips-i-load-and-branch-delays"});
+        writer.Key("registers"); writer.StartArray();
+        for (const auto& restored : scoped.registers) {
+            writer.StartObject(); writer.Key("register"); writer.Uint(restored.reg);
+            writer.Key("entrySpOffset"); writer.Int(restored.offset);
+            writer.Key("physicalWord"); writer.Uint(restored.physicalWord);
+            writer.Key("storePc"); writer.Uint64(restored.storePc);
+            numbers(writer, "loadPcs", restored.loadPcs); numbers(writer, "callPcs", restored.callPcs);
+            numbers(writer, "exitPcs", restored.exitPcs); writer.EndObject();
+        }
+        writer.EndArray(); writer.EndObject();
+    }
     numbers(writer, "parameterRegisters", value.parameterRegisters);
     writer.Key("demands"); writer.StartArray();
     for (const auto& row : value.demands) {

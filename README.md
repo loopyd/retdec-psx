@@ -71,6 +71,12 @@ uses the current Rizin analysis and supplied context.
 For original-only generation, the absolute workspace must contain the validated
 request, original image bytes and fixed configuration expected by `pdzar`.
 
+Original-only analysis can bind a checked runtime entry observation after native
+discovery matches its function identity and original instructions. Native stores,
+calls, joins and delayed loads recover saved-register relationships within a
+fixed RAM frame. The `scopedRestoration` report retains its entry and execution
+conditions. It does not establish universal control, effects or C declarations.
+
 ## Overlay state
 
 The backend owns ordered PS1 image mounts through
