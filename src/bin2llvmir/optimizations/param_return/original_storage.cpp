@@ -51,6 +51,35 @@ bool joinState(RegisterState& destination, const RegisterState& incoming)
     return changed;
 }
 
+std::optional<ScopedCallTransfer> ScopedCallTransfer::bind(const Disposition::Call& call,
+    const common::OriginalPartialCall& proof, const common::OriginalFunctionSummary& summary,
+    const RegisterState& before) {
+    if (!proof.identity.isComplete() || proof.callee != summary.function || !summary.entry.isComplete()
+        || summary.pendingEntry != "requires-no-pending-gpr-loads" || !summary.scopedRestoration
+        || !call.target || *call.target != summary.scopedRestoration->entryPc
+        || proof.delay != call.pc + 4 || proof.continuation != call.pc + 8
+        || proof.actualIncomingLink != std::optional<uint32_t>{uint32_t(proof.continuation)}
+        || summary.transfers.size() != Disposition::RegisterCount || summary.exits.empty()
+        || std::any_of(before.mayPending.begin(), before.mayPending.end(), [](bool value) { return value; })) return {};
+    const auto& transfer = summary.transfers[2];
+    if (transfer.reg != 2 || transfer.kind != "assigned" || !transfer.proof.isComplete()
+        || transfer.definitions.empty() || !transfer.bad.empty() || transfer.pending
+        || !transfer.mayNoPending || !transfer.pendingDefinitions.empty()) return {};
+    const common::OriginalScopedRestoration::Register* link = nullptr;
+    for (const auto& row : summary.scopedRestoration->registers) {
+        if (row.reg != 31) continue;
+        if (link || row.loadPcs.empty()) return {};
+        link = &row;
+    }
+    std::vector<uint64_t> exits;
+    for (const auto& exit : summary.exits) exits.push_back(exit.pc);
+    std::sort(exits.begin(), exits.end());
+    if (!link || link->exitPcs != exits) return {};
+    for (auto entry : transfer.entries)
+        if (entry >= Disposition::RegisterCount || before[entry].missing || !before[entry].bad.empty()) return {};
+    return ScopedCallTransfer(transfer);
+}
+
 bool OriginalMemoryState::Word::sameValue(const Word& other) const {
     return entry == other.entry && offset == other.offset && store == other.store;
 }

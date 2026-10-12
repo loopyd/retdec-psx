@@ -447,6 +447,10 @@ bool canProposeOrdinaryBody(const common::Function& function)
 	if (disposition.kind != Disposition::Kind::Unknown || evidence.selection != "selected-root"
 		|| !evidence.analysisComplete || summary.result.isComplete() || summary.declaration.isComplete()
 		|| evidence.exits.size() != 1 || !ordinaryBodyLayout(evidence)) return false;
+	if (std::any_of(evidence.obligations.begin(), evidence.obligations.end(), [](const auto& row) {
+		return row.domain == "architectural" && (row.reason == "conditional-callee-preservation-unresolved"
+			|| row.reason == "conditional-callee-assigned-transfer-unresolved");
+	})) return false;
 	const auto& exit = evidence.exits.front();
 	if (exit.pc != evidence.end - 8 || exit.delaySlot != evidence.end - 4 || exit.missing
 		|| exit.definitions.empty() || !exit.formals.empty() || !exit.pendingDefinitions.empty() || !exit.bad.empty()) return false;
@@ -1750,6 +1754,8 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
         proof.result = summary->result; proof.effects = summary->effects; proof.declaration = summary->declaration;
         proof.registerTransfers = summary->transfers;
     }
+    auto scoped = summary ? ScopedCallTransfer::bind(call, proof, *summary, before) : std::nullopt;
+    bool conditionalAssigned = false;
     bool transfers = summary && summary->transfers.size() == Disposition::RegisterCount && proof.control.isComplete() && !pending;
     for (unsigned reg = 1; reg < Disposition::RegisterCount; ++reg) {
         state[reg] = RegisterFact{};
@@ -1767,7 +1773,8 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
         bool usable = transfer && transfer->reg == reg && transfer->proof.isComplete() && !transfer->pending && proof.control.isComplete() && !pending;
         transfers &= usable;
         if (usable && transfer->kind == "preserved") { state[reg] = before[reg]; continue; }
-        if (usable && transfer->kind == "assigned" && callee && !transfer->definitions.empty()) {
+        bool scopedAssigned = !usable && scoped && transfer == &scoped->transfer();
+        if ((usable || scopedAssigned) && transfer->kind == "assigned" && callee && !transfer->definitions.empty()) {
             RegisterFact output; output.missing = false;
             for (auto entry : transfer->entries) {
                 output.formals.insert(before[entry].formals.begin(), before[entry].formals.end());
@@ -1796,7 +1803,7 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
             output.equalityEvidence.insert(call.pc); output.equalityEvidence.insert(proof.delay);
             definition.equalEntry = output.equalEntry; definition.constant = output.constant;
             definition.equalityEvidence.assign(output.equalityEvidence.begin(), output.equalityEvidence.end());
-            state[reg] = std::move(output); continue;
+            state[reg] = std::move(output); conditionalAssigned |= scopedAssigned; continue;
         }
         state[reg].bad.insert(reg == 2 ? "unknown-call-result" : "unknown-call-clobber");
     }
@@ -1804,16 +1811,17 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     if (summary && !proof.effects.isComplete() && evidence.obligations.size() < Disposition::RowLimit
         && std::none_of(evidence.obligations.begin(), evidence.obligations.end(), [&](const auto& row) { return row.pc == call.pc && row.reason == "callee-memory-effects-unresolved"; }))
         evidence.obligations.push_back({call.pc, "memory", "callee-memory-effects-unresolved"});
-    if (conditionalPreservation) {
+    if (conditionalPreservation || conditionalAssigned) {
         state.conditionalCallees.insert(call.pc);
         if (state.conditionalCallees.size() > Disposition::ReferenceLimit)
             throw std::runtime_error("conditional-callee-references-exhausted");
+        const std::string reason = conditionalAssigned ? "conditional-callee-assigned-transfer-unresolved" : "conditional-callee-preservation-unresolved";
         if (std::none_of(evidence.obligations.begin(), evidence.obligations.end(), [&](const auto& row) {
-            return row.pc == call.pc && row.domain == "architectural" && row.reason == "conditional-callee-preservation-unresolved";
+            return row.pc == call.pc && row.domain == "architectural" && row.reason == reason;
         })) {
             if (evidence.obligations.size() >= Disposition::RowLimit)
                 throw std::runtime_error("return-obligations-exhausted");
-            evidence.obligations.push_back({call.pc, "architectural", "conditional-callee-preservation-unresolved"});
+            evidence.obligations.push_back({call.pc, "architectural", reason});
         }
     }
     for (auto jumpPc : state.conditionalTables) {

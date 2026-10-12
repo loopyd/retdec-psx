@@ -76,6 +76,9 @@ discovery matches its function identity and original instructions. Native stores
 calls, joins and delayed loads recover saved-register relationships within a
 fixed RAM frame. The `scopedRestoration` report retains its entry and execution
 conditions. It does not establish universal control, effects or C declarations.
+An all-exit incoming-link restoration can support assigned register-2 flow into a
+direct caller under those retained conditions. Conditional call flow still
+refuses ordinary C body admission.
 
 ## Overlay state
 

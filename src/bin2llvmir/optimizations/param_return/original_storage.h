@@ -68,6 +68,15 @@ struct RegisterState {
     RegisterFact& operator[](unsigned reg) { return registers[reg]; }
     const RegisterFact& operator[](unsigned reg) const { return registers[reg]; }
 };
+class ScopedCallTransfer {
+    const common::OriginalTransfer* _transfer;
+    explicit ScopedCallTransfer(const common::OriginalTransfer& transfer) : _transfer(&transfer) {}
+public:
+    static std::optional<ScopedCallTransfer> bind(const Disposition::Call& call,
+        const common::OriginalPartialCall& proof, const common::OriginalFunctionSummary& summary,
+        const RegisterState& before);
+    const common::OriginalTransfer& transfer() const { return *_transfer; }
+};
 struct MipsOperation {
 	enum Kind { Compute, Multiply, Divide, Load, Store, Branch, Return, Call, Trap, Unsupported } kind = Unsupported;
 	enum class MergeMemory { Lwl, Lwr, Swl, Swr };
