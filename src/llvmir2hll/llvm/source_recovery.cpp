@@ -31,6 +31,14 @@
 #include "retdec/llvmir2hll/ir/array_index_op_expr.h"
 #include "retdec/llvmir2hll/ir/neq_op_expr.h"
 #include "retdec/llvmir2hll/ir/eq_op_expr.h"
+#include "retdec/llvmir2hll/ir/address_op_expr.h"
+#include "retdec/llvmir2hll/ir/bit_cast_expr.h"
+#include "retdec/llvmir2hll/ir/add_op_expr.h"
+#include "retdec/llvmir2hll/ir/sub_op_expr.h"
+#include "retdec/llvmir2hll/ir/mul_op_expr.h"
+#include "retdec/llvmir2hll/ir/bit_and_op_expr.h"
+#include "retdec/llvmir2hll/ir/bit_or_op_expr.h"
+#include "retdec/llvmir2hll/ir/bit_xor_op_expr.h"
 #include "retdec/llvmir2hll/ir/cast_expr.h"
 #include "retdec/llvmir2hll/ir/ext_cast_expr.h"
 #include "retdec/llvmir2hll/ir/trunc_cast_expr.h"
@@ -1279,6 +1287,320 @@ private:
 	}
 };
 
+struct ByteReadEdge {
+	ShPtr<Expression> parent;
+	unsigned operand;
+};
+
+struct ProvenByteLoadLocal {
+	ShPtr<Variable> local;
+	ShPtr<Statement> definition;
+	ShPtr<Expression> load;
+	ShPtr<IntType> originalType;
+	std::vector<ByteReadEdge> reads;
+};
+
+class OriginalZeroExtendedByteLocals final : public FuncOptimizer {
+public:
+	OriginalZeroExtendedByteLocals(ShPtr<Module> module, const config::Config& config):
+		FuncOptimizer(module), retained(config) {}
+	std::string getId() const override { return "OriginalZeroExtendedByteLocals"; }
+private:
+	const config::Config& retained;
+	const common::Function* source = nullptr;
+	llvm::Function* machine = nullptr;
+	ShPtr<ValueAnalysis> values;
+	StmtVector statements;
+
+	bool graph(ShPtr<Expression> expression, std::set<ShPtr<Expression>>& seen) {
+		if (!expression || isa<Variable>(expression) || isa<Constant>(expression)) return true;
+		if (seen.size() >= common::ReturnDisposition::RowLimit || !seen.insert(expression).second) return false;
+		if (auto conversion = cast<CastExpr>(expression)) return graph(conversion->getOperand(), seen);
+		if (auto unary = cast<UnaryOpExpr>(expression)) return graph(unary->getOperand(), seen);
+		if (auto binary = cast<BinaryOpExpr>(expression))
+			return graph(binary->getFirstOperand(), seen) && graph(binary->getSecondOperand(), seen);
+		return false;
+	}
+
+	bool collect(ShPtr<Statement> first, ShPtr<Statement> parent, StmtSet& seen,
+			std::set<ShPtr<Expression>>& expressions) {
+		bool exited = false;
+		for (auto statement = first; statement; statement = statement->getSuccessor()) {
+			if (seen.size() >= common::ReturnDisposition::RowLimit || !seen.insert(statement).second
+					|| statement->getParent() != parent || statement->hasLabel() || statement->isGotoTarget()) return false;
+			statements.push_back(statement);
+			if (isa<EmptyStmt>(statement)) continue;
+			if (exited) return false;
+			if (auto assignment = cast<AssignStmt>(statement)) {
+				if (!graph(assignment->getLhs(), expressions) || !graph(assignment->getRhs(), expressions)) return false;
+			} else if (auto declaration = cast<VarDefStmt>(statement)) {
+				if (!graph(declaration->getInitializer(), expressions)) return false;
+			} else if (auto branch = cast<IfStmt>(statement)) {
+				if (branch->hasElseIfClauses() || !graph(branch->getFirstIfCond(), expressions)
+						|| !collect(branch->getFirstIfBody(), branch, seen, expressions)
+						|| !collect(branch->getElseClause(), branch, seen, expressions)) return false;
+			} else if (auto exit = cast<ReturnStmt>(statement)) {
+				if (!graph(exit->getRetVal(), expressions)) return false;
+				exited = true;
+			} else return false;
+		}
+		return true;
+	}
+
+	ShPtr<Variable> byteObject(ShPtr<Expression> expression, uint64_t& offset) {
+		offset = 0;
+		auto type = expression ? cast<IntType>(expression->getType()) : nullptr;
+		if (!type || type->getSize() != 8 || expression->hasMetadata()) return {};
+		if (auto direct = cast<Variable>(expression))
+			return module->isGlobalVar(direct) && !direct->isVolatile() ? direct : nullptr;
+		ShPtr<Expression> pointer;
+		if (auto dereference = cast<DerefOpExpr>(expression)) pointer = dereference->getOperand();
+		else if (auto index = cast<ArrayIndexOpExpr>(expression)) {
+			auto constant = cast<ConstInt>(index->getIndex());
+			if (!constant || constant->isNegative() || constant->getValue().getActiveBits() > 2) return {};
+			offset = constant->getValue().getZExtValue();
+			pointer = index->getBase();
+		} else return {};
+		if (pointer->hasMetadata()) return {};
+		if (auto conversion = cast<BitCastExpr>(pointer)) {
+			auto destination = cast<PointerType>(conversion->getType());
+			auto byte = destination ? cast<IntType>(destination->getContainedType()) : nullptr;
+			if (!byte || byte->getSize() != 8) return {};
+			pointer = conversion->getOperand();
+		}
+		auto address = cast<AddressOpExpr>(pointer);
+		auto object = address ? cast<Variable>(address->getOperand()) : nullptr;
+		return object && !address->hasMetadata() && module->isGlobalVar(object) && !object->isVolatile()
+			? object : nullptr;
+	}
+
+	bool memory(ShPtr<Expression> expression, uint64_t pc, bool read) {
+		uint64_t offset;
+		auto object = byteObject(expression, offset);
+		if (!object || object->hasMetadata() || object->isVolatile()) return false;
+		const auto& evidence = source->returnDisposition->evidence;
+		const auto& summary = *source->originalCallSummary;
+		const auto* row = original_expression::unique(evidence.instructions,
+			[&](const auto& candidate) { return candidate.pc == pc; });
+		const auto* access = original_expression::unique(summary.accesses,
+			[&](const auto& candidate) { return candidate.pc == pc; });
+		const auto* address = access ? std::get_if<common::OriginalFixedMemoryAddress>(&access->address) : nullptr;
+		if (!row || !address || !row->mapped || row->undef || row->bytes != 4 || row->owner != evidence.symbol
+				|| row->pc < evidence.start || row->pc >= evidence.end || row->pc % 4
+				|| row->word >> 26 != (read ? 36u : 40u) || access->width != 8
+				|| access->kind != (read ? "read" : "write") || access->extension != (read ? "zero" : "none")
+				|| access->delayed != read || !access->addressEntries.empty() || (read && !((row->word >> 16) & 31))
+				|| !address->alignment.isComplete()
+				|| !std::holds_alternative<common::OriginalFileBytes>(address->fileBytes)) return false;
+		auto instruction = retained.parameters.getPsxMemoryContext()->resolve(pc, 4);
+		if (!instruction) return false;
+		for (unsigned i = 0; i < 4; ++i)
+			if (instruction->bytes[i] != uint8_t(row->word >> (8 * i))) return false;
+		unsigned hllMatches = 0;
+		for (const auto& statement : statements) {
+			if (statement->getAddress() != pc || (!isa<AssignStmt>(statement) && !isa<VarDefStmt>(statement))) continue;
+			uint64_t candidateOffset;
+			if (byteObject(read ? getRhs(statement) : getLhs(statement), candidateOffset)) ++hllMatches;
+		}
+		if (hllMatches != 1) return false;
+		const auto& views = *source->sharedOriginalAddressViews;
+		const auto* view = original_expression::unique(views, [&](const auto& candidate) {
+			return std::find(candidate.accessPcs.begin(), candidate.accessPcs.end(), pc) != candidate.accessPcs.end();
+		});
+		auto objectType = cast<IntType>(object->getType());
+		if (!view || !objectType || (view->width != 8 && view->width != 16 && view->width != 32)
+				|| std::count(view->accessPcs.begin(), view->accessPcs.end(), pc) != 1
+				|| objectType->getSize() != view->width || offset >= view->width / 8
+				|| uint64_t(view->start) + offset != address->value || object->getInitialName() != view->symbol) return false;
+		auto* global = machine->getParent()->getNamedGlobal(view->symbol);
+		auto* marker = global ? global->getMetadata("retdec.original.address-view") : nullptr;
+		if (!global || !global->isDeclaration() || global->isConstant() || global->getAddressSpace()
+				|| !global->getValueType()->isIntegerTy(view->width) || !marker || marker->getNumOperands() != 5) return false;
+		auto* owner = llvm::dyn_cast<llvm::MDString>(marker->getOperand(0).get());
+		auto* identity = llvm::dyn_cast<llvm::MDString>(marker->getOperand(1).get());
+		auto number = [&](unsigned index, uint64_t expected) {
+			auto* value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(marker->getOperand(index));
+			return value && value->getType()->isIntegerTy(64) && value->getZExtValue() == expected;
+		};
+		if (!owner || owner->getString() != source->getName() || !identity || identity->getString() != summary.function
+				|| !number(2, view - views.data()) || !number(3, view->start) || !number(4, view->width)) return false;
+		llvm::Instruction* matched = nullptr;
+		for (auto& block : *machine) for (auto& candidate : block) {
+			if ((!llvm::isa<llvm::LoadInst>(candidate) && !llvm::isa<llvm::StoreInst>(candidate))
+					|| !original_expression::hasPc(candidate, pc)) continue;
+			if (matched) return false;
+			matched = &candidate;
+		}
+		auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(matched);
+		auto* store = llvm::dyn_cast_or_null<llvm::StoreInst>(matched);
+		if ((read && (!load || !load->getType()->isIntegerTy(8) || load->isVolatile() || load->isAtomic()))
+				|| (!read && (!store || !store->getValueOperand()->getType()->isIntegerTy(8)
+					|| store->isVolatile() || store->isAtomic()))) return false;
+		auto* pointer = load ? load->getPointerOperand() : store->getPointerOperand();
+		if (pointer->getType()->getPointerAddressSpace()) return false;
+		uint64_t llvmOffset = 0;
+		if (auto* index = llvm::dyn_cast<llvm::GEPOperator>(pointer)) {
+			auto* constant = index->getNumIndices() == 1 ? llvm::dyn_cast<llvm::ConstantInt>(index->getOperand(1)) : nullptr;
+			if (!index->getSourceElementType()->isIntegerTy(8) || !constant || constant->getValue().isNegative()
+					|| constant->getValue().getActiveBits() > 2) return false;
+			llvmOffset = constant->getZExtValue();
+			pointer = index->getPointerOperand();
+		}
+		if (auto* conversion = llvm::dyn_cast<llvm::Operator>(pointer))
+			if (conversion->getOpcode() == llvm::Instruction::BitCast) pointer = conversion->getOperand(0);
+		return pointer == global && llvmOffset == offset;
+	}
+
+	bool follows(ShPtr<Statement> definition, ShPtr<Statement> read) {
+		for (auto ancestor = read; ancestor; ancestor = ancestor->getParent())
+			for (auto next = definition->getSuccessor(); next; next = next->getSuccessor())
+				if (next == ancestor) return true;
+		return false;
+	}
+
+	bool readEdges(ShPtr<Expression> expression, ShPtr<Variable> local, bool byte,
+			ShPtr<Expression> parent, unsigned operand, std::vector<ByteReadEdge>& edges) {
+		if (!expression || expression->hasMetadata()) return false;
+		auto type = cast<IntType>(expression->getType());
+		bool equality = isa<EqOpExpr>(expression) || isa<NeqOpExpr>(expression);
+		if (!type || (type->getSize() != 8 && type->getSize() != 16 && type->getSize() != 32
+				&& !(equality && type->getSize() == 1))) return false;
+		if (expression == local) {
+			if (!byte || !parent) return false;
+			edges.push_back({parent, operand});
+			return true;
+		}
+		if (isa<ConstInt>(expression)) return true;
+		if (auto variable = cast<Variable>(expression))
+			return currFunc->hasLocalVar(variable) && !variable->isExternal() && !variable->isVolatile();
+		if (auto conversion = cast<CastExpr>(expression)) {
+			auto input = cast<IntType>(conversion->getOperand()->getType());
+			auto extension = cast<ExtCastExpr>(conversion);
+			auto truncation = cast<TruncCastExpr>(conversion);
+			if (!input || (!isa<BitCastExpr>(conversion) && !extension && !truncation)
+					|| (extension && (extension->getOriginalExtraction()
+						|| extension->getVariant() == ExtCastExpr::Variant::FPExt))
+					|| (truncation && truncation->getOriginalExtraction())) return false;
+			return readEdges(conversion->getOperand(), local,
+				byte || type->getSize() == 8 || (extension && input->getSize() == 8), conversion, 0, edges);
+		}
+		auto binary = cast<BinaryOpExpr>(expression);
+		if (!binary) return false;
+		if (isa<EqOpExpr>(binary) || isa<NeqOpExpr>(binary)) {
+			auto lhs = cast<IntType>(binary->getFirstOperand()->getType());
+			auto rhs = cast<IntType>(binary->getSecondOperand()->getType());
+			bool direct = (binary->getFirstOperand() == local && isa<ConstInt>(binary->getSecondOperand()))
+				|| (binary->getSecondOperand() == local && isa<ConstInt>(binary->getFirstOperand()));
+			if (!direct || !lhs || !rhs || lhs->getSize() != 8 || rhs->getSize() != 8
+					|| !lhs->isSigned() || !rhs->isSigned()) return false;
+			byte = true;
+		} else if (!byte || (!isa<AddOpExpr>(binary) && !isa<SubOpExpr>(binary) && !isa<MulOpExpr>(binary)
+				&& !isa<BitAndOpExpr>(binary) && !isa<BitOrOpExpr>(binary) && !isa<BitXorOpExpr>(binary))) return false;
+		return readEdges(binary->getFirstOperand(), local, byte, binary, 0, edges)
+			&& readEdges(binary->getSecondOperand(), local, byte, binary, 1, edges);
+	}
+
+	std::optional<ProvenByteLoadLocal> prove(ShPtr<Variable> local) {
+		auto type = cast<IntType>(local->getType());
+		if (!type || type->getSize() != 8 || !type->isSigned() || local->isExternal() || local->isVolatile()
+				|| local->hasMetadata() || values->mayBePointed(local) || module->hasAssignedDebugName(local)
+				|| !module->getDebugNameForLocalVar(currFunc, local).empty()) return {};
+		ProvenByteLoadLocal candidate{local, nullptr, nullptr, type, {}};
+		ShPtr<VarDefStmt> declaration;
+		StmtSet observed;
+		for (const auto& statement : statements) {
+			auto data = values->getValueData(statement);
+			if (data->hasCalls() || data->hasAddressTaken(local) || data->mayBeIndirAccessed(local)
+					|| data->mustBeIndirAccessed(local)) return {};
+			if (data->isDirAccessed(local)) observed.insert(statement);
+			if (auto definition = cast<VarDefStmt>(statement)) if (definition->getVar() == local) {
+				if (declaration) return {};
+				declaration = definition;
+			}
+			if (!data->isDirWritten(local)) continue;
+			if ((!isa<AssignStmt>(statement) && !isa<VarDefStmt>(statement)) || getLhs(statement) != local) return {};
+			auto rhs = getRhs(statement);
+			if (!rhs) continue;
+			if (candidate.definition || data->isDirRead(local) || !statement->getAddress().isDefined()
+					|| !memory(rhs, statement->getAddress().getValue(), true)) return {};
+			candidate.definition = statement;
+			candidate.load = rhs;
+		}
+		if (!declaration || !candidate.definition) return {};
+		auto uses = VarUsesVisitor::create(values, false)->getUses(local, currFunc);
+		if (uses->dirUses != observed || !uses->indirUses.empty()) return {};
+		for (const auto& statement : observed) {
+			auto data = values->getValueData(statement);
+			std::size_t before = candidate.reads.size();
+			if (data->isDirRead(local)) {
+				if (!follows(candidate.definition, statement)) return {};
+				ShPtr<Expression> expression;
+				bool byte = false;
+				if (auto assignment = cast<AssignStmt>(statement)) {
+					if (values->getValueData(assignment->getLhs())->isDirAccessed(local)) return {};
+					expression = assignment->getRhs();
+					byte = statement->getAddress().isDefined()
+						&& memory(assignment->getLhs(), statement->getAddress().getValue(), false);
+				} else if (auto definition = cast<VarDefStmt>(statement)) expression = definition->getInitializer();
+				else if (auto branch = cast<IfStmt>(statement)) expression = branch->getFirstIfCond();
+				else if (auto exit = cast<ReturnStmt>(statement)) expression = exit->getRetVal();
+				if (!readEdges(expression, local, byte, nullptr, 0, candidate.reads)) return {};
+			}
+			if (data->getDirNumOfUses(local)
+					!= candidate.reads.size() - before + (data->isDirWritten(local) ? 1 : 0)) return {};
+		}
+		return candidate.reads.empty() ? std::nullopt : std::optional<ProvenByteLoadLocal>{candidate};
+	}
+
+	void runOnFunction(ShPtr<Function> function) override {
+		currFunc = function;
+		machine = module->getLLVMModule()->getFunction(function->getInitialName());
+		source = retained.functions.getFunctionByName(function->getInitialName());
+		const auto& scope = retained.parameters.getOriginalCallScope();
+		const auto& context = retained.parameters.getPsxMemoryContext();
+		if (!machine || machine->isDeclaration() || !function->getBody() || !source || !scope || !context
+				|| !source->returnDisposition || !source->originalCallSummary || !source->sharedOriginalAddressViews
+				|| source->sharedOriginalAddressViews->empty() || !source->getStart().isDefined() || !source->getEnd().isDefined()
+				|| source->getName() != machine->getName().str() || source->getStart() != retained.parameters.getEntryPoint()) return;
+		const auto& summary = *source->originalCallSummary;
+		const auto& evidence = source->returnDisposition->evidence;
+		bool ordinary = source->originalBodyCandidate
+			&& std::holds_alternative<common::OriginalOrdinaryBody>(*source->originalBodyCandidate)
+			&& source->returnDisposition->kind == common::ReturnDisposition::Kind::Unknown;
+		bool value = source->returnDisposition->kind == common::ReturnDisposition::Kind::Value
+			&& summary.result.isComplete() && summary.declaration.isComplete();
+		if ((!ordinary && !value) || !summary.entry.isComplete() || !summary.control.isComplete() || !evidence.decodeComplete
+				|| !evidence.analysisComplete || !evidence.calls.empty() || evidence.selection != "selected-root"
+				|| evidence.symbol != source->getName() || summary.function != scope->root.key
+				|| evidence.start != scope->root.start || evidence.end != scope->root.end || evidence.start >= evidence.end
+				|| evidence.start != source->getStart().getValue() || evidence.end != source->getEnd().getValue()) return;
+		auto root = context->resolve(evidence.start, evidence.end - evidence.start);
+		if (!root || root->image->id != scope->root.imageId || root->image->payloadHash != scope->payloadHash) return;
+		statements.clear();
+		StmtSet seen;
+		std::set<ShPtr<Expression>> expressions;
+		if (!collect(function->getBody(), nullptr, seen, expressions)) return;
+		values = ValueAnalysis::create(SimpleAliasAnalysis::create(), false);
+		values->initAliasAnalysis(module);
+		std::vector<ProvenByteLoadLocal> candidates;
+		for (const auto& local : function->getLocalVars())
+			if (auto candidate = prove(local)) candidates.push_back(std::move(*candidate));
+		for (const auto& candidate : candidates) {
+			auto load = BitCastExpr::create(candidate.load, IntType::create(8, false));
+			if (auto assignment = cast<AssignStmt>(candidate.definition)) assignment->setRhs(load);
+			else cast<VarDefStmt>(candidate.definition)->setInitializer(load);
+			for (const auto& edge : candidate.reads) {
+				auto read = BitCastExpr::create(candidate.local, candidate.originalType);
+				if (auto conversion = cast<CastExpr>(edge.parent)) conversion->setOperand(read);
+				else if (edge.operand) cast<BinaryOpExpr>(edge.parent)->setSecondOperand(read);
+				else cast<BinaryOpExpr>(edge.parent)->setFirstOperand(read);
+			}
+		}
+		for (const auto& candidate : candidates) candidate.local->setType(IntType::create(8, false));
+		values.reset();
+	}
+};
+
 bool onlyLowBitsUsed(const llvm::Argument &arg, unsigned bits) {
 	if (arg.use_empty()) return false;
 	for (auto *user : arg.users()) {
@@ -1613,6 +1935,7 @@ void recoverSourceSignatures(ShPtr<Module> module, const config::Config &config)
 		}
 		function->setParams(params);
 	}
+	if (config.parameters.isOriginalOnlyReturnRecovery()) OriginalZeroExtendedByteLocals(module, config).optimize();
 }
 
 namespace {
