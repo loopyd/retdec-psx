@@ -181,7 +181,8 @@ EmitsUForLoopStmtWithInitCondStep) {
 
 	auto code = emitCodeForCurrentModule();
 
-	ASSERT_TRUE(contains(code, "for (i = 0; i < 10; i++)")) << code;
+	ASSERT_TRUE(contains(code, "for (i = 0; (((uint32_t)(i)) < ((uint32_t)(10))); "
+		"i = ((int32_t)((uint32_t)(i) + (uint32_t)(1))))")) << code;
 }
 
 TEST_F(CHLLWriterTests,

@@ -108,10 +108,10 @@ EmitsMangledClassNamesWhenDemangledNamesAreNotAvailable) {
 	auto code = emitCodeForCurrentModule();
 
 	// Classes in the header.
-	ASSERT_TRUE(contains(code, "// 7Polygon")) << code;
-	ASSERT_TRUE(contains(code, "// 6Derived (base classes: 7Polygon)")) << code;
+	ASSERT_TRUE(contains(code, "/* 7Polygon */")) << code;
+	ASSERT_TRUE(contains(code, "/* 6Derived (base classes: 7Polygon) */")) << code;
 	// Info for function test().
-	ASSERT_TRUE(contains(code, "// From class:    6Derived")) << code;
+	ASSERT_TRUE(contains(code, "/* From class:    6Derived */")) << code;
 }
 
 TEST_F(HLLWriterTests,
@@ -130,10 +130,10 @@ EmitsDemangledClassNamesWhenAvailable) {
 	auto code = emitCodeForCurrentModule();
 
 	// Classes in the header.
-	ASSERT_TRUE(contains(code, "// Polygon")) << code;
-	ASSERT_TRUE(contains(code, "// Derived (base classes: Polygon)")) << code;
+	ASSERT_TRUE(contains(code, "/* Polygon */")) << code;
+	ASSERT_TRUE(contains(code, "/* Derived (base classes: Polygon) */")) << code;
 	// Info for function test().
-	ASSERT_TRUE(contains(code, "// From class:    Derived")) << code;
+	ASSERT_TRUE(contains(code, "/* From class:    Derived */")) << code;
 }
 
 //
@@ -149,7 +149,7 @@ EmitsDetectedCryptoPatternInCommentAboveGlobalVariableWhenPatternWasDetected) {
 	auto code = emitCodeForCurrentModule();
 
 	std::string expectedCodePart(
-		"// Detected cryptographic pattern: CRC32\n"
+		"/* Detected cryptographic pattern: CRC32 */\n"
 		"int32_t g;"
 	);
 	ASSERT_TRUE(contains(code, expectedCodePart))
@@ -169,7 +169,7 @@ EmitsDemangledFuncNameInCommentWhenAvailable) {
 	auto code = emitCodeForCurrentModule();
 
 	// Info for function test().
-	ASSERT_TRUE(contains(code, "// Demangled:     demangled_func")) << code;
+	ASSERT_TRUE(contains(code, "/* Demangled:     demangled_func */")) << code;
 }
 
 TEST_F(HLLWriterTests,
@@ -180,7 +180,7 @@ EmitsFuncCommentInCommentOnSingleLineWhenThereAreNoLineBreaks) {
 	auto code = emitCodeForCurrentModule();
 
 	// Info for function test().
-	ASSERT_TRUE(contains(code, "// Comment:       single-line comment")) << code;
+	ASSERT_TRUE(contains(code, "/* Comment:       single-line comment */")) << code;
 }
 
 TEST_F(HLLWriterTests,
@@ -191,7 +191,7 @@ EmitsFuncCommentInCommentInBlockWhenThereAreLineBreaks) {
 	auto code = emitCodeForCurrentModule();
 
 	// Info for function test().
-	ASSERT_TRUE(contains(code, "// Comment:\n//     multi-line\n//     comment\n")) << code;
+	ASSERT_TRUE(contains(code, "/* Comment: */\n/*     multi-line */\n/*     comment */\n")) << code;
 }
 
 TEST_F(HLLWriterTests,
@@ -203,9 +203,9 @@ EmitsDetectedCryptoPatternsInCommentWhenAvailable) {
 
 	// Info for function test().
 	std::string expectedCodePart(
-		"// Used cryptographic patterns:\n"
-		"//  - CRC32\n"
-		"//  - MD5\n"
+		"/* Used cryptographic patterns: */\n"
+		"/*  - CRC32 */\n"
+		"/*  - MD5 */\n"
 		"void test(void) {"
 	);
 	ASSERT_TRUE(contains(code, expectedCodePart))
