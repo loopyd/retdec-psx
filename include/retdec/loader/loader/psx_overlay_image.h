@@ -6,7 +6,7 @@
 
 namespace retdec { namespace loader {
 
-std::vector<common::PsxOriginalImage> readPsxImageMetadata(const std::string& path);
+std::vector<common::PsxOriginalImage> readPsxImageMetadata(const std::string& path, const std::string& expectedHash = {});
 
 struct PsxOverlayOperation {
 	enum class Kind { Mount, Dismount };

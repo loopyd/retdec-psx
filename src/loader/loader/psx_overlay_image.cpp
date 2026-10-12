@@ -155,8 +155,9 @@ std::vector<common::PsxVisibleInterval> visible(const std::vector<common::PsxOri
 
 }
 
-std::vector<common::PsxOriginalImage> readPsxImageMetadata(const std::string& path) {
+std::vector<common::PsxOriginalImage> readPsxImageMetadata(const std::string& path, const std::string& expectedHash) {
 	auto bytes = readFile(path, 1 << 20);
+	require(expectedHash.empty() || hash(bytes) == expectedHash, "psx-overlay-metadata-identity-differs");
 	auto doc = document(bytes);
 	auto schema = text(doc, "schema");
 	bool catalog = schema == "retdec118.original-image-catalog/v1";
