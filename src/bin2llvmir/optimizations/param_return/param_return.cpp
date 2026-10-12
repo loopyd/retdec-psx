@@ -1156,6 +1156,56 @@ std::optional<OriginalImageView> originalImageView(const FileImage* image,
     return view;
 }
 
+bool originalEntryCoveredForResult(const Disposition::Evidence& evidence,
+    const common::OriginalFunctionSummary& summary, const OriginalImageView& image,
+    const std::map<unsigned, Disposition::Definition>& definitions)
+{
+    if (!image.physical || !evidence.decodeComplete || !evidence.analysisComplete
+        || !summary.entry.isComplete() || !summary.control.isComplete()
+        || summary.pendingEntry != "requires-no-pending-gpr-loads"
+        || evidence.start % 4 || evidence.end % 4 || evidence.start >= evidence.end
+        || evidence.end > (uint64_t(1) << 32)
+        || evidence.instructions.size() != (evidence.end - evidence.start) / 4
+        || evidence.exits.empty() || summary.exits.size() != evidence.exits.size()
+        || summary.transfers.size() != Disposition::RegisterCount) return false;
+    for (size_t i = 0; i < evidence.instructions.size(); ++i) {
+        const auto& row = evidence.instructions[i];
+        if (row.pc != evidence.start + 4 * i || row.owner != evidence.symbol
+            || !row.mapped || row.undef || row.bytes != 4
+            || !image.contains(row.pc, 4) || image.word(row.pc) != row.word) return false;
+    }
+    auto instruction = [&](uint64_t pc) -> const Disposition::Instruction* {
+        if (pc < evidence.start || pc >= evidence.end || pc % 4) return nullptr;
+        return &evidence.instructions[(pc - evidence.start) / 4];
+    };
+    auto settled = [&](const common::OriginalTransfer& transfer) {
+        if (transfer.reg != 2 || transfer.kind != "assigned" || !transfer.proof.isComplete()
+            || transfer.definitions.empty() || !transfer.bad.empty() || transfer.pending
+            || !transfer.mayNoPending || !transfer.pendingDefinitions.empty()) return false;
+        for (auto id : transfer.definitions) {
+            auto found = definitions.find(id);
+            if (found == definitions.end() || found->second.id != id || found->second.reg != 2
+                || found->second.width != 32 || !found->second.bad.empty()
+                || !instruction(found->second.pc)) return false;
+        }
+        return true;
+    };
+    if (!settled(summary.transfers[2])) return false;
+    for (size_t i = 0; i < evidence.exits.size(); ++i) {
+        const auto& exit = evidence.exits[i];
+        const auto& normal = summary.exits[i];
+        const auto* jump = instruction(exit.pc);
+        if (!jump || jump->word != 0x03e00008 || exit.delaySlot != exit.pc + 4
+            || !instruction(exit.delaySlot) || exit.missing || exit.definitions.empty()
+            || !exit.bad.empty() || !exit.pendingDefinitions.empty()
+            || normal.pc != exit.pc || normal.delay != exit.delaySlot
+            || !normal.incomingLink.isComplete() || normal.transfers.size() != Disposition::RegisterCount
+            || !settled(normal.transfers[2]) || normal.transfers[2].definitions != exit.definitions
+            || normal.transfers[2].pendingDefinitions != exit.pendingDefinitions) return false;
+    }
+    return true;
+}
+
 using OriginalCalleePreservation = std::map<uint64_t, uint32_t>;
 
 OriginalCalleePreservation originalCalleePreservation(
@@ -2228,7 +2278,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 				[](const auto& row) { return row.domain == "architectural"; });
 			evidence.analysisComplete = true;
 			bool value = evidence.decodeComplete && !evidence.exits.empty();
-			value &= std::none_of(evidence.obligations.begin(), evidence.obligations.end(),
+			bool entryCovered = std::none_of(evidence.obligations.begin(), evidence.obligations.end(),
 				[](const auto& row) { return row.domain == "entry"; });
 			for (const auto& exit : evidence.exits)
 				value &= !exit.missing && !exit.definitions.empty() && exit.bad.empty();
@@ -2271,6 +2321,9 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     }
                 }
             }
+            entryCovered |= revised && !observation && imageView
+                && originalEntryCoveredForResult(evidence, summary, *imageView, definitions);
+            value &= entryCovered;
             auto* v0 = _abi->getRegister(MIPS_REG_V0);
 			value &= v0 && v0->getValueType()->isIntegerTy(32);
 			if (value) {
