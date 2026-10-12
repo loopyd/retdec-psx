@@ -1659,64 +1659,78 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
 {
     for (auto& access : summary.accesses) {
         const auto* flow = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&access.address);
-        if (!flow || flow->derivation != common::OriginalEntryRelativeMemoryAddress::Derivation::Flow)
+        const auto* fixed = std::get_if<common::OriginalFixedMemoryAddress>(&access.address);
+        if ((!flow || flow->derivation != common::OriginalEntryRelativeMemoryAddress::Derivation::Flow)
+            && (!fixed || fixed->derivation != common::OriginalFixedMemoryAddress::Derivation::Flow))
             access.address = common::OriginalFact::partial("original-address-proof-unresolved");
     }
     const auto& evidence = disposition.evidence;
-    if (!evidence.analysisComplete || !evidence.decodeComplete || !summary.control.isComplete()
-        || summary.exits.empty() || !evidence.calls.empty() || summary.pendingEntry != "requires-no-pending-gpr-loads"
+    auto selectOriginalMemory = [&] {
+        if (!evidence.analysisComplete || !evidence.decodeComplete || !summary.control.isComplete()
+            || summary.exits.empty() || !evidence.calls.empty() || summary.pendingEntry != "requires-no-pending-gpr-loads"
+            || evidence.start % 4 || evidence.end % 4 || evidence.start >= evidence.end
+            || evidence.instructions.size() != (evidence.end - evidence.start) / 4 || !image) return;
+        if (!view) return;
+        std::map<uint64_t, const Disposition::Instruction*> instructions;
+        std::set<uint64_t> returns;
+        for (const auto& row : evidence.instructions) {
+            instructions.emplace(row.pc, &row);
+            if (originalOperation(row).kind == MipsOperation::Return) returns.insert(row.pc);
+        }
+        if (returns.size() != summary.exits.size() || returns.size() != evidence.exits.size()) return;
+        std::set<uint64_t> observedExits;
+        for (const auto& exit : evidence.exits)
+            if (!returns.count(exit.pc) || !observedExits.insert(exit.pc).second || exit.delaySlot != exit.pc + 4) return;
+        for (const auto& exit : summary.exits)
+            if (!returns.erase(exit.pc) || !exit.incomingLink.isComplete() || exit.sampledEntry != std::optional<unsigned>{31}
+                || exit.delay != exit.pc + 4 || !instructions.count(exit.delay)
+                || std::count(exit.equalityEvidence.begin(), exit.equalityEvidence.end(), exit.pc) != 1) return;
+        std::map<std::pair<uint64_t, unsigned>, const Disposition::Definition*> definitions;
+        std::set<unsigned> ids;
+        for (const auto& definition : evidence.definitions)
+            if (!definition.id || !ids.insert(definition.id).second
+                || !definitions.emplace(std::make_pair(definition.pc, definition.reg), &definition).second) return;
+        std::multimap<uint64_t, const Disposition::Edge*> outgoing, incoming;
+        for (const auto& edge : evidence.edges) {
+            outgoing.emplace(edge.from, &edge); incoming.emplace(edge.to, &edge);
+        }
+        for (auto& access : summary.accesses) {
+            if (!instructions.count(access.pc)) continue;
+            auto address = originalMemoryAddress(access, instructions, definitions);
+            if (address && !originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc, address->equalityEvidence))
+                address.reset();
+            if (!address) {
+                auto relative = originalEntryRelativeMemoryAddress(access, instructions, definitions);
+                if (relative && originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc,
+                        relative->equalityEvidence, relative->entryRegister)) {
+                    access.address = std::move(*relative); continue;
+                }
+                auto candidate = flowAccesses.find(access.pc);
+                if (candidate != flowAccesses.end()) {
+                    const auto* flow = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&candidate->second.address);
+                    if (flow && flow->derivation == common::OriginalEntryRelativeMemoryAddress::Derivation::Flow)
+                        access.address = *flow;
+                    else if (const auto* bounded = std::get_if<common::OriginalBoundedEntryMemoryAddress>(&candidate->second.address))
+                        access.address = *bounded;
+                    else if (const auto* fixed = std::get_if<common::OriginalFixedMemoryAddress>(&candidate->second.address))
+                        if (fixed->derivation == common::OriginalFixedMemoryAddress::Derivation::Flow) address = *fixed;
+                }
+                if (!address) continue;
+            }
+            access.address = std::move(*address);
+        }
+    };
+    selectOriginalMemory();
+    if (!evidence.analysisComplete || !evidence.decodeComplete
+        || summary.pendingEntry != "requires-no-pending-gpr-loads"
         || evidence.start % 4 || evidence.end % 4 || evidence.start >= evidence.end
-        || evidence.instructions.size() != (evidence.end - evidence.start) / 4 || !image) return;
-    if (!view) return;
+        || evidence.instructions.size() != (evidence.end - evidence.start) / 4 || !image || !view) return;
     uint64_t load = view->mappingStart;
     const auto& payload = view->payload;
-    std::map<uint64_t, const Disposition::Instruction*> instructions;
-    std::set<uint64_t> returns;
-    for (const auto& row : evidence.instructions) {
-        instructions.emplace(row.pc, &row);
-        if (originalOperation(row).kind == MipsOperation::Return) returns.insert(row.pc);
-    }
-    if (returns.size() != summary.exits.size() || returns.size() != evidence.exits.size()) return;
-    std::set<uint64_t> observedExits;
-    for (const auto& exit : evidence.exits)
-        if (!returns.count(exit.pc) || !observedExits.insert(exit.pc).second || exit.delaySlot != exit.pc + 4) return;
-    for (const auto& exit : summary.exits)
-        if (!returns.erase(exit.pc) || !exit.incomingLink.isComplete() || exit.sampledEntry != std::optional<unsigned>{31}
-            || exit.delay != exit.pc + 4 || !instructions.count(exit.delay)
-            || std::count(exit.equalityEvidence.begin(), exit.equalityEvidence.end(), exit.pc) != 1) return;
-    std::map<std::pair<uint64_t, unsigned>, const Disposition::Definition*> definitions;
-    std::set<unsigned> ids;
-    for (const auto& definition : evidence.definitions)
-        if (!definition.id || !ids.insert(definition.id).second
-            || !definitions.emplace(std::make_pair(definition.pc, definition.reg), &definition).second) return;
-    std::multimap<uint64_t, const Disposition::Edge*> outgoing, incoming;
-    for (const auto& edge : evidence.edges) {
-        outgoing.emplace(edge.from, &edge); incoming.emplace(edge.to, &edge);
-    }
     auto* loaded = image->getImage();
     for (auto& access : summary.accesses) {
-        if (!instructions.count(access.pc)) continue;
-        auto address = originalMemoryAddress(access, instructions, definitions);
-        if (address && !originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc, address->equalityEvidence))
-            address.reset();
-        if (!address) {
-            auto relative = originalEntryRelativeMemoryAddress(access, instructions, definitions);
-            if (relative && originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc,
-                    relative->equalityEvidence, relative->entryRegister)) {
-                access.address = std::move(*relative); continue;
-            }
-            auto candidate = flowAccesses.find(access.pc);
-            if (candidate != flowAccesses.end()) {
-                const auto* flow = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&candidate->second.address);
-                if (flow && flow->derivation == common::OriginalEntryRelativeMemoryAddress::Derivation::Flow)
-                    access.address = *flow;
-                else if (const auto* bounded = std::get_if<common::OriginalBoundedEntryMemoryAddress>(&candidate->second.address))
-                    access.address = *bounded;
-                else if (const auto* fixed = std::get_if<common::OriginalFixedMemoryAddress>(&candidate->second.address))
-                    if (fixed->derivation == common::OriginalFixedMemoryAddress::Derivation::Flow) address = *fixed;
-            }
-            if (!address) continue;
-        }
+        auto* address = std::get_if<common::OriginalFixedMemoryAddress>(&access.address);
+        if (!address) continue;
         uint64_t count = access.width / 8, value = address->value;
         if (view->context && address->alignment.isComplete() && value + count <= (uint64_t(1) << 32)) {
             auto span = view->context->resolve(value, count);
@@ -1742,7 +1756,6 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
                 && std::equal(bytes.bytes.begin(), bytes.bytes.end(), payload.begin() + bytes.payloadOffset))
                 address->fileBytes = std::move(bytes);
         }
-        access.address = std::move(*address);
     }
 }
 
