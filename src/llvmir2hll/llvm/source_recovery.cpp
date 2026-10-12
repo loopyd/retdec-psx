@@ -40,6 +40,10 @@
 #include "retdec/llvmir2hll/support/visitors/ordered_all_visitor.h"
 #include "retdec/llvmir2hll/ir/if_stmt.h"
 #include "retdec/llvmir2hll/ir/return_stmt.h"
+#include "retdec/llvmir2hll/ir/switch_stmt.h"
+#include "retdec/llvmir2hll/ir/break_stmt.h"
+#include "retdec/llvmir2hll/ir/deref_op_expr.h"
+#include "retdec/llvmir2hll/graphs/cfg/cfg_builders/non_recursive_cfg_builder.h"
 #include "retdec/llvmir2hll/optimizer/func_optimizer.h"
 #include "retdec/llvmir2hll/analysis/goto_target_analysis.h"
 #include "retdec/llvmir2hll/analysis/alias_analysis/alias_analyses/simple_alias_analysis.h"
@@ -1092,6 +1096,189 @@ private:
 	ShPtr<AliasAnalysis> aliases;
 };
 
+struct ProvenScalarReturnMerge {
+	ShPtr<Variable> source, result;
+	ShPtr<VarDefStmt> sourceDeclaration;
+	ShPtr<Statement> sourceInitialization, resultInitialization;
+	ShPtr<AssignStmt> update, copy;
+	ShPtr<SwitchStmt> branch;
+	ShPtr<ReturnStmt> exit;
+};
+
+class ScalarReturnMergeRecovery final : public FuncOptimizer {
+public:
+	explicit ScalarReturnMergeRecovery(ShPtr<Module> module) : FuncOptimizer(module) {}
+	std::string getId() const override { return "ScalarReturnMergeRecovery"; }
+private:
+	bool hasExtraction = false;
+	ShPtr<ValueAnalysis> values;
+
+	void visit(ShPtr<ExtCastExpr> expression) override {
+		hasExtraction = hasExtraction || expression->getOriginalExtraction();
+		FuncOptimizer::visit(expression);
+	}
+	void visit(ShPtr<TruncCastExpr> expression) override {
+		hasExtraction = hasExtraction || expression->getOriginalExtraction();
+		FuncOptimizer::visit(expression);
+	}
+	void runOnFunction(ShPtr<Function> function) override {
+		if (!function->getBody()) return;
+		hasExtraction = false;
+		FuncOptimizer::runOnFunction(function);
+		if (hasExtraction) return;
+		values = ValueAnalysis::create(SimpleAliasAnalysis::create(), false);
+		values->initAliasAnalysis(module);
+		if (auto merge = prove()) {
+			merge->update->setLhs(merge->result);
+			Statement::removeStatementButKeepDebugComment(merge->sourceInitialization);
+			if (merge->sourceDeclaration != merge->sourceInitialization)
+				Statement::removeStatementButKeepDebugComment(merge->sourceDeclaration);
+			Statement::removeStatementButKeepDebugComment(merge->copy);
+			currFunc->removeLocalVar(merge->source);
+		}
+	}
+
+	bool local(ShPtr<Variable> variable) {
+		return variable && currFunc->hasLocalVar(variable) && !variable->isExternal()
+			&& !variable->isVolatile() && isa<IntType>(variable->getType())
+			&& !variable->hasMetadata() && !values->mayBePointed(variable)
+			&& !module->hasAssignedDebugName(variable)
+			&& module->getDebugNameForLocalVar(currFunc, variable).empty();
+	}
+
+	std::optional<ProvenScalarReturnMerge> prove() {
+		StmtSet all;
+		StmtVector prefix;
+		ShPtr<SwitchStmt> branch;
+		ShPtr<ReturnStmt> exit;
+		for (auto statement = currFunc->getBody(); statement; statement = statement->getSuccessor()) {
+			if (!all.insert(statement).second || statement->getParent()
+					|| statement->hasLabel() || statement->isGotoTarget()
+					|| values->getValueData(statement)->hasCalls()) return {};
+			if (isa<EmptyStmt>(statement)) continue;
+			if (exit) return {};
+			if (branch) {
+				exit = cast<ReturnStmt>(statement);
+				if (!exit) return {};
+			} else if (auto candidate = cast<SwitchStmt>(statement)) branch = candidate;
+			else if (isa<AssignStmt>(statement) || isa<VarDefStmt>(statement)) prefix.push_back(statement);
+			else return {};
+		}
+		if (!branch || !exit || prefix.size() < 2) return {};
+		std::vector<StmtVector> clauses;
+		unsigned defaults = 0;
+		for (auto clause = branch->clause_begin(); clause != branch->clause_end(); ++clause) {
+			if (!clause->first) ++defaults;
+			else if (!isa<ConstInt>(clause->first)) return {};
+			StmtVector body;
+			for (auto statement = clause->second; statement; statement = statement->getSuccessor()) {
+				if (!all.insert(statement).second || statement->getParent() != branch
+						|| statement->hasLabel() || statement->isGotoTarget()
+						|| values->getValueData(statement)->hasCalls()) return {};
+				if (isa<EmptyStmt>(statement)) continue;
+				if ((!body.empty() && isa<BreakStmt>(body.back()))
+						|| (!isa<AssignStmt>(statement) && !isa<BreakStmt>(statement))) return {};
+				body.push_back(statement);
+			}
+			if (body.empty()) return {};
+			clauses.push_back(std::move(body));
+		}
+		if (defaults > 1 || clauses.size() < 2) return {};
+		auto uses = VarUsesVisitor::create(values, false);
+		for (std::size_t i = 0; i + 1 < clauses.size(); ++i) {
+			if (clauses[i].size() != 1 || !isa<BreakStmt>(clauses[i + 1].back())) continue;
+			auto update = cast<AssignStmt>(clauses[i].front());
+			auto copy = cast<AssignStmt>(clauses[i + 1].front());
+			if (!update || !copy) continue;
+			auto source = cast<Variable>(copy->getRhs());
+			auto result = cast<Variable>(copy->getLhs());
+			if (source == result || !local(source) || !local(result)
+					|| !source->getType()->isEqualTo(result->getType())
+					|| update->getLhs() != source || exit->getRetVal() != result) continue;
+			ShPtr<Statement> sourceInitialization, resultInitialization;
+			for (std::size_t j = prefix.size() - 2; j < prefix.size(); ++j) {
+				if (getLhs(prefix[j]) == source) sourceInitialization = prefix[j];
+				if (getLhs(prefix[j]) == result) resultInitialization = prefix[j];
+			}
+			if (!sourceInitialization || !resultInitialization) continue;
+			auto initial = cast<ConstInt>(getRhs(sourceInitialization));
+			auto final = cast<ConstInt>(getRhs(resultInitialization));
+			if (!initial || !final || !initial->isEqualTo(final)
+					|| !initial->getType()->isEqualTo(source->getType())
+					|| !final->getType()->isEqualTo(result->getType())
+					|| initial->hasMetadata() || final->hasMetadata()) continue;
+			ShPtr<VarDefStmt> sourceDeclaration, resultDeclaration;
+			bool valid = true;
+			for (const auto& statement : prefix) {
+				auto declaration = cast<VarDefStmt>(statement);
+				if (!declaration) continue;
+				if (declaration->getVar() == source) {
+					if (sourceDeclaration || (declaration->getInitializer() && declaration != sourceInitialization)) valid = false;
+					sourceDeclaration = declaration;
+				}
+				if (declaration->getVar() == result) {
+					if (resultDeclaration || (declaration->getInitializer() && declaration != resultInitialization)) valid = false;
+					resultDeclaration = declaration;
+				}
+			}
+			if (!valid || !sourceDeclaration || !resultDeclaration) continue;
+			StmtSet sourceAccesses{sourceDeclaration, sourceInitialization, update, copy};
+			StmtSet resultAccesses{resultDeclaration, resultInitialization, copy, exit};
+			StmtSet resultReads{exit};
+			for (std::size_t j = 1; j + 1 < clauses[i + 1].size(); ++j) {
+				auto store = cast<AssignStmt>(clauses[i + 1][j]);
+				if (values->getValueData(store)->isDirRead(result)) {
+					if (!isa<DerefOpExpr>(store->getLhs())) valid = false;
+					resultAccesses.insert(store);
+					resultReads.insert(store);
+				}
+			}
+			auto sourceUses = uses->getUses(source, currFunc);
+			auto resultUses = uses->getUses(result, currFunc);
+			if (!valid || sourceUses->dirUses != sourceAccesses || resultUses->dirUses != resultAccesses
+					|| !sourceUses->indirUses.empty() || !resultUses->indirUses.empty()) continue;
+			for (const auto& statement : all) {
+				auto accesses = values->getValueData(statement);
+				if ((accesses->isDirRead(source) && statement != copy)
+						|| (accesses->isDirRead(result) && !resultReads.count(statement))
+						|| accesses->hasAddressTaken(source) || accesses->hasAddressTaken(result)
+						|| accesses->mayBeIndirAccessed(source) || accesses->mustBeIndirAccessed(source)
+						|| accesses->mayBeIndirAccessed(result) || accesses->mustBeIndirAccessed(result)) valid = false;
+			}
+			if (!valid) continue;
+			auto cfg = NonRecursiveCFGBuilder::create()->getCFG(currFunc);
+			for (const auto& statement : all)
+				if (!isa<EmptyStmt>(statement) && !cfg->hasNodeForStmt(statement)) valid = false;
+			if (!valid) continue;
+			auto dispatch = cfg->getNodeForStmt(branch).first;
+			auto updated = cfg->getNodeForStmt(update).first;
+			auto synchronized = cfg->getNodeForStmt(copy).first;
+			auto returned = cfg->getNodeForStmt(exit).first;
+			if (updated == synchronized || dispatch == updated || dispatch == synchronized
+					|| updated->getNumberOfStmts() != 1 || updated->getNumberOfPreds() != 1
+					|| (*updated->pred_begin())->getSrc() != dispatch
+					|| updated->getNumberOfSuccs() != 1 || updated->getFirstSucc()->getDst() != synchronized
+					|| updated->getFirstSucc()->getLabel() || *synchronized->stmt_begin() != copy
+					|| synchronized->getNumberOfPreds() != 2 || synchronized->getNumberOfSuccs() != 1
+					|| synchronized->getFirstSucc()->getDst() != returned || synchronized->getFirstSucc()->getLabel()) continue;
+			std::set<ShPtr<CFG::Node>> predecessors;
+			for (auto edge = synchronized->pred_begin(); edge != synchronized->pred_end(); ++edge)
+				predecessors.insert((*edge)->getSrc());
+			if (predecessors != std::set<ShPtr<CFG::Node>>{dispatch, updated}) continue;
+			std::set<ShPtr<CFG::Node>> destinations;
+			for (const auto& clause : clauses) destinations.insert(cfg->getNodeForStmt(clause.front()).first);
+			if (!defaults) destinations.insert(returned);
+			if (dispatch->getNumberOfSuccs() != destinations.size()) continue;
+			for (auto edge = dispatch->succ_begin(); edge != dispatch->succ_end(); ++edge)
+				if (!destinations.erase((*edge)->getDst())) valid = false;
+			if (!valid || !destinations.empty()) continue;
+			return ProvenScalarReturnMerge{source, result, sourceDeclaration, sourceInitialization,
+				resultInitialization, update, copy, branch, exit};
+		}
+		return {};
+	}
+};
+
 bool onlyLowBitsUsed(const llvm::Argument &arg, unsigned bits) {
 	if (arg.use_empty()) return false;
 	for (auto *user : arg.users()) {
@@ -1186,6 +1373,7 @@ void recoverSourceSignatures(ShPtr<Module> module, const config::Config &config)
 	ForwardGuardRecovery(module).optimize();
 	MembershipReturnRecovery(module).optimize();
 	TableInitializerRecovery(module).optimize();
+	if (config.parameters.isOriginalOnlyReturnRecovery()) ScalarReturnMergeRecovery(module).optimize();
 	for (auto f = module->func_begin(); f != module->func_end(); ++f) {
 		auto function = *f;
 		auto *machine = module->getLLVMModule()->getFunction(function->getInitialName());
