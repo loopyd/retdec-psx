@@ -202,13 +202,13 @@ class ConfigProvider
 {
 	public:
 		static Config* addConfig(llvm::Module* m, retdec::config::Config& c);
-		static Config* getConfig(llvm::Module* m);
-		static bool getConfig(llvm::Module* m, Config*& c);
+		static Config* getConfig(const llvm::Module* m);
+		static bool getConfig(const llvm::Module* m, Config*& c);
 		static void doFinalization(llvm::Module* m);
 		static void clear();
 
 	private:
-		static std::map<llvm::Module*, Config> _module2config;
+		static std::map<const llvm::Module*, Config> _module2config;
 };
 
 } // namespace bin2llvmir

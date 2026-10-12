@@ -6,11 +6,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 
+#include "retdec/bin2llvmir/providers/config.h"
 #include "retdec/llvmir2hll/analysis/indirect_func_ref_analysis.h"
 #include "retdec/llvmir2hll/analysis/null_pointer_analysis.h"
 #include "retdec/llvmir2hll/analysis/special_fp_analysis.h"
@@ -527,8 +530,54 @@ void CHLLWriter::visit(ShPtr<GlobalVarDef> varDef) {
 	if (!global && machine) global = machine->getGlobalVariable(var->getName());
 	auto *array = global ? llvm::dyn_cast<llvm::ArrayType>(global->getValueType()) : nullptr;
 	bool incomplete = array && array->getNumElements() == 0 && global->isDeclaration();
+	bool conditional = false;
+	if (auto* marker = global ? global->getMetadata("retdec.original.address-view") : nullptr) {
+		auto* provider = bin2llvmir::ConfigProvider::getConfig(machine);
+		if (!provider || !provider->getConfig().parameters.isOriginalOnlyReturnRecovery()
+				|| !provider->getConfig().architecture.isMipsOrPic32() || marker->getNumOperands() != 5)
+			throw std::runtime_error("invalid-original-address-view-marker");
+		auto* owner = llvm::dyn_cast<llvm::MDString>(marker->getOperand(0).get());
+		auto* identity = llvm::dyn_cast<llvm::MDString>(marker->getOperand(1).get());
+		auto number = [&](unsigned index) -> std::optional<uint64_t> {
+			auto* value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(marker->getOperand(index));
+			return value && value->getType()->isIntegerTy(64) ? std::optional<uint64_t>{value->getZExtValue()} : std::nullopt;
+		};
+		auto index = number(2), start = number(3), width = number(4);
+		const auto& retained = provider->getConfig();
+		const auto& scope = retained.parameters.getOriginalCallScope();
+		auto* source = owner ? retained.functions.getFunctionByName(owner->getString().str()) : nullptr;
+		if (!source || !identity || !index || !start || !width || !scope || !source->sharedOriginalAddressViews
+				|| *index >= source->sharedOriginalAddressViews->size() || !source->returnDisposition || !source->originalCallSummary
+				|| source->getStart() != retained.parameters.getEntryPoint())
+			throw std::runtime_error("unbound-original-address-view-marker");
+		const auto& summary = *source->originalCallSummary;
+		const auto& disposition = *source->returnDisposition;
+		const auto& evidence = disposition.evidence;
+		bool ordinary = source->originalBodyCandidate
+			&& std::holds_alternative<common::OriginalOrdinaryBody>(*source->originalBodyCandidate)
+			&& disposition.kind == common::ReturnDisposition::Kind::Unknown;
+		bool value = disposition.kind == common::ReturnDisposition::Kind::Value
+			&& summary.result.isComplete() && summary.declaration.isComplete();
+		auto& view = source->sharedOriginalAddressViews->at(*index);
+		auto type = cast<IntType>(var->getType());
+		if ((!ordinary && !value) || !summary.entry.isComplete() || !summary.control.isComplete()
+				|| !evidence.decodeComplete || !evidence.analysisComplete || !evidence.calls.empty()
+				|| evidence.symbol != source->getName() || evidence.selection != "selected-root"
+				|| evidence.start != scope->root.start || evidence.end != scope->root.end
+				|| summary.function != scope->root.key || identity->getString() != summary.function
+				|| view.start != *start || view.width != *width || view.accessPcs.empty()
+				|| (view.width != 8 && view.width != 16 && view.width != 32)
+				|| !global->isDeclaration() || global->isConstant() || global->hasInitializer()
+				|| global->getAddressSpace() || !global->getValueType()->isIntegerTy(view.width)
+				|| !type || type->getSize() != view.width || var->isVolatile() || init
+				|| var->getInitialName() != global->getName().str()
+				|| (view.symbol != global->getName().str() && view.symbol != var->getName()))
+			throw std::runtime_error("invalid-original-address-view-emission");
+		view.symbol = var->getName();
+		conditional = true;
+	}
 	bool externalObject = !incomplete && global && global->isDeclaration()
-		&& var->isVolatile();
+		&& (var->isVolatile() || conditional);
 
 	if (incomplete) {
 		out->keyword("extern");

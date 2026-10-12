@@ -743,7 +743,7 @@ void Config::tagFunctionsWithUsedCryptoGlobals()
 //=============================================================================
 //
 
-std::map<llvm::Module*, Config> ConfigProvider::_module2config;
+std::map<const llvm::Module*, Config> ConfigProvider::_module2config;
 
 Config* ConfigProvider::addConfig(llvm::Module* m, retdec::config::Config& c)
 {
@@ -751,13 +751,13 @@ Config* ConfigProvider::addConfig(llvm::Module* m, retdec::config::Config& c)
 	return &p.first->second;
 }
 
-Config* ConfigProvider::getConfig(llvm::Module* m)
+Config* ConfigProvider::getConfig(const llvm::Module* m)
 {
 	auto f = _module2config.find(m);
 	return f != _module2config.end() ? &f->second : nullptr;
 }
 
-bool ConfigProvider::getConfig(llvm::Module* m, Config*& c)
+bool ConfigProvider::getConfig(const llvm::Module* m, Config*& c)
 {
 	c = getConfig(m);
 	return c != nullptr;

@@ -8,6 +8,7 @@
 #define RETDEC_COMMON_FUNCTION_H
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <map>
 #include <utility>
@@ -149,6 +150,12 @@ struct OriginalMemoryAccess {
 	OriginalFact currentContents = OriginalFact::partial("runtime-contents-unresolved");
 	OriginalFact aliasEffects = OriginalFact::partial("alias-effects-unresolved");
 	OriginalFact placement = OriginalFact::partial("object-placement-unresolved");
+};
+struct OriginalAddressSpanView {
+	std::string symbol;
+	uint32_t start = 0;
+	unsigned width = 0;
+	std::vector<uint64_t> accessPcs;
 };
 struct OriginalFunctionSummary {
 	std::string function;
@@ -431,6 +438,7 @@ class Function : public retdec::common::AddressRange
 		common::Type returnType;
 		std::optional<ReturnDisposition> returnDisposition;
 		std::optional<OriginalFunctionSummary> originalCallSummary;
+		std::shared_ptr<std::vector<OriginalAddressSpanView>> sharedOriginalAddressViews;
 		std::optional<OriginalCalleeContexts> originalCalleeContexts;
 		std::optional<OriginalDiscoveredFunction> originalDiscovered;
 		std::vector<OriginalJumpTableContext> originalJumpTables;

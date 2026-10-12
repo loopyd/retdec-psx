@@ -104,6 +104,15 @@ load-delay-safe constant chains in the complete original control flow. Initial
 file bytes identify static backing from the active image owner. Object extents,
 qualifiers, runtime contents and memory effects remain separate obligations.
 
+Call-free original-only bodies with an observed byte access inside a 16- or 32-bit
+scalar span may use conditional scalar address views. Accesses require fixed,
+aligned RAM addresses and complete backing from active images. Overlapping bytes
+use character pointers into the same scalar. The `originalAddressViews` output
+records emitted symbols, addresses, widths and original access PCs for
+measurement bindings.
+These views provide no historical object declaration, initializer, qualifier or
+runtime-content proof.
+
 Original-only recovery can emit conditional C89 body proposals for supported
 straight-line code with direct calls. It retains unresolved return, call, memory
 and declaration facts. This path rejects indirect and exceptional control,

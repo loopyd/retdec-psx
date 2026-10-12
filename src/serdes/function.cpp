@@ -452,6 +452,23 @@ void serialize(Writer& writer, const common::Function& f)
             && std::holds_alternative<common::OriginalEntryStackWordBody>(*f.originalBodyCandidate));
     if (f.returnDisposition) disposition(writer, *f.returnDisposition);
     if (f.originalCallSummary) summary(writer, *f.originalCallSummary);
+	if (f.sharedOriginalAddressViews) {
+		if (f.sharedOriginalAddressViews->empty() || f.sharedOriginalAddressViews->size() > common::ReturnDisposition::RowLimit)
+			throw std::runtime_error("invalid-original-address-view-count");
+		writer.Key("originalAddressViews"); writer.StartArray();
+		for (const auto& view : *f.sharedOriginalAddressViews) {
+			if (view.symbol.empty() || (view.width != 8 && view.width != 16 && view.width != 32)
+					|| view.accessPcs.empty() || view.accessPcs.size() > common::ReturnDisposition::ReferenceLimit
+					|| !std::is_sorted(view.accessPcs.begin(), view.accessPcs.end())
+					|| std::adjacent_find(view.accessPcs.begin(), view.accessPcs.end()) != view.accessPcs.end())
+				throw std::runtime_error("invalid-original-address-view");
+			writer.StartObject(); writer.Key("kind"); writer.String("conditional-scalar-address-view/v1");
+			writer.Key("symbol"); writer.String(view.symbol); writer.Key("start"); writer.Uint(view.start);
+			writer.Key("width"); writer.Uint(view.width); numbers(writer, "accessPcs", view.accessPcs);
+			writer.EndObject();
+		}
+		writer.EndArray();
+	}
 	if (f.originalDiscovered) {
 		const auto& node = *f.originalDiscovered;
 		writer.Key("originalDiscovered"); writer.StartObject();
@@ -588,6 +605,9 @@ SERIALIZE_EXPLICIT_INSTANTIATION(common::Function)
 
 void deserialize(const rapidjson::Value& val, common::Function& f)
 {
+	f.sharedOriginalAddressViews.reset();
+	if (val.IsObject() && val.HasMember("originalAddressViews"))
+		throw std::runtime_error("original-address-views-is-invocation-output-only");
 	if (val.IsNull() || !val.IsObject())
 	{
 		return;
