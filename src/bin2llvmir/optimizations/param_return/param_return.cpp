@@ -652,10 +652,15 @@ bool originalIdentityWriter(const OriginalIdentityFlow& flow, uint64_t pc, unsig
             || state->mayPending[reg] || !state->mayNoPending[reg]) return false;
         const auto& row = *instruction->second;
         if (!row.mapped || row.undef || row.bytes != 4 || pc % 4 || row.owner != flow.symbol) return false;
+        auto operation = originalOperation(row);
+        if (operation.kind == MipsOperation::Call) return false;
+        auto context = flow.states.lower_bound({pc, 0})->first.second;
+        if (context) {
+            auto owner = flow.instructions.find(context);
+            if (owner == flow.instructions.end() || originalOperation(*owner->second).kind == MipsOperation::Call) return false;
+        }
         if (point.second) {
-            auto operation = originalOperation(row);
-            if (operation.kind == MipsOperation::Call || operation.kind == MipsOperation::Trap
-                || operation.kind == MipsOperation::Unsupported) return false;
+            if (operation.kind == MipsOperation::Trap || operation.kind == MipsOperation::Unsupported) return false;
             if (std::find(operation.destinations.begin(), operation.destinations.end(), reg) != operation.destinations.end()) {
                 if (operation.kind == MipsOperation::Load || expected != std::optional<uint64_t>{pc}
                     || std::count(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), reg) != 1) return false;
@@ -1550,7 +1555,11 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
     const FileImage* image, const common::OriginalCallScope& scope, const config::Parameters& parameters,
     const std::map<uint64_t, common::OriginalMemoryAccess>& flowAccesses)
 {
-    for (auto& access : summary.accesses) access.address = common::OriginalFact::partial("original-address-proof-unresolved");
+    for (auto& access : summary.accesses) {
+        const auto* flow = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&access.address);
+        if (!flow || flow->derivation != common::OriginalEntryRelativeMemoryAddress::Derivation::Flow)
+            access.address = common::OriginalFact::partial("original-address-proof-unresolved");
+    }
     const auto& evidence = disposition.evidence;
     if (!evidence.analysisComplete || !evidence.decodeComplete || !summary.control.isComplete()
         || summary.exits.empty() || !evidence.calls.empty() || summary.pendingEntry != "requires-no-pending-gpr-loads"
@@ -2317,6 +2326,17 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 			for (const auto& exit : evidence.exits)
 				value &= !exit.missing && !exit.definitions.empty() && exit.bad.empty();
 			if (revised) {
+                bool flowComplete = imageView && evidence.decodeComplete && evidence.analysisComplete
+                    && summary.pendingEntry == "requires-no-pending-gpr-loads"
+                    && evidence.start % 4 == 0 && evidence.end % 4 == 0 && evidence.start < evidence.end
+                    && instructions.size() == (evidence.end - evidence.start) / 4
+                    && std::all_of(branchPaths.begin(), branchPaths.end(),
+                        [](const auto& branch) { return branch.second == BothBranchPaths; });
+                if (!flowComplete) for (auto& pair : accesses) {
+                    const auto* flow = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&pair.second.address);
+                    if (flow && flow->derivation == common::OriginalEntryRelativeMemoryAddress::Derivation::Flow)
+                        pair.second.address = common::OriginalFact::partial("original-address-proof-unresolved");
+                }
                 summarizeOriginal(summary, disposition, exitStates, sampledTargets, demands, accesses, graph.unavailable.count(evidence.start));
             }
             auto* v0 = _abi->getRegister(MIPS_REG_V0);
