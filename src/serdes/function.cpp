@@ -214,6 +214,26 @@ void summary(Writer& writer, const retdec::common::OriginalFunctionSummary& valu
         }
         writer.EndArray(); writer.EndObject();
     }
+    if (value.symbolicFrame) {
+        const auto& frame = *value.symbolicFrame;
+        writer.Key("symbolicFrame"); writer.StartObject();
+        writer.Key("kind"); writer.String("mips-symbolic-frame-restoration/v1");
+        writer.Key("entryPc"); writer.Uint(frame.entryPc);
+        writer.Key("frameBytes"); writer.Uint(frame.frameBytes);
+        strings(writer, "conditions", std::vector<std::string>{"settled-entry-loads-and-mips-i-delays",
+            "aligned-whole-frame-in-ordinary-ram", "frame-writes-disjoint-from-fetched-code",
+            "ordinary-ram-mapping-and-cache-mode-remain-active", "original-instructions-and-call-bindings-remain-active",
+            "accesses-and-instruction-fetches-complete-normally", "no-asynchronous-or-external-state-interference"});
+        writer.Key("registers"); writer.StartArray();
+        for (const auto& restored : frame.registers) {
+            writer.StartObject(); writer.Key("register"); writer.Uint(restored.reg);
+            writer.Key("entrySpOffset"); writer.Int(restored.offset);
+            writer.Key("storePc"); writer.Uint64(restored.storePc);
+            numbers(writer, "loadPcs", restored.loadPcs); numbers(writer, "callPcs", restored.callPcs);
+            numbers(writer, "exitPcs", restored.exitPcs); writer.EndObject();
+        }
+        writer.EndArray(); writer.EndObject();
+    }
     numbers(writer, "parameterRegisters", value.parameterRegisters);
     writer.Key("demands"); writer.StartArray();
     for (const auto& row : value.demands) {

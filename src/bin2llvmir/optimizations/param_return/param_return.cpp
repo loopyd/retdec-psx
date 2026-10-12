@@ -449,7 +449,8 @@ bool canProposeOrdinaryBody(const common::Function& function)
 		|| evidence.exits.size() != 1 || !ordinaryBodyLayout(evidence)) return false;
 	if (std::any_of(evidence.obligations.begin(), evidence.obligations.end(), [](const auto& row) {
 		return row.domain == "architectural" && (row.reason == "conditional-callee-preservation-unresolved"
-			|| row.reason == "conditional-callee-assigned-transfer-unresolved");
+			|| row.reason == "conditional-callee-assigned-transfer-unresolved"
+            || row.reason == "conditional-symbolic-frame-restoration-unresolved");
 	})) return false;
 	const auto& exit = evidence.exits.front();
 	if (exit.pc != evidence.end - 8 || exit.delaySlot != evidence.end - 4 || exit.missing
@@ -549,163 +550,6 @@ unsigned originalBranchPaths(const Disposition::Instruction& row, const Register
         || (right.constant && (*right.constant & ~left.possibleOnes()))) equal = false;
     else return BothBranchPaths;
     return equal == (opcode == 4) ? BranchTaken : BranchFallthrough;
-}
-
-struct OriginalEntryOffset {
-    unsigned entry;
-    uint32_t offset = 0;
-    std::set<uint64_t> evidence;
-    bool adjusted = false;
-};
-struct OriginalIdentityFlow {
-    uint64_t start;
-    const std::string& symbol;
-    const std::map<uint64_t, const Disposition::Instruction*>& instructions;
-    const std::map<unsigned, Disposition::Definition>& definitions;
-    const std::map<std::pair<uint64_t, uint64_t>, RegisterState>& states;
-    const std::multimap<uint64_t, const Disposition::Edge*>& incoming;
-    const std::map<uint64_t, Disposition::Call>& calls;
-};
-
-bool originalIdentityCall(const OriginalIdentityFlow& flow, uint64_t pc, unsigned reg)
-{
-    auto call = flow.calls.find(pc);
-    auto instruction = flow.instructions.find(pc), delay = flow.instructions.find(pc + 4);
-    if (pc > UINT32_MAX - 8 || reg >= Disposition::RegisterCount || call == flow.calls.end()
-        || instruction == flow.instructions.end() || delay == flow.instructions.end()
-        || call->second.pc != pc || !call->second.contract || instruction->second->word >> 26 != 3
-        || call->second.target != originalOperation(*instruction->second).target) return false;
-    const auto* proof = std::get_if<common::OriginalPartialCall>(&*call->second.contract);
-    if (!proof) proof = &std::get<common::OriginalCompleteCall>(*call->second.contract).proof();
-    if (proof->callee.empty() || !proof->identity.isComplete() || !proof->inputs.isComplete()
-        || !proof->control.isComplete() || !proof->transfers.isComplete()
-        || proof->delay != pc + 4 || proof->continuation != pc + 8
-        || proof->actualIncomingLink != std::optional<uint32_t>{uint32_t(pc + 8)}
-        || proof->registerTransfers.size() != Disposition::RegisterCount) return false;
-    for (unsigned i = 0; i < Disposition::RegisterCount; ++i) {
-        const auto& transfer = proof->registerTransfers[i];
-        if (transfer.reg != i || !transfer.proof.isComplete() || transfer.pending
-            || !transfer.mayNoPending || !transfer.pendingDefinitions.empty()) return false;
-    }
-    const auto& transfer = proof->registerTransfers[reg];
-    if (transfer.kind != "preserved" || transfer.equalEntry != std::optional<unsigned>{reg}) return false;
-    for (const auto* row : {instruction->second, delay->second}) {
-        if (!row->mapped || row->undef || row->bytes != 4 || row->pc % 4 || row->owner != flow.symbol) return false;
-        auto operation = originalOperation(*row);
-        if (std::find(operation.destinations.begin(), operation.destinations.end(), reg) != operation.destinations.end()) return false;
-    }
-    return true;
-}
-
-const RegisterState* originalIdentityState(const OriginalIdentityFlow& flow, uint64_t pc)
-{
-    auto state = flow.states.lower_bound({pc, 0});
-    if (state == flow.states.end() || state->first.first != pc) return nullptr;
-    auto next = state; ++next;
-    return next != flow.states.end() && next->first.first == pc ? nullptr : &state->second;
-}
-
-bool originalIdentityWriter(const OriginalIdentityFlow& flow, uint64_t pc, unsigned reg,
-    std::optional<uint64_t> expected, bool after = false)
-{
-    std::vector<std::pair<uint64_t, bool>> pending{{pc, after}};
-    std::set<uint64_t> visited;
-    unsigned terminals = 0, references = 0;
-    while (!pending.empty()) {
-        auto point = pending.back(); pending.pop_back();
-        pc = point.first;
-        if (point.second && !visited.insert(pc).second) continue;
-        if (visited.size() > Disposition::RowLimit) return false;
-        auto instruction = flow.instructions.find(pc);
-        const auto* state = originalIdentityState(flow, pc);
-        if (instruction == flow.instructions.end() || !state
-            || state->mayPending[reg] || !state->mayNoPending[reg]) return false;
-        const auto& row = *instruction->second;
-        if (!row.mapped || row.undef || row.bytes != 4 || pc % 4 || row.owner != flow.symbol) return false;
-        auto operation = originalOperation(row);
-        if (operation.kind == MipsOperation::Call && !originalIdentityCall(flow, pc, reg)) return false;
-        auto context = flow.states.lower_bound({pc, 0})->first.second;
-        if (context) {
-            auto owner = flow.instructions.find(context);
-            if (owner == flow.instructions.end()
-                || (originalOperation(*owner->second).kind == MipsOperation::Call
-                    && !originalIdentityCall(flow, context, reg))) return false;
-        }
-        if (point.second) {
-            if (operation.kind == MipsOperation::Trap || operation.kind == MipsOperation::Unsupported) return false;
-            if (std::find(operation.destinations.begin(), operation.destinations.end(), reg) != operation.destinations.end()) {
-                if (operation.kind == MipsOperation::Load || expected != std::optional<uint64_t>{pc}
-                    || std::count(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), reg) != 1) return false;
-                ++terminals; continue;
-            }
-        }
-        if ((*state)[reg].missing) return false;
-        if (pc == flow.start) {
-            if (expected) return false;
-            ++terminals;
-        }
-        auto predecessors = flow.incoming.equal_range(pc);
-        if (predecessors.first == predecessors.second) {
-            if (pc == flow.start) continue;
-            return false;
-        }
-        for (auto edge = predecessors.first; edge != predecessors.second; ++edge) {
-            if (++references > Disposition::ReferenceLimit) return false;
-            pending.emplace_back(edge->second->from, true);
-        }
-    }
-    return terminals != 0;
-}
-
-std::optional<OriginalEntryOffset> originalEntryOffset(unsigned id, const OriginalIdentityFlow& flow)
-{
-    OriginalEntryOffset result{};
-    std::set<unsigned> visited;
-    std::vector<const Disposition::Definition*> chain;
-    while (true) {
-        if (!visited.insert(id).second || visited.size() > 128) return {};
-        auto found = flow.definitions.find(id);
-        if (found == flow.definitions.end()) return {};
-        const auto& definition = found->second;
-        auto instruction = flow.instructions.find(definition.pc);
-        const auto* state = originalIdentityState(flow, definition.pc);
-        if (instruction == flow.instructions.end() || !state || definition.origin != "instruction"
-            || definition.width != 32 || definition.delayed || definition.constant
-            || !definition.reg || definition.reg >= Disposition::GprCount || definition.inputs.size() > 1) return {};
-        const auto& row = *instruction->second;
-        unsigned op = row.word >> 26, rs = (row.word >> 21) & 31, rt = (row.word >> 16) & 31;
-        bool copy = op == 0 && (row.word & 63) == 33 && ((row.word >> 6) & 31) == 0 && bool(rs) != bool(rt);
-        unsigned source = op == 9 ? rs : rs ? rs : rt;
-        unsigned destination = op == 9 ? rt : (row.word >> 11) & 31;
-        if ((op != 9 && !copy) || !source || destination != definition.reg
-            || definition.operation != (op == 9 ? "integer-immediate" : "integer-binary")
-            || !row.mapped || row.undef || row.bytes != 4 || row.pc % 4 || row.owner != flow.symbol
-            || std::count(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), destination) != 1
-            || (*state)[source].missing || state->mayPending[source] || !state->mayNoPending[source]
-            || state->mayPending[destination] || !state->mayNoPending[destination]
-            || definition.inputs != std::vector<unsigned>((*state)[source].definitions.begin(), (*state)[source].definitions.end())) return {};
-        std::optional<uint64_t> writer;
-        if (!definition.inputs.empty()) {
-            auto input = flow.definitions.find(definition.inputs.front());
-            if (input == flow.definitions.end() || input->second.reg != source) return {};
-            writer = input->second.pc;
-        }
-        if (!originalIdentityWriter(flow, row.pc, source, writer)) return {};
-        if (op == 9) {
-            result.offset += uint32_t(int32_t(int16_t(row.word & 0xffff)));
-            result.adjusted |= (row.word & 0xffff) != 0;
-        }
-        result.evidence.insert(row.pc); chain.push_back(&definition);
-        if (!definition.inputs.empty()) { id = definition.inputs.front(); continue; }
-        const auto& entry = flow.states.at({flow.start, 0})[source];
-        if (entry.missing || entry.equalEntry != std::optional<unsigned>{source}
-            || entry.entries != std::set<unsigned>{source}) return {};
-        for (const auto* member : chain)
-            if (member->entries != std::vector<unsigned>{source}
-                || member->formals != std::vector<unsigned>(entry.formals.begin(), entry.formals.end())
-                || member->bad != std::vector<std::string>(entry.bad.begin(), entry.bad.end())) return {};
-        result.entry = source; return result;
-    }
 }
 
 common::OriginalTransfer transferFact(unsigned reg, const RegisterState& state, bool covered)
@@ -1705,7 +1549,8 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     std::map<unsigned, Disposition::Definition>& definitions,
     std::map<std::tuple<uint64_t, unsigned, bool>, unsigned>& ids,
     std::set<std::tuple<uint64_t, unsigned, std::string>>& demands,
-    Disposition::Evidence& evidence, Config& config, const OriginalCalleePreservation& preservation)
+    Disposition::Evidence& evidence, Config& config, const OriginalCalleePreservation& preservation,
+    std::map<uint64_t, OriginalFrameContract>& frameUses, bool allowFrames)
 {
     common::OriginalPartialCall proof;
     proof.delay = call.pc + 4; proof.continuation = call.pc + 8;
@@ -1755,6 +1600,9 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
         proof.registerTransfers = summary->transfers;
     }
     auto scoped = summary ? ScopedCallTransfer::bind(call, proof, *summary, before) : std::nullopt;
+    auto frame = summary && allowFrames ? OriginalFrameContract::bind(call, proof, *summary, before) : std::nullopt;
+    if (frame) frameUses.insert_or_assign(call.pc, *frame);
+    else frameUses.erase(call.pc);
     bool conditionalAssigned = false;
     bool transfers = summary && summary->transfers.size() == Disposition::RegisterCount && proof.control.isComplete() && !pending;
     for (unsigned reg = 1; reg < Disposition::RegisterCount; ++reg) {
@@ -1773,7 +1621,9 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
         bool usable = transfer && transfer->reg == reg && transfer->proof.isComplete() && !transfer->pending && proof.control.isComplete() && !pending;
         transfers &= usable;
         if (usable && transfer->kind == "preserved") { state[reg] = before[reg]; continue; }
-        bool scopedAssigned = !usable && scoped && transfer == &scoped->transfer();
+        if (!usable && frame && frame->preserves(reg)) { state[reg] = before[reg]; continue; }
+        bool scopedAssigned = !usable && ((scoped && transfer == &scoped->transfer())
+            || (frame && transfer == frame->assignedResult(before)));
         if ((usable || scopedAssigned) && transfer->kind == "assigned" && callee && !transfer->definitions.empty()) {
             RegisterFact output; output.missing = false;
             for (auto entry : transfer->entries) {
@@ -1811,11 +1661,12 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     if (summary && !proof.effects.isComplete() && evidence.obligations.size() < Disposition::RowLimit
         && std::none_of(evidence.obligations.begin(), evidence.obligations.end(), [&](const auto& row) { return row.pc == call.pc && row.reason == "callee-memory-effects-unresolved"; }))
         evidence.obligations.push_back({call.pc, "memory", "callee-memory-effects-unresolved"});
-    if (conditionalPreservation || conditionalAssigned) {
+    if (conditionalPreservation || conditionalAssigned || frame) {
         state.conditionalCallees.insert(call.pc);
         if (state.conditionalCallees.size() > Disposition::ReferenceLimit)
             throw std::runtime_error("conditional-callee-references-exhausted");
-        const std::string reason = conditionalAssigned ? "conditional-callee-assigned-transfer-unresolved" : "conditional-callee-preservation-unresolved";
+        const std::string reason = frame ? "conditional-symbolic-frame-restoration-unresolved"
+            : conditionalAssigned ? "conditional-callee-assigned-transfer-unresolved" : "conditional-callee-preservation-unresolved";
         if (std::none_of(evidence.obligations.begin(), evidence.obligations.end(), [&](const auto& row) {
             return row.pc == call.pc && row.domain == "architectural" && row.reason == reason;
         })) {
@@ -2095,6 +1946,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                 _config->getConfig().parameters, evidence, instructions, imageView);
 			RegisterState entry;
             const auto& observation = _config->getConfig().parameters.getOriginalEntryObservation();
+            std::map<uint64_t, OriginalFrameContract> frameUses;
             entry.storage = OriginalMemoryState::bind(observation ? &*observation : nullptr,
                 summary.function, extent.imageId, imageView && imageView->owner ? imageView->owner->fileHash : "", evidence);
             entry.mayNoPending.fill(true);
@@ -2323,7 +2175,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 					}
 					else if (branch.kind == MipsOperation::Call) {
 						auto& call = calls[owner]; call.pc = owner; call.target = branch.target;
-                        if (revised) composeOriginalCall(call, state, graph, definitions, ids, demands, evidence, *_config, calleePreservation);
+                        if (revised) composeOriginalCall(call, state, graph, definitions, ids, demands, evidence, *_config, calleePreservation, frameUses, !observation);
                         else {
                             call.unresolved = {"argument-result-effect-contract-unresolved"};
                             for (unsigned reg = 1; reg < Disposition::RegisterCount; ++reg) {
@@ -2358,10 +2210,11 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 			for (const auto& edge : edges) evidence.edges.push_back({std::get<0>(edge), std::get<1>(edge),
 				std::get<2>(edge) ? std::optional<uint64_t>(std::get<2>(edge)) : std::nullopt, std::get<3>(edge)});
             if (revised && std::none_of(evidence.obligations.begin(), evidence.obligations.end(),
-                [](const auto& row) { return row.domain == "architectural"; })) {
+                [](const auto& row) { return row.domain == "architectural"
+                    && row.reason != "conditional-symbolic-frame-restoration-unresolved"; })) {
                 std::multimap<uint64_t, const Disposition::Edge*> incoming;
                 for (const auto& edge : evidence.edges) incoming.emplace(edge.to, &edge);
-                OriginalIdentityFlow flow{evidence.start, evidence.symbol, instructions, definitions, states, incoming, calls};
+                OriginalIdentityFlow flow{evidence.start, evidence.symbol, instructions, definitions, states, incoming, calls, originalOperation, &frameUses};
                 for (auto& pair : definitions) {
                     auto& definition = pair.second;
                     if (definition.equalEntry) continue;
@@ -2400,10 +2253,14 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 			for (auto& pair : definitions) {
 				references += pair.second.inputs.size() + pair.second.formals.size() + pair.second.bad.size();
 				if (references > Disposition::ReferenceLimit) throw std::runtime_error("return-references-exhausted");
-				evidence.definitions.push_back(std::move(pair.second));
+				if (observation) evidence.definitions.push_back(std::move(pair.second));
+                else evidence.definitions.push_back(pair.second);
 			}
 			for (auto& pair : exits) evidence.exits.push_back(std::move(pair.second));
-			for (auto& pair : calls) evidence.calls.push_back(std::move(pair.second));
+			for (auto& pair : calls) {
+                if (observation) evidence.calls.push_back(std::move(pair.second));
+                else evidence.calls.push_back(pair.second);
+            }
 			evidence.decodeComplete = std::none_of(evidence.obligations.begin(), evidence.obligations.end(),
 				[](const auto& row) { return row.domain == "architectural"; });
 			evidence.analysisComplete = true;
@@ -2413,7 +2270,10 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 			for (const auto& exit : evidence.exits)
 				value &= !exit.missing && !exit.definitions.empty() && exit.bad.empty();
 			if (revised) {
-                bool flowComplete = imageView && evidence.decodeComplete && evidence.analysisComplete
+                bool flowComplete = imageView && evidence.analysisComplete
+                    && (evidence.decodeComplete || std::none_of(evidence.obligations.begin(), evidence.obligations.end(),
+                        [](const auto& row) { return row.domain == "architectural"
+                            && row.reason != "conditional-symbolic-frame-restoration-unresolved"; }))
                     && summary.pendingEntry == "requires-no-pending-gpr-loads"
                     && evidence.start % 4 == 0 && evidence.end % 4 == 0 && evidence.start < evidence.end
                     && instructions.size() == (evidence.end - evidence.start) / 4
@@ -2427,7 +2287,15 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                         pair.second.address = common::OriginalFact::partial("original-address-proof-unresolved");
                 }
                 summarizeOriginal(summary, disposition, exitStates, sampledTargets, demands, accesses, graph.unavailable.count(evidence.start));
-                if (flowComplete && summary.entry.isComplete()) OriginalMemoryState::summarize(summary, exitStates);
+                if (flowComplete && summary.entry.isComplete()) {
+                    OriginalMemoryState::summarize(summary, exitStates);
+                    if (!observation) {
+                        std::multimap<uint64_t, const Disposition::Edge*> incoming;
+                        for (const auto& edge : evidence.edges) incoming.emplace(edge.to, &edge);
+                        OriginalIdentityFlow flow{evidence.start, evidence.symbol, instructions, definitions, states, incoming, calls, originalOperation, &frameUses};
+                        summary.symbolicFrame = OriginalFrameContract::recover(flow, evidence, summary, exitStates, sampledTargets);
+                    }
+                }
             }
             auto* v0 = _abi->getRegister(MIPS_REG_V0);
 			value &= v0 && v0->getValueType()->isIntegerTy(32);
@@ -2503,6 +2371,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
             evidence.definitions.clear(); evidence.edges.clear(); evidence.exits.clear(); evidence.calls.clear();
             cf->originalJumpTables.clear();
             summary.scopedRestoration.reset();
+            summary.symbolicFrame.reset();
             summary.noMemoryWrites = common::OriginalFact::partial("native-analysis-failed");
             for (auto& access : summary.accesses) access.address = common::OriginalFact::partial("native-analysis-failed");
             if (evidence.obligations.size() < Disposition::RowLimit)

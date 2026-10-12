@@ -56,6 +56,16 @@ struct OriginalScopedRestoration {
 	};
 	std::vector<Register> registers;
 };
+struct OriginalSymbolicFrame {
+    uint32_t entryPc = 0, frameBytes = 0;
+    struct Register {
+        unsigned reg = 0;
+        int32_t offset = 0;
+        uint64_t storePc = 0;
+        std::vector<uint64_t> loadPcs, callPcs, exitPcs;
+    };
+    std::vector<Register> registers;
+};
 struct OriginalDiscoveredFunction {
 	std::string key, target, imageId, contextHash;
 	uint64_t start = 0, end = 0;
@@ -185,6 +195,7 @@ struct OriginalFunctionSummary {
 	std::vector<unsigned> parameterRegisters;
 	std::string pendingEntry = "requires-no-pending-gpr-loads";
 	std::optional<OriginalScopedRestoration> scopedRestoration;
+	std::optional<OriginalSymbolicFrame> symbolicFrame;
 };
 struct OriginalInputBinding {
 	unsigned reg = 0;

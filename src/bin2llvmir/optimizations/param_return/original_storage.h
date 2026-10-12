@@ -87,6 +87,43 @@ struct MipsOperation {
 	bool conditional = false;
 	std::string name = "unsupported";
 };
+struct OriginalEntryOffset {
+    unsigned entry;
+    uint32_t offset = 0;
+    std::set<uint64_t> evidence;
+    bool adjusted = false;
+};
+struct OriginalIdentityFlow;
+class OriginalFrameContract {
+    const common::OriginalFunctionSummary* _summary;
+    OriginalFrameContract(const common::OriginalFunctionSummary& summary)
+        : _summary(&summary) {}
+public:
+    static std::optional<common::OriginalSymbolicFrame> recover(const OriginalIdentityFlow& flow,
+        const Disposition::Evidence& evidence, const common::OriginalFunctionSummary& summary,
+        const std::map<uint64_t, RegisterState>& exits, const std::map<uint64_t, RegisterFact>& sampled);
+    static std::optional<OriginalFrameContract> bind(const Disposition::Call& call,
+        const common::OriginalPartialCall& proof, const common::OriginalFunctionSummary& summary,
+        const RegisterState& before);
+    bool preserves(unsigned reg) const;
+    const common::OriginalTransfer* assignedResult(const RegisterState& before) const;
+};
+struct OriginalIdentityFlow {
+    uint64_t start;
+    const std::string& symbol;
+    const std::map<uint64_t, const Disposition::Instruction*>& instructions;
+    const std::map<unsigned, Disposition::Definition>& definitions;
+    const std::map<std::pair<uint64_t, uint64_t>, RegisterState>& states;
+    const std::multimap<uint64_t, const Disposition::Edge*>& incoming;
+    const std::map<uint64_t, Disposition::Call>& calls;
+    MipsOperation (*operation)(const Disposition::Instruction&);
+    const std::map<uint64_t, OriginalFrameContract>* frameUses = nullptr;
+};
+const RegisterState* originalIdentityState(const OriginalIdentityFlow& flow, uint64_t pc);
+bool originalIdentityCall(const OriginalIdentityFlow& flow, uint64_t pc, unsigned reg);
+bool originalIdentityWriter(const OriginalIdentityFlow& flow, uint64_t pc, unsigned reg,
+    std::optional<uint64_t> expected, bool after = false);
+std::optional<OriginalEntryOffset> originalEntryOffset(unsigned id, const OriginalIdentityFlow& flow);
 bool joinFact(RegisterFact& fact, const RegisterFact& incoming);
 bool joinState(RegisterState& destination, const RegisterState& incoming);
 } }
