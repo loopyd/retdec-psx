@@ -465,6 +465,7 @@ bool CHLLWriter::emitFileHeader() {
 }
 
 bool CHLLWriter::emitGlobalVariables() {
+	originalUnsignedByteViews.clear();
 	// See emitConstStruct() for a rationale behind setting the following
 	// variable.
 	emittingGlobalVarDefs = true;
@@ -581,6 +582,7 @@ void CHLLWriter::visit(ShPtr<GlobalVarDef> varDef) {
 					|| view.accessPcs != std::vector<uint64_t>{access.pc})
 				throw std::runtime_error("invalid-original-byte-read-view-emission");
 			var->setType(IntType::create(8, false));
+			originalUnsignedByteViews.insert(var);
 		}
 		view.symbol = var->getName();
 		conditional = true;
@@ -720,8 +722,13 @@ void CHLLWriter::visit(ShPtr<NegOpExpr> expr) {
 void CHLLWriter::emitBitPatternEquality(const std::string &op, ShPtr<BinaryOpExpr> expr) {
 	auto lhs = cast<IntType>(expr->getFirstOperand()->getType());
 	auto rhs = cast<IntType>(expr->getSecondOperand()->getType());
+	bool originalByteConstant = lhs && lhs->getSize() == 8
+		&& ((originalUnsignedByteViews.count(cast<Variable>(expr->getFirstOperand()))
+				&& isa<ConstInt>(expr->getSecondOperand()))
+			|| (originalUnsignedByteViews.count(cast<Variable>(expr->getSecondOperand()))
+				&& isa<ConstInt>(expr->getFirstOperand())));
 	if (!lhs || !rhs || lhs->getSize() != rhs->getSize()
-			|| lhs->isSigned() != rhs->isSigned()
+			|| (lhs->isSigned() != rhs->isSigned() && !originalByteConstant)
 			|| (lhs->getSize() != 8 && lhs->getSize() != 16)) {
 		emitBinaryOpExpr(op, expr);
 		return;

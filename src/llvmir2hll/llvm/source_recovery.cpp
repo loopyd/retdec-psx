@@ -1911,6 +1911,7 @@ void recoverOriginalAddressViews(llvm::Function& function, common::Function& sou
 	}
 	bool byteRead = value && ordered.size() == 1 && ordered.front()->kind == "read"
 		&& ordered.front()->width == 8 && ordered.front()->extension == "zero"
+		&& evidence.obligations.size() == 1
 		&& std::all_of(evidence.obligations.begin(), evidence.obligations.end(), [&](const auto& obligation) {
 			return obligation.domain == "memory" && obligation.pc == ordered.front()->pc
 				&& obligation.reason == "contents-object-address-alias-effect-placement-unresolved";
