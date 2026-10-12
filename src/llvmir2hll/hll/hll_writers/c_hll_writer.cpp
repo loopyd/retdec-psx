@@ -19,6 +19,7 @@
 #include "retdec/llvmir2hll/analysis/special_fp_analysis.h"
 #include "retdec/llvmir2hll/analysis/used_types_visitor.h"
 #include "retdec/llvmir2hll/config/config.h"
+#include "retdec/llvmir2hll/llvm/source_recovery.h"
 #include "retdec/llvmir2hll/hll/bracket_managers/c_bracket_manager.h"
 #include "retdec/llvmir2hll/hll/bracket_managers/no_bracket_manager.h"
 #include "retdec/llvmir2hll/hll/compound_op_manager.h"
@@ -560,9 +561,14 @@ void CHLLWriter::visit(ShPtr<GlobalVarDef> varDef) {
 		bool value = disposition.kind == common::ReturnDisposition::Kind::Value
 			&& summary.result.isComplete() && summary.declaration.isComplete();
 		auto& view = source->sharedOriginalAddressViews->at(*index);
+		bool scalar = view.kind == common::OriginalAddressSpanView::Kind::Scalar;
+		auto* ownerFunction = machine->getFunction(source->getName());
+		bool write = view.kind == common::OriginalAddressSpanView::Kind::IndependentByteWrite
+			&& ordinary && ownerFunction && validateOriginalByteWriteViews(*ownerFunction, *source, retained);
 		auto type = cast<IntType>(var->getType());
-		if ((!ordinary && !value) || !summary.entry.isComplete() || !summary.control.isComplete()
-				|| !evidence.decodeComplete || !evidence.analysisComplete || !evidence.calls.empty()
+		if ((!scalar && !write) || (!ordinary && !value) || !summary.entry.isComplete()
+				|| (!write && !summary.control.isComplete())
+				|| !evidence.decodeComplete || !evidence.analysisComplete || (!write && !evidence.calls.empty())
 				|| evidence.symbol != source->getName() || evidence.selection != "selected-root"
 				|| evidence.start != scope->root.start || evidence.end != scope->root.end
 				|| summary.function != scope->root.key || identity->getString() != summary.function
@@ -574,7 +580,7 @@ void CHLLWriter::visit(ShPtr<GlobalVarDef> varDef) {
 				|| var->getInitialName() != global->getName().str()
 				|| (view.symbol != global->getName().str() && view.symbol != var->getName()))
 			throw std::runtime_error("invalid-original-address-view-emission");
-		if (source->sharedOriginalAddressViews->size() == 1 && summary.accesses.size() == 1 && view.width == 8) {
+		if (scalar && source->sharedOriginalAddressViews->size() == 1 && summary.accesses.size() == 1 && view.width == 8) {
 			const auto& access = summary.accesses.front();
 			const auto* address = std::get_if<common::OriginalFixedMemoryAddress>(&access.address);
 			if (!value || access.kind != "read" || access.width != 8 || access.extension != "zero"

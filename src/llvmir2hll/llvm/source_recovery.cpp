@@ -4,6 +4,7 @@
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Support/KnownBits.h>
 #include "retdec/bin2llvmir/utils/llvm.h"
+#include "retdec/bin2llvmir/providers/asm_instruction.h"
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
@@ -1562,6 +1563,9 @@ private:
 				|| !source->returnDisposition || !source->originalCallSummary || !source->sharedOriginalAddressViews
 				|| source->sharedOriginalAddressViews->empty() || !source->getStart().isDefined() || !source->getEnd().isDefined()
 				|| source->getName() != machine->getName().str() || source->getStart() != retained.parameters.getEntryPoint()) return;
+		if (std::any_of(source->sharedOriginalAddressViews->begin(), source->sharedOriginalAddressViews->end(), [](const auto& view) {
+			return view.kind != common::OriginalAddressSpanView::Kind::Scalar;
+		})) return;
 		const auto& summary = *source->originalCallSummary;
 		const auto& evidence = source->returnDisposition->evidence;
 		bool ordinary = source->originalBodyCandidate
@@ -1751,6 +1755,191 @@ bool onlyLowBitsUsed(const llvm::Argument &arg, unsigned bits) {
 	return true;
 }
 
+bool originalScalarLocal(llvm::AllocaInst& local, const llvm::Function& function) {
+	auto* type = local.getAllocatedType();
+	if (local.getFunction() != &function || local.isArrayAllocation()
+			|| local.getType()->getPointerAddressSpace()
+			|| (!type->isIntegerTy(8) && !type->isIntegerTy(16) && !type->isIntegerTy(32))) return false;
+	for (auto* user : local.users()) {
+		auto* read = llvm::dyn_cast<llvm::LoadInst>(user);
+		auto* write = llvm::dyn_cast<llvm::StoreInst>(user);
+		if (read) {
+			if (read->getFunction() != &function || read->getPointerOperand() != &local
+					|| read->getType() != type || read->isVolatile() || read->isAtomic()) return false;
+		} else if (write) {
+			if (write->getFunction() != &function || write->getPointerOperand() != &local
+					|| write->getValueOperand()->getType() != type || write->isVolatile() || write->isAtomic()) return false;
+		} else return false;
+	}
+	return true;
+}
+
+std::optional<uint64_t> originalInstructionPc(const llvm::Instruction& instruction) {
+	auto* node = instruction.getMetadata("insn.addr");
+	auto* pc = node && node->getNumOperands() == 1
+		? llvm::mdconst::dyn_extract<llvm::ConstantInt>(node->getOperand(0)) : nullptr;
+	return pc && pc->getType()->isIntegerTy(64) ? std::optional<uint64_t>{pc->getZExtValue()} : std::nullopt;
+}
+
+struct ByteWriteCensus {
+	std::map<uint64_t, const common::OriginalMemoryAccess*> writes;
+	std::set<uint64_t> projectedLinkAccesses;
+	std::map<uint64_t, uint64_t> calls;
+	std::map<uint64_t, llvm::StoreInst*> stores;
+};
+
+std::optional<ByteWriteCensus> collectOriginalByteWriteCensus(llvm::Function& function,
+		const common::Function& source, const config::Config& config) {
+	const auto& scope = config.parameters.getOriginalCallScope();
+	const auto& context = config.parameters.getPsxMemoryContext();
+	const auto* body = source.originalBodyCandidate
+		? std::get_if<common::OriginalOrdinaryBody>(&*source.originalBodyCandidate) : nullptr;
+	if (!config.parameters.isOriginalOnlyReturnRecovery() || !config.architecture.isMipsOrPic32()
+			|| !scope || !context || !body || !source.returnDisposition || !source.originalCallSummary
+			|| !source.parameters.empty()
+			|| source.returnDisposition->kind != common::ReturnDisposition::Kind::Unknown
+			|| source.getName() != function.getName().str() || !source.getStart().isDefined()
+			|| !source.getEnd().isDefined() || source.getStart() != config.parameters.getEntryPoint()
+			|| function.isDeclaration() || !function.getReturnType()->isIntegerTy(32)
+			|| function.getParent()->getDataLayout().getPointerSizeInBits() != 32
+			|| !function.getParent()->getDataLayout().isLittleEndian()) return {};
+	const auto& evidence = source.returnDisposition->evidence;
+	const auto& summary = *source.originalCallSummary;
+	if (!summary.entry.isComplete() || summary.result.isComplete() || summary.declaration.isComplete()
+			|| summary.pendingEntry != "requires-no-pending-gpr-loads"
+			|| summary.exits.empty() || !evidence.decodeComplete || !evidence.analysisComplete
+			|| evidence.selection != "selected-root" || evidence.symbol != source.getName()
+			|| evidence.start != source.getStart().getValue() || evidence.end != source.getEnd().getValue()
+			|| scope->root.start != evidence.start || scope->root.end != evidence.end
+			|| scope->root.key != summary.function || summary.function.empty()
+			|| evidence.start >= evidence.end || evidence.start % 4 || evidence.end % 4
+			|| evidence.end > uint64_t(UINT32_MAX) + 1
+			|| evidence.instructions.size() != (evidence.end - evidence.start) / 4
+			|| evidence.instructions.size() > common::ReturnDisposition::RowLimit
+			|| summary.accesses.empty() || summary.accesses.size() > common::ReturnDisposition::RowLimit) return {};
+	auto instructions = context->resolve(evidence.start, evidence.end - evidence.start);
+	if (!instructions || instructions->image->id != scope->root.imageId
+			|| instructions->image->payloadHash != scope->payloadHash) return {};
+	ByteWriteCensus census;
+	std::map<uint64_t, const common::OriginalMemoryAccess*> accesses;
+	std::set<uint32_t> addresses;
+	for (const auto& access : summary.accesses) {
+		if (!accesses.emplace(access.pc, &access).second) return {};
+		if (body->erasedLink && (access.pc == body->erasedLink->savePc || access.pc == body->erasedLink->restorePc)) {
+			const auto* address = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&access.address);
+			bool read = access.pc == body->erasedLink->restorePc;
+			if (!address || address->entryRegister != 29 || address->offset != uint32_t(body->erasedLink->entryOffset)
+					|| address->equalityEvidence != std::vector<uint64_t>{evidence.start}
+					|| address->firstUse || address->derivation == common::OriginalEntryRelativeMemoryAddress::Derivation::EntryFirstUse
+					|| access.width != 32 || access.extension != "none"
+					|| access.kind != (read ? "read" : "write") || access.delayed != read) return {};
+			census.projectedLinkAccesses.insert(access.pc);
+			continue;
+		}
+		const auto* address = std::get_if<common::OriginalFixedMemoryAddress>(&access.address);
+		const auto* bytes = address ? std::get_if<common::OriginalFileBytes>(&address->fileBytes) : nullptr;
+		if (!address || !bytes || access.kind != "write" || access.width != 8
+				|| access.extension != "none" || access.delayed || !access.addressEntries.empty()
+				|| !address->alignment.isComplete() || !addresses.insert(address->value).second
+				|| common::psxRamAddress(address->value) != std::optional<uint64_t>{address->value}
+				|| bytes->bytes.size() != 1 || !bytes->mappingBytes
+				|| common::psxRamAddress(bytes->mappingStart) != std::optional<uint64_t>{bytes->mappingStart}
+				|| bytes->mappingBytes > 0x80200000ull - bytes->mappingStart
+				|| bytes->payloadOffset >= bytes->mappingBytes
+				|| uint64_t(bytes->mappingStart) + bytes->payloadOffset != address->value) return {};
+		auto span = context->resolve(address->value, 1);
+		if (!span || common::psxRamAddress(span->image->loadAddress) != std::optional<uint64_t>{bytes->mappingStart}
+				|| span->image->payload->size() != bytes->mappingBytes || span->payloadOffset != bytes->payloadOffset
+				|| span->bytes[0] != bytes->bytes[0]) return {};
+		census.writes.emplace(access.pc, &access);
+	}
+	if (census.writes.empty() || (body->erasedLink && (census.projectedLinkAccesses.size() != 2
+			|| body->erasedLink->savePc >= body->erasedLink->restorePc
+			|| body->erasedLink->frameBytes < 8 || body->erasedLink->frameBytes > 32767 || body->erasedLink->frameBytes % 8
+			|| evidence.instructions.front().word != (0x27bd0000u | uint16_t(-int(body->erasedLink->frameBytes)))))) return {};
+	std::set<uint64_t> observedMemory;
+	for (size_t i = 0; i < evidence.instructions.size(); ++i) {
+		const auto& row = evidence.instructions[i];
+		if (row.pc != evidence.start + 4 * i || row.owner != evidence.symbol || row.bytes != 4 || !row.mapped || row.undef) return {};
+		for (unsigned j = 0; j < 4; ++j)
+			if (instructions->bytes[4 * i + j] != uint8_t(row.word >> (8 * j))) return {};
+		unsigned op = row.word >> 26;
+		if (op == 3) {
+			uint64_t target = ((row.pc + 4) & 0xf0000000u) | ((row.word & 0x03ffffffu) << 2);
+			if (!census.calls.emplace(row.pc, target).second) return {};
+		} else if (!op && (row.word & 63) == 9) return {};
+		if (op < 32 || op > 46) {
+			if (accesses.count(row.pc)) return {};
+			continue;
+		}
+		if (!accesses.count(row.pc) || !observedMemory.insert(row.pc).second) return {};
+		if (census.projectedLinkAccesses.count(row.pc)) {
+			bool read = row.pc == body->erasedLink->restorePc;
+			if (op != (read ? 35u : 43u) || ((row.word >> 21) & 31) != 29 || ((row.word >> 16) & 31) != 31
+					|| int(int16_t(row.word)) - int(body->erasedLink->frameBytes) != body->erasedLink->entryOffset) return {};
+		} else if (op != 40 || !census.writes.count(row.pc)) return {};
+	}
+	if (observedMemory.size() != accesses.size() || census.calls.size() != evidence.calls.size()) return {};
+	std::set<uint64_t> recordedCalls;
+	for (const auto& call : evidence.calls) {
+		if (!call.target || !call.contract || !census.calls.count(call.pc)
+				|| census.calls.at(call.pc) != *call.target || !recordedCalls.insert(call.pc).second) return {};
+		const auto& proof = std::holds_alternative<common::OriginalPartialCall>(*call.contract)
+			? std::get<common::OriginalPartialCall>(*call.contract) : std::get<common::OriginalCompleteCall>(*call.contract).proof();
+		const common::Function* callee = nullptr;
+		for (const auto& candidate : config.functions)
+			if (candidate.getStart().isDefined() && candidate.getStart().getValue() == *call.target) {
+				if (callee) return {};
+				callee = &candidate;
+			}
+		if (!callee || !callee->originalCallSummary || callee->originalCallSummary->function != proof.callee
+				|| !function.getParent()->getFunction(callee->getName())) return {};
+	}
+	std::set<uint64_t> irCalls;
+	for (auto& block : function) for (auto& instruction : block) {
+		if (llvm::isa<llvm::InvokeInst>(instruction)) return {};
+		if (auto* call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
+			auto pc = originalInstructionPc(instruction);
+			if (!pc && instruction.getMetadata("insn.addr")) return {};
+			if (!pc) {
+				auto assembly = bin2llvmir::AsmInstruction(&instruction);
+				if (assembly) pc = assembly.getAddress().getValue();
+			}
+			if (!pc) return {};
+			if (!census.calls.count(*pc)) {
+				const auto* edge = original_expression::unique(evidence.edges, [&](const auto& candidate) {
+					return candidate.to == *pc && candidate.from + 4 == *pc && candidate.kind == "delay-slot"
+						&& candidate.delayOwner == candidate.from && census.calls.count(candidate.from);
+				});
+				if (!edge) return {};
+				pc = edge->from;
+			}
+			auto* callee = call->getCalledFunction();
+			auto* binding = callee ? config.functions.getFunctionByName(callee->getName().str()) : nullptr;
+			if (!callee || callee->isIntrinsic() || !binding || !binding->getStart().isDefined()
+					|| binding->getStart().getValue() != census.calls.at(*pc) || !irCalls.insert(*pc).second) return {};
+			continue;
+		}
+		auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+		auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+		if (!load && !store) {
+			if (instruction.mayReadOrWriteMemory()) return {};
+			continue;
+		}
+		auto* pointer = load ? load->getPointerOperand() : store->getPointerOperand();
+		if (auto* local = llvm::dyn_cast<llvm::AllocaInst>(pointer)) {
+			if (!originalScalarLocal(*local, function)) return {};
+			continue;
+		}
+		auto pc = originalInstructionPc(instruction);
+		if (!store || !pc || !census.writes.count(*pc) || store->isVolatile() || store->isAtomic()
+				|| !store->getValueOperand()->getType()->isIntegerTy(8) || pointer->getType()->getPointerAddressSpace()
+				|| !census.stores.emplace(*pc, store).second) return {};
+	}
+	if (irCalls.size() != census.calls.size() || census.stores.size() != census.writes.size()) return {};
+	return census;
+}
+
 void recoverOriginalAddressViews(llvm::Function& function, common::Function& source,
 		const config::Config& config) {
 	source.sharedOriginalAddressViews.reset();
@@ -1770,9 +1959,10 @@ void recoverOriginalAddressViews(llvm::Function& function, common::Function& sou
 		&& disposition.kind == common::ReturnDisposition::Kind::Unknown;
 	bool value = disposition.kind == common::ReturnDisposition::Kind::Value
 		&& summary.result.isComplete() && summary.declaration.isComplete();
-	if ((!ordinary && !value) || !summary.entry.isComplete() || !summary.control.isComplete()
+	auto writes = ordinary ? collectOriginalByteWriteCensus(function, source, config) : std::nullopt;
+	if ((!ordinary && !value) || !summary.entry.isComplete() || (!writes && !summary.control.isComplete())
 			|| summary.pendingEntry != "requires-no-pending-gpr-loads" || summary.exits.empty()
-			|| !evidence.decodeComplete || !evidence.analysisComplete || !evidence.calls.empty()
+			|| !evidence.decodeComplete || !evidence.analysisComplete || (!writes && !evidence.calls.empty())
 			|| evidence.selection != "selected-root" || evidence.symbol != source.getName()
 			|| evidence.start != source.getStart().getValue() || evidence.end != source.getEnd().getValue()
 			|| scope->root.start != evidence.start || scope->root.end != evidence.end
@@ -1788,6 +1978,7 @@ void recoverOriginalAddressViews(llvm::Function& function, common::Function& sou
 	std::map<uint64_t, const common::OriginalMemoryAccess*> accesses;
 	std::vector<const common::OriginalMemoryAccess*> ordered;
 	for (const auto& access : summary.accesses) {
+		if (writes && writes->projectedLinkAccesses.count(access.pc)) continue;
 		const auto* address = std::get_if<common::OriginalFixedMemoryAddress>(&access.address);
 		const auto* bytes = address ? std::get_if<common::OriginalFileBytes>(&address->fileBytes) : nullptr;
 		if (!address || !bytes || !address->alignment.isComplete()
@@ -1815,10 +2006,11 @@ void recoverOriginalAddressViews(llvm::Function& function, common::Function& sou
 		for (unsigned j = 0; j < 4; ++j)
 			if (instructions->bytes[4 * i + j] != uint8_t(row.word >> (8 * j))) return;
 		unsigned op = row.word >> 26;
+		if (writes && writes->projectedLinkAccesses.count(row.pc)) continue;
 		bool read = op == 32 || op == 33 || op == 35 || op == 36 || op == 37;
 		bool write = op == 40 || op == 41 || op == 43;
 		if (!read && !write) {
-			if (accesses.count(row.pc) || (32 <= op && op <= 46) || op == 3
+			if (accesses.count(row.pc) || (32 <= op && op <= 46) || (op == 3 && !writes)
 					|| (!op && (row.word & 63) == 9)) return;
 			continue;
 		}
@@ -1834,27 +2026,17 @@ void recoverOriginalAddressViews(llvm::Function& function, common::Function& sou
 	if (observed != accesses.size()) return;
 	std::map<uint64_t, llvm::Instruction*> matches;
 	for (auto& block : function) for (auto& instruction : block) {
-		if (llvm::isa<llvm::CallInst>(instruction) || llvm::isa<llvm::InvokeInst>(instruction)) return;
+		if (llvm::isa<llvm::InvokeInst>(instruction)) return;
+		if (llvm::isa<llvm::CallInst>(instruction)) {
+			if (!writes) return;
+			continue;
+		}
 		auto* load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
 		auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
 		if (!load && !store) continue;
 		auto* pointer = load ? load->getPointerOperand() : store->getPointerOperand();
 		if (auto* local = llvm::dyn_cast<llvm::AllocaInst>(pointer)) {
-			auto* type = local->getAllocatedType();
-			if (local->getFunction() != &function || local->isArrayAllocation()
-					|| local->getType()->getPointerAddressSpace()
-					|| (!type->isIntegerTy(8) && !type->isIntegerTy(16) && !type->isIntegerTy(32))) return;
-			for (auto* user : local->users()) {
-				auto* read = llvm::dyn_cast<llvm::LoadInst>(user);
-				auto* write = llvm::dyn_cast<llvm::StoreInst>(user);
-				if (read) {
-					if (read->getFunction() != &function || read->getPointerOperand() != local
-							|| read->getType() != type || read->isVolatile() || read->isAtomic()) return;
-				} else if (write) {
-					if (write->getFunction() != &function || write->getPointerOperand() != local
-							|| write->getValueOperand()->getType() != type || write->isVolatile() || write->isAtomic()) return;
-				} else return;
-			}
+			if (!originalScalarLocal(*local, function)) return;
 			continue;
 		}
 		auto* node = instruction.getMetadata("insn.addr");
@@ -1916,9 +2098,10 @@ void recoverOriginalAddressViews(llvm::Function& function, common::Function& sou
 			return obligation.domain == "memory" && obligation.pc == ordered.front()->pc
 				&& obligation.reason == "contents-object-address-alias-effect-placement-unresolved";
 		});
-	if (!mixed && !byteRead) return;
+	if (!mixed && !byteRead && !writes) return;
 	std::sort(spans.begin(), spans.end(), [](const auto& a, const auto& b) { return a.view.start < b.view.start; });
 	for (auto& span : spans) {
+		if (writes) span.view.kind = common::OriginalAddressSpanView::Kind::IndependentByteWrite;
 		span.view.symbol = "original_address_" + std::to_string(span.view.start);
 		if (function.getParent()->getNamedValue(span.view.symbol)) return;
 		std::sort(span.view.accessPcs.begin(), span.view.accessPcs.end());
@@ -1951,6 +2134,47 @@ void recoverOriginalAddressViews(llvm::Function& function, common::Function& sou
 	}
 	source.sharedOriginalAddressViews = std::move(views);
 }
+}
+
+bool validateOriginalByteWriteViews(llvm::Function& function,
+		const common::Function& source, const config::Config& config) {
+	auto census = collectOriginalByteWriteCensus(function, source, config);
+	if (!census || !source.sharedOriginalAddressViews
+			|| source.sharedOriginalAddressViews->size() != census->writes.size()) return false;
+	const auto& views = *source.sharedOriginalAddressViews;
+	std::set<llvm::GlobalVariable*> globals;
+	std::set<uint64_t> pcs;
+	for (size_t index = 0; index < views.size(); ++index) {
+		const auto& view = views[index];
+		if (view.kind != common::OriginalAddressSpanView::Kind::IndependentByteWrite || view.width != 8
+				|| view.accessPcs.size() != 1 || !pcs.insert(view.accessPcs.front()).second
+				|| !census->writes.count(view.accessPcs.front()) || (index && views[index - 1].start >= view.start)) return false;
+		auto pc = view.accessPcs.front();
+		if (std::get<common::OriginalFixedMemoryAddress>(census->writes.at(pc)->address).value != view.start) return false;
+		auto* store = census->stores.at(pc);
+		auto* global = llvm::dyn_cast<llvm::GlobalVariable>(store->getPointerOperand());
+		auto* marker = global ? global->getMetadata("retdec.original.address-view") : nullptr;
+		if (!global || !globals.insert(global).second || global->getParent() != function.getParent()
+				|| !global->hasExternalLinkage() || !global->isDeclaration() || global->isConstant()
+				|| global->hasInitializer() || global->getAddressSpace() || !global->getValueType()->isIntegerTy(8)
+				|| !global->hasOneUse() || *global->user_begin() != store || !marker || marker->getNumOperands() != 5) return false;
+		auto* owner = llvm::dyn_cast<llvm::MDString>(marker->getOperand(0).get());
+		auto* identity = llvm::dyn_cast<llvm::MDString>(marker->getOperand(1).get());
+		auto number = [&](unsigned position, uint64_t expected) {
+			auto* value = llvm::mdconst::dyn_extract<llvm::ConstantInt>(marker->getOperand(position));
+			return value && value->getType()->isIntegerTy(64) && value->getZExtValue() == expected;
+		};
+		if (!owner || owner->getString() != source.getName() || !identity
+				|| identity->getString() != source.originalCallSummary->function
+				|| !number(2, index) || !number(3, view.start) || !number(4, 8)) return false;
+	}
+	for (auto& global : function.getParent()->globals()) {
+		auto* marker = global.getMetadata("retdec.original.address-view");
+		auto* owner = marker && marker->getNumOperands()
+			? llvm::dyn_cast<llvm::MDString>(marker->getOperand(0).get()) : nullptr;
+		if (owner && owner->getString() == source.getName() && !globals.count(&global)) return false;
+	}
+	return true;
 }
 
 void recoverPointerExpressions(llvm::Module &module, config::Config &config) {

@@ -2,12 +2,15 @@
 #define RETDEC_LLVMIR2HLL_LLVM_SOURCE_RECOVERY_H
 
 #include "retdec/llvmir2hll/support/smart_ptr.h"
-namespace llvm { class Module; }
+namespace llvm { class Function; class Module; }
 namespace retdec {
+namespace common { class Function; }
 namespace config { class Config; }
 namespace llvmir2hll {
 class Module;
 void recoverPointerExpressions(llvm::Module &module, config::Config &config);
+bool validateOriginalByteWriteViews(llvm::Function &function,
+	const common::Function &source, const config::Config &config);
 void recoverSourceSignatures(ShPtr<Module> module, const config::Config &config);
 void validateOriginalSourceForms(ShPtr<Module> module, config::Config &config);
 void applyDeclaredAccessQualifiers(ShPtr<Module> module, const config::Config &config);

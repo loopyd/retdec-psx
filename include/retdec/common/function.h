@@ -184,10 +184,12 @@ struct OriginalMemoryAccess {
 	OriginalFact placement = OriginalFact::partial("object-placement-unresolved");
 };
 struct OriginalAddressSpanView {
+	enum class Kind { Scalar, IndependentByteWrite };
 	std::string symbol;
 	uint32_t start = 0;
 	unsigned width = 0;
 	std::vector<uint64_t> accessPcs;
+	Kind kind = Kind::Scalar;
 };
 struct OriginalFunctionSummary {
 	std::string function;
@@ -324,7 +326,14 @@ struct OriginalSourceExpression {
 
 enum class OriginalSourceForm { SignedNarrowCast, UnsignedMaskSubtract };
 struct OriginalEmptyVoidBody {};
-struct OriginalOrdinaryBody {};
+struct OriginalOrdinaryBody {
+	struct ErasedLinkAccesses {
+		uint64_t savePc = 0, restorePc = 0;
+		unsigned frameBytes = 0;
+		int32_t entryOffset = 0;
+	};
+	std::optional<ErasedLinkAccesses> erasedLink;
+};
 struct OriginalEntryStackWordBody {
 	uint64_t pc;
 	unsigned definition;

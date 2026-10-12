@@ -145,6 +145,12 @@ measurement bindings.
 These views provide no historical object declaration, initializer, qualifier or
 runtime-content proof.
 
+Supported ordinary-body proposals can also bind distinct fixed byte stores to
+independent external byte symbols. Native recovery checks the original and IR
+memory and direct-call inventories, including the frame's erased saved-link
+accesses. Each write view owns one backed byte store. Its declaration has no
+initializer, and the original control, call, object and effect obligations remain.
+
 Original-only recovery can emit conditional C89 body proposals for supported
 straight-line code with direct calls. It retains unresolved return, call, memory
 and declaration facts. This path rejects indirect and exceptional control,

@@ -523,14 +523,21 @@ void serialize(Writer& writer, const common::Function& f)
 	if (f.sharedOriginalAddressViews) {
 		if (f.sharedOriginalAddressViews->empty() || f.sharedOriginalAddressViews->size() > common::ReturnDisposition::RowLimit)
 			throw std::runtime_error("invalid-original-address-view-count");
+		auto kind = f.sharedOriginalAddressViews->front().kind;
 		writer.Key("originalAddressViews"); writer.StartArray();
 		for (const auto& view : *f.sharedOriginalAddressViews) {
-			if (view.symbol.empty() || (view.width != 8 && view.width != 16 && view.width != 32)
+			if (view.kind != kind || (kind != common::OriginalAddressSpanView::Kind::Scalar
+					&& kind != common::OriginalAddressSpanView::Kind::IndependentByteWrite)
+					|| (kind == common::OriginalAddressSpanView::Kind::IndependentByteWrite
+						&& (view.width != 8 || view.accessPcs.size() != 1))
+					|| view.symbol.empty() || (view.width != 8 && view.width != 16 && view.width != 32)
 					|| view.accessPcs.empty() || view.accessPcs.size() > common::ReturnDisposition::ReferenceLimit
 					|| !std::is_sorted(view.accessPcs.begin(), view.accessPcs.end())
 					|| std::adjacent_find(view.accessPcs.begin(), view.accessPcs.end()) != view.accessPcs.end())
 				throw std::runtime_error("invalid-original-address-view");
-			writer.StartObject(); writer.Key("kind"); writer.String("conditional-scalar-address-view/v1");
+			writer.StartObject(); writer.Key("kind");
+			writer.String(kind == common::OriginalAddressSpanView::Kind::IndependentByteWrite
+				? "conditional-byte-write-address-view/v1" : "conditional-scalar-address-view/v1");
 			writer.Key("symbol"); writer.String(view.symbol); writer.Key("start"); writer.Uint(view.start);
 			writer.Key("width"); writer.Uint(view.width); numbers(writer, "accessPcs", view.accessPcs);
 			writer.EndObject();

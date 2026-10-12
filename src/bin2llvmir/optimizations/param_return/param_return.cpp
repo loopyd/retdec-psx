@@ -352,17 +352,18 @@ MipsOperation originalOperation(const Disposition::Instruction& instruction)
 	return result;
 }
 
-bool ordinaryBodyLayout(const Disposition::Evidence& evidence)
+std::optional<common::OriginalOrdinaryBody> ordinaryBodyLayout(const Disposition::Evidence& evidence)
 {
 	const auto& rows = evidence.instructions;
 	if (rows.size() < 2 || rows.size() > Disposition::RowLimit
 		|| evidence.end != evidence.start + 4 * rows.size()
-		|| rows[rows.size() - 2].word != 0x03e00008) return false;
+		|| rows[rows.size() - 2].word != 0x03e00008) return {};
 	const int frame = rows.front().word >> 16 == 0x27bd ? -int(int16_t(rows.front().word)) : 0;
 	const bool slotRestore = frame && rows.back().word == (0x27bd0000u | unsigned(frame));
 	const bool earlyRestore = frame && rows.size() >= 3 && rows.back().word == 0
 		&& rows[rows.size() - 3].word == (0x27bd0000u | unsigned(frame));
-	if (frame && (frame < 8 || frame > 32767 || frame % 8 || (!slotRestore && !earlyRestore))) return false;
+	if (frame && (frame < 8 || frame > 32767 || frame % 8 || (!slotRestore && !earlyRestore))) return {};
+	common::OriginalOrdinaryBody body;
 	std::optional<unsigned> lastCall;
 	for (unsigned i = 0; i < rows.size(); ++i)
 		if (rows[i].word >> 26 == 3) lastCall = i;
@@ -383,35 +384,39 @@ bool ordinaryBodyLayout(const Disposition::Evidence& evidence)
 			|| (op == 15 && rs) || (terminal && i != rows.size() - 2)
 			|| (op == 32 && (!lastCall || i <= *lastCall))
 			|| ((previous.kind == MipsOperation::Call || previous.kind == MipsOperation::Return
-				|| previous.kind == MipsOperation::Branch) && (call || terminal || branch || (load && rt)))) return false;
+				|| previous.kind == MipsOperation::Branch) && (call || terminal || branch || (load && rt)))) return {};
 		if (branch && (branchCount++ || !frame || savedCount != 1 || loadedCount
 			|| (lastCall && i <= *lastCall) || i + 3 >= rows.size()
 			|| operation.target != row.pc + 12 || rows[i + 1].word >> 16 != 0x2402
-			|| rows[i + 2].word >> 16 != 0x2402)) return false;
+			|| rows[i + 2].word >> 16 != 0x2402)) return {};
 		std::set<unsigned> reads(operation.inputs.begin(), operation.inputs.end());
-		if (pendingLoad && reads.count(*pendingLoad)) return false;
+		if (pendingLoad && reads.count(*pendingLoad)) return {};
 		pendingLoad = load && rt ? std::optional<unsigned>(rt) : std::nullopt;
 		for (auto destination : operation.destinations)
 			if (destination && std::find(row.fullWidthRegisters.begin(), row.fullWidthRegisters.end(), destination)
-				== row.fullWidthRegisters.end()) return false;
+				== row.fullWidthRegisters.end()) return {};
 		bool stackAdjustment = frame && op == 9 && rs == 29 && rt == 29
 			&& (i == 0 || (slotRestore && i == rows.size() - 1) || (earlyRestore && i == rows.size() - 3));
 		bool linkAccess = frame && rs == 29 && rt == 31 && (op == 35 || op == 43);
 		if (linkAccess) {
 			int offset = int16_t(row.word);
-			if (offset < 0 || offset % 4 || offset + 4 > frame) return false;
+			if (offset < 0 || offset % 4 || offset + 4 > frame) return {};
 			if (op == 43) {
-				if (callIndex || loadedCount || savedCount++) return false;
+				if (callIndex || loadedCount || savedCount++) return {};
 				savedLink = offset;
-			} else if (!savedLink || *savedLink != offset || loadedCount++ || i >= rows.size() - 2) return false;
+				body.erasedLink = common::OriginalOrdinaryBody::ErasedLinkAccesses{row.pc, 0, unsigned(frame), offset - frame};
+			} else {
+				if (!savedLink || *savedLink != offset || loadedCount++ || i >= rows.size() - 2) return {};
+				body.erasedLink->restorePc = row.pc;
+			}
 		}
 		if (!stackAdjustment && !linkAccess
 			&& (reads.count(29) || (writesRegister && rt == 29)
-				|| (!terminal && reads.count(31)) || (writesRegister && rt == 31))) return false;
+				|| (!terminal && reads.count(31)) || (writesRegister && rt == 31))) return {};
 		if (call) {
-			if (loadedCount || i + 2 >= rows.size() || callIndex >= evidence.calls.size()) return false;
+			if (loadedCount || i + 2 >= rows.size() || callIndex >= evidence.calls.size()) return {};
 			const auto& observed = evidence.calls[callIndex++];
-			if (observed.pc != row.pc || observed.target != operation.target) return false;
+			if (observed.pc != row.pc || observed.target != operation.target) return {};
 		}
 		if (i + 1 < rows.size()) {
 			if (previous.kind == MipsOperation::Branch) {
@@ -427,58 +432,60 @@ bool ordinaryBodyLayout(const Disposition::Evidence& evidence)
 		previous = operation;
 	}
 	if (callIndex != evidence.calls.size() || (frame && (savedCount != 1 || loadedCount != 1))
-		|| (callIndex && !frame) || evidence.edges.size() != edges.size()) return false;
+		|| (callIndex && !frame) || evidence.edges.size() != edges.size()) return {};
 	for (unsigned i = 0; i < edges.size(); ++i) {
 		const auto& expected = edges[i];
 		const auto& observed = evidence.edges[i];
 		if (observed.from != expected.from || observed.to != expected.to
-			|| observed.delayOwner != expected.delayOwner || observed.kind != expected.kind) return false;
+			|| observed.delayOwner != expected.delayOwner || observed.kind != expected.kind) return {};
 	}
-	return true;
+	return body;
 }
 
-bool canProposeOrdinaryBody(const common::Function& function)
+std::optional<common::OriginalOrdinaryBody> canProposeOrdinaryBody(const common::Function& function)
 {
-	if (!function.returnDisposition || !function.originalCallSummary || !function.parameters.empty()) return false;
+	if (!function.returnDisposition || !function.originalCallSummary || !function.parameters.empty()) return {};
 	const auto& disposition = *function.returnDisposition;
 	const auto& evidence = disposition.evidence;
 	const auto& summary = *function.originalCallSummary;
 	const auto& rows = evidence.instructions;
 	if (disposition.kind != Disposition::Kind::Unknown || evidence.selection != "selected-root"
 		|| !evidence.analysisComplete || summary.result.isComplete() || summary.declaration.isComplete()
-		|| evidence.exits.size() != 1 || !ordinaryBodyLayout(evidence)) return false;
+		|| evidence.exits.size() != 1) return {};
+	auto body = ordinaryBodyLayout(evidence);
+	if (!body) return {};
 	if (std::any_of(evidence.obligations.begin(), evidence.obligations.end(), [](const auto& row) {
 		return row.domain == "architectural" && (row.reason == "conditional-callee-preservation-unresolved"
 			|| row.reason == "conditional-callee-assigned-transfer-unresolved"
             || row.reason == "conditional-symbolic-frame-restoration-unresolved");
-	})) return false;
+	})) return {};
 	const auto& exit = evidence.exits.front();
 	if (exit.pc != evidence.end - 8 || exit.delaySlot != evidence.end - 4 || exit.missing
-		|| exit.definitions.empty() || !exit.formals.empty() || !exit.pendingDefinitions.empty() || !exit.bad.empty()) return false;
+		|| exit.definitions.empty() || !exit.formals.empty() || !exit.pendingDefinitions.empty() || !exit.bad.empty()) return {};
 	std::map<unsigned, const Disposition::Definition*> definitions;
 	for (const auto& definition : evidence.definitions)
-		if (!definitions.emplace(definition.id, &definition).second) return false;
+		if (!definitions.emplace(definition.id, &definition).second) return {};
 	std::vector<unsigned> pending = exit.definitions;
 	std::set<unsigned> visited;
 	for (auto id : exit.definitions)
-		if (!definitions.count(id) || definitions.at(id)->reg != 2) return false;
+		if (!definitions.count(id) || definitions.at(id)->reg != 2) return {};
 	while (!pending.empty()) {
 		auto id = pending.back(); pending.pop_back();
 		if (!visited.insert(id).second) continue;
 		auto found = definitions.find(id);
-		if (found == definitions.end()) return false;
+		if (found == definitions.end()) return {};
 		const auto& definition = *found->second;
 		if (definition.width != 32 || definition.origin != "instruction" || !definition.bad.empty()
 			|| !definition.entries.empty() || !definition.formals.empty()
-			|| definition.pc < evidence.start || definition.pc >= evidence.end || (definition.pc - evidence.start) % 4) return false;
+			|| definition.pc < evidence.start || definition.pc >= evidence.end || (definition.pc - evidence.start) % 4) return {};
 		const auto& instruction = rows[(definition.pc - evidence.start) / 4];
-		if (std::find(instruction.fullWidthRegisters.begin(), instruction.fullWidthRegisters.end(), definition.reg) == instruction.fullWidthRegisters.end()) return false;
+		if (std::find(instruction.fullWidthRegisters.begin(), instruction.fullWidthRegisters.end(), definition.reg) == instruction.fullWidthRegisters.end()) return {};
 		for (auto input : definition.inputs) {
-			if (input >= id) return false;
+			if (input >= id) return {};
 			pending.push_back(input);
 		}
 	}
-	return true;
+	return body;
 }
 
 std::optional<uint32_t> retainedLoadMask(const MipsOperation& operation,
@@ -2353,8 +2360,8 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 		cf->originalBodyCandidate.reset();
 		if (revised && canProposeEmptyBody(*cf))
 			cf->originalBodyCandidate = common::OriginalEmptyVoidBody{};
-		else if (revised && canProposeOrdinaryBody(*cf))
-			cf->originalBodyCandidate = common::OriginalOrdinaryBody{};
+		else if (auto body = revised ? canProposeOrdinaryBody(*cf) : std::nullopt)
+			cf->originalBodyCandidate = std::move(*body);
 		else if (revised && stackWordBody)
 			cf->originalBodyCandidate = *stackWordBody;
 	}
