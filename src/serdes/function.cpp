@@ -124,6 +124,7 @@ void contract(Writer& writer, const retdec::common::OriginalCallContract& value)
     writer.Key("continuation"); writer.Uint64(proof.continuation); optional(writer, "actualIncomingLink", proof.actualIncomingLink);
     fact(writer, "identity", proof.identity); fact(writer, "inputs", proof.inputs); fact(writer, "transfers", proof.transfers);
     fact(writer, "result", proof.result); fact(writer, "control", proof.control); fact(writer, "effects", proof.effects);
+    fact(writer, "noMemoryWrites", proof.noMemoryWrites);
     fact(writer, "declaration", proof.declaration); strings(writer, "remaining", proof.remaining);
     numbers(writer, "calleeExits", proof.calleeExits); transfers(writer, "registerTransfers", proof.registerTransfers);
     writer.Key("bindings"); writer.StartArray();
@@ -188,6 +189,7 @@ void summary(Writer& writer, const retdec::common::OriginalFunctionSummary& valu
     writer.Key("pendingEntry"); writer.String(value.pendingEntry);
     fact(writer, "entry", value.entry); fact(writer, "result", value.result); fact(writer, "control", value.control);
     fact(writer, "effects", value.effects); fact(writer, "declaration", value.declaration);
+    fact(writer, "noMemoryWrites", value.noMemoryWrites);
     numbers(writer, "parameterRegisters", value.parameterRegisters);
     writer.Key("demands"); writer.StartArray();
     for (const auto& row : value.demands) {

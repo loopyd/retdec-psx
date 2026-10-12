@@ -22,6 +22,7 @@
 
 #include "retdec/utils/container.h"
 #include "retdec/utils/string.h"
+#include "retdec/common/psx_memory.h"
 #include "retdec/bin2llvmir/optimizations/param_return/filter/filter.h"
 #include "retdec/bin2llvmir/optimizations/param_return/param_return.h"
 #define debug_enabled false
@@ -138,9 +139,21 @@ bool ParamReturn::run()
 		} catch (...) {
 			if (!syntaxOnly) {
 				for (const auto& function : _config->getConfig().functions)
-					if (function.originalCallSummary)
-						for (auto& access : const_cast<common::Function&>(function).originalCallSummary->accesses)
+					if (function.originalCallSummary) {
+						auto& summary = *const_cast<common::Function&>(function).originalCallSummary;
+						summary.noMemoryWrites = common::OriginalFact::partial("native-analysis-failed");
+						for (auto& access : summary.accesses)
 							access.address = common::OriginalFact::partial("native-analysis-failed");
+					}
+				for (auto& pair : _fnc2calls) if (pair.second.getReturnDisposition()) {
+					auto disposition = *pair.second.getReturnDisposition();
+					for (auto& call : disposition.evidence.calls) if (call.contract) {
+						auto* partial = std::get_if<common::OriginalPartialCall>(&*call.contract);
+						auto& proof = partial ? *partial : std::get<common::OriginalCompleteCall>(*call.contract)._proof;
+						proof.noMemoryWrites = common::OriginalFact::partial("native-analysis-failed");
+					}
+					pair.second.setReturnDisposition(std::move(disposition));
+				}
 				publishReturnDispositions();
 			}
 			_RDA.clear();
@@ -1658,6 +1671,7 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
     const FileImage* image, const std::optional<OriginalImageView>& view,
     const std::map<uint64_t, common::OriginalMemoryAccess>& flowAccesses)
 {
+    summary.noMemoryWrites = common::OriginalFact::partial("memory-write-absence-unresolved");
     for (auto& access : summary.accesses) {
         const auto* flow = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&access.address);
         const auto* fixed = std::get_if<common::OriginalFixedMemoryAddress>(&access.address);
@@ -1895,6 +1909,9 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     proof.inputs.remaining.erase(std::unique(proof.inputs.remaining.begin(), proof.inputs.remaining.end()), proof.inputs.remaining.end());
     std::sort(proof.transfers.remaining.begin(), proof.transfers.remaining.end());
     proof.transfers.remaining.erase(std::unique(proof.transfers.remaining.begin(), proof.transfers.remaining.end()), proof.transfers.remaining.end());
+    if (summary && summary->noMemoryWrites.isComplete() && proof.identity.isComplete()
+        && proof.inputs.isComplete() && proof.control.isComplete() && !pending)
+        proof.noMemoryWrites = common::OriginalFact::complete();
     proof.remaining.clear();
     for (const auto* dimension : {&proof.identity, &proof.inputs, &proof.transfers, &proof.result, &proof.control, &proof.effects, &proof.declaration})
         if (!dimension->isComplete()) proof.remaining.insert(proof.remaining.end(), dimension->remaining.begin(), dimension->remaining.end());
@@ -2497,6 +2514,50 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     }
                 }
                 recoverOriginalMemory(summary, disposition, _image, imageView, accesses);
+                bool noWrites = imageView && evidence.decodeComplete && evidence.analysisComplete
+                    && summary.entry.isComplete() && summary.control.isComplete() && !summary.exits.empty()
+                    && summary.pendingEntry == "requires-no-pending-gpr-loads"
+                    && evidence.start % 4 == 0 && evidence.end % 4 == 0 && evidence.start < evidence.end
+                    && evidence.end <= (uint64_t(1) << 32)
+                    && evidence.instructions.size() == (evidence.end - evidence.start) / 4;
+                size_t readCount = 0, callCount = 0;
+                for (size_t i = 0; noWrites && i < evidence.instructions.size(); ++i) {
+                    const auto& row = evidence.instructions[i];
+                    auto operation = originalOperation(row);
+                    noWrites = row.pc == evidence.start + 4 * i && row.mapped && row.owner == evidence.symbol
+                        && row.bytes == 4 && !row.undef && !operation.merge
+                        && operation.kind != MipsOperation::Store && operation.kind != MipsOperation::Trap
+                        && operation.kind != MipsOperation::Unsupported;
+                    if (operation.kind == MipsOperation::Load) {
+                        ++readCount;
+                        auto access = std::find_if(summary.accesses.begin(), summary.accesses.end(),
+                            [&](const auto& value) { return value.pc == row.pc; });
+                        if (access == summary.accesses.end()) { noWrites = false; continue; }
+                        const auto* address = std::get_if<common::OriginalFixedMemoryAddress>(&access->address);
+                        unsigned opcode = row.word >> 26;
+                        unsigned width = opcode == 32 || opcode == 36 ? 8 : opcode == 33 || opcode == 37 ? 16 : 32;
+                        uint64_t count = width / 8;
+                        const auto* bytes = address ? std::get_if<common::OriginalFileBytes>(&address->fileBytes) : nullptr;
+                        auto start = address ? common::psxRamAddress(address->value) : std::nullopt;
+                        auto end = address ? common::psxRamAddress(uint64_t(address->value) + count - 1) : std::nullopt;
+                        noWrites &= access->kind == "read" && access->delayed && access->width == width
+                            && std::count_if(summary.accesses.begin(), summary.accesses.end(),
+                                [&](const auto& value) { return value.pc == row.pc; }) == 1
+                            && address && address->alignment.isComplete() && address->value % count == 0
+                            && start && end && *end == *start + count - 1 && bytes && bytes->bytes.size() == count;
+                    }
+                    if (operation.kind == MipsOperation::Call) {
+                        ++callCount;
+                        auto call = std::find_if(evidence.calls.begin(), evidence.calls.end(),
+                            [&](const auto& value) { return value.pc == row.pc; });
+                        if (call == evidence.calls.end() || !call->contract) { noWrites = false; continue; }
+                        const auto* partial = std::get_if<common::OriginalPartialCall>(&*call->contract);
+                        const auto& proof = partial ? *partial : std::get<common::OriginalCompleteCall>(*call->contract).proof();
+                        noWrites &= proof.noMemoryWrites.isComplete();
+                    }
+                }
+                if (noWrites && readCount == summary.accesses.size() && callCount == evidence.calls.size())
+                    summary.noMemoryWrites = common::OriginalFact::complete();
 				if (imageView && cf->parameters.empty())
 					stackWordBody = proposeIncomingStackWordBody(disposition, summary, states);
             }
@@ -2505,6 +2566,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
             evidence.decodeComplete = false; evidence.analysisComplete = false;
             evidence.definitions.clear(); evidence.edges.clear(); evidence.exits.clear(); evidence.calls.clear();
             cf->originalJumpTables.clear();
+            summary.noMemoryWrites = common::OriginalFact::partial("native-analysis-failed");
             for (auto& access : summary.accesses) access.address = common::OriginalFact::partial("native-analysis-failed");
             if (evidence.obligations.size() < Disposition::RowLimit)
 				evidence.obligations.push_back({evidence.start, "architectural", error.what()});

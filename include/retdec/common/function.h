@@ -160,6 +160,7 @@ struct OriginalAddressSpanView {
 struct OriginalFunctionSummary {
 	std::string function;
 	OriginalFact entry, result, control, effects, declaration;
+	OriginalFact noMemoryWrites = OriginalFact::partial("memory-write-absence-unresolved");
 	std::vector<OriginalEntryUse> demands;
 	std::vector<OriginalTransfer> transfers;
 	std::vector<OriginalNormalExit> exits;
@@ -180,6 +181,7 @@ struct OriginalPartialCall {
 	std::string callee;
 	uint64_t delay = 0, continuation = 0;
 	OriginalFact identity, inputs, transfers, result, control, effects, declaration;
+	OriginalFact noMemoryWrites = OriginalFact::partial("memory-write-absence-unresolved");
 	std::vector<OriginalInputBinding> bindings;
 	std::vector<uint64_t> calleeExits;
 	std::optional<uint32_t> actualIncomingLink;
