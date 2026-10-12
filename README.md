@@ -99,6 +99,11 @@ bytes, calling contracts, associated data or placement. Unsupported instruction,
 control or memory facts remain explicit obligations. Inferred machine values
 alone do not establish source C declarations.
 
+Fixed-address evidence distinguishes uninterrupted entry prefixes from unique,
+load-delay-safe constant chains in the complete original control flow. Initial
+file bytes identify static backing from the active image owner. Object extents,
+qualifiers, runtime contents and memory effects remain separate obligations.
+
 Original-only recovery can emit conditional C89 body proposals for supported
 straight-line code with direct calls. It retains unresolved return, call, memory
 and declaration facts. This path rejects indirect and exceptional control,

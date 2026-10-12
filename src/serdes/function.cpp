@@ -164,7 +164,9 @@ void memoryAddress(Writer& writer, const retdec::common::OriginalMemoryAccess& a
         numbers(writer, "boundEvidence", address->boundEvidence); writer.EndObject(); return;
     }
     const auto& address = std::get<retdec::common::OriginalFixedMemoryAddress>(access.address);
-    writer.Key("address"); writer.StartObject(); writer.Key("kind"); writer.String("entry-fallthrough-prefix/v1");
+    writer.Key("address"); writer.StartObject(); writer.Key("kind");
+    writer.String(address.derivation == retdec::common::OriginalFixedMemoryAddress::Derivation::Flow
+        ? "instruction-fixed-flow/v1" : "entry-fallthrough-prefix/v1");
     writer.Key("base"); writer.Uint(address.base); writer.Key("value"); writer.Uint(address.value);
     numbers(writer, "equalityEvidence", address.equalityEvidence); fact(writer, "alignment", address.alignment);
     if (auto* partial = std::get_if<retdec::common::OriginalFact>(&address.fileBytes)) {

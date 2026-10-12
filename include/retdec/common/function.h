@@ -113,8 +113,10 @@ struct OriginalJumpTableContext {
 	std::vector<std::string> conditions;
 };
 struct OriginalFixedMemoryAddress {
+	enum class Derivation { Prefix, Flow };
 	uint32_t base = 0, value = 0;
 	std::vector<uint64_t> equalityEvidence;
+	Derivation derivation = Derivation::Prefix;
 	OriginalFact alignment = OriginalFact::partial("access-alignment-unresolved");
 	std::variant<OriginalFact, OriginalFileBytes> fileBytes = OriginalFact::partial("physical-file-backing-unresolved");
 };
