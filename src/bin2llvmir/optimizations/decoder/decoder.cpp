@@ -361,6 +361,9 @@ void Decoder::captureOriginalInstruction(
 	if (row.bytes == 4)
 		for (unsigned i = 0; i < 4; ++i)
 			row.word |= uint32_t(instruction->bytes[i]) << (i * 8);
+	if (auto discovered = _originalDiscovered.find(extent->first); discovered != _originalDiscovered.end())
+		if (!discovered->second.words.count(row.pc) || discovered->second.words.at(row.pc) != row.word)
+			throw std::runtime_error("discovered-instruction-owner-conflict");
 	bool reachedContinuation = false;
 	if (continuation && result.llvmInsn->getParent() == continuation->getParent()) {
 		for (auto* ir = result.llvmInsn->getNextNode(); ir; ir = ir->getNextNode()) {
@@ -408,6 +411,7 @@ void Decoder::admitOriginalDirectTarget(uint64_t callPc, uint64_t target)
 		}
 		return;
 	}
+	discoverOriginalDirectTarget(callPc, target);
 }
 
 void Decoder::refuseOriginalOwnership(common::Address addr)
@@ -444,11 +448,16 @@ void Decoder::publishOriginalDecodeCoverage(const std::string& failure)
 			cf = const_cast<common::Function*>(&*c.functions.insert(record).first);
 		}
 		evidence.symbol = cf->getName();
+		if (auto discovered = _originalDiscovered.find(extent.first); discovered != _originalDiscovered.end())
+			for (const auto& reason : discovered->second.remaining)
+				evidence.obligations.push_back({extent.first, "architectural", reason});
 		for (const auto& row : evidence.instructions)
 			if (row.owner != evidence.symbol && evidence.obligations.size() < common::ReturnDisposition::RowLimit)
 				evidence.obligations.push_back({row.pc, "architectural", "original-function-owner-mismatch"});
 		if (!failure.empty()) evidence.obligations.push_back({evidence.start, "architectural", failure});
 		cf->returnDisposition = disposition;
+		if (auto discovered = _originalDiscovered.find(extent.first); discovered != _originalDiscovered.end())
+			cf->originalDiscovered = discovered->second;
 		cf->returnType.setLlvmIr(""); cf->returnStorage = common::Storage::undefined();
 	}
 }
@@ -885,7 +894,7 @@ bool Decoder::getJumpTargetsFromInstruction(
 				return false;
 			}
 
-			if (const auto* reviewed = getReviewedOriginalFunction(t))
+			if (const auto reviewed = getOriginalDecodeOwner(t))
 				if (t.getValue() != reviewed->start) refuseOriginalOwnership(t);
 			if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery()
 				&& tr.capstoneInsn->size == 4 && (tr.capstoneInsn->bytes[3] >> 2) == 3)

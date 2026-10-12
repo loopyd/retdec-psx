@@ -15,6 +15,7 @@
 
 #include "retdec/common/address.h"
 #include "retdec/common/function.h"
+#include "retdec/common/psx_memory.h"
 
 namespace retdec {
 namespace config {
@@ -32,6 +33,8 @@ class Parameters
 		bool isKeepAllFunctions() const;
 		bool isSelectedDecodeOnly() const;
 		bool isOriginalOnlyReturnRecovery() const;
+		void setPsxMemoryContext(std::shared_ptr<const common::PsxMemoryContext> context) { _psxMemoryContext = std::move(context); }
+		const std::shared_ptr<const common::PsxMemoryContext>& getPsxMemoryContext() const { return _psxMemoryContext; }
 		void setOriginalCallScope(common::OriginalCallScope scope);
 		const std::optional<common::OriginalCallScope>& getOriginalCallScope() const { return _originalCallScope; }
 		void setOriginalSourceForm(common::OriginalSourceForm form);
@@ -157,6 +160,7 @@ class Parameters
 		/// results.
 		bool _selectedDecodeOnly = false;
 		bool _originalOnlyReturnRecovery = false;
+		std::shared_ptr<const common::PsxMemoryContext> _psxMemoryContext;
 		std::optional<common::OriginalCallScope> _originalCallScope;
 		std::optional<common::OriginalSourceForm> _originalSourceForm;
 

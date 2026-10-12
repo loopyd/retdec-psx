@@ -47,8 +47,12 @@ class ParamReturn : public llvm::ModulePass
 		bool run();
 		void validateStrictProfile() const;
 		struct OriginalContractGraph {
+			struct Identity {
+				std::string key, imageId;
+				uint64_t start, end;
+			};
 			std::map<uint64_t, DataFlowEntry*> functions;
-			std::map<uint64_t, common::ReviewedOriginalFunction> identities;
+			std::map<uint64_t, Identity> identities;
 			std::set<uint64_t> unavailable;
 		};
 		void qualifyReturns();

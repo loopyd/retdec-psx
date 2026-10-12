@@ -6,6 +6,7 @@ add_library(loader STATIC
 	image_factory.cpp
 	loader/pe/pe_image.cpp
 	loader/image.cpp
+	loader/psx_overlay_image.cpp
 	loader/coff/coff_image.cpp
 	loader/segment.cpp
 	loader/intel_hex/intel_hex_image.cpp
@@ -29,6 +30,7 @@ target_link_libraries(loader
 		retdec::fileformat
 		retdec::common
 		retdec::utils
+		retdec::deps::rapidjson
 )
 
 set_target_properties(loader

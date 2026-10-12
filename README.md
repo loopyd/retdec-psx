@@ -71,6 +71,26 @@ uses the current Rizin analysis and supplied context.
 For original-only generation, the absolute workspace must contain the validated
 request, original image bytes and fixed configuration expected by `pdzar`.
 
+## Overlay state
+
+The backend owns ordered PS1 image mounts through
+[`loader::PsxOverlayManager`](include/retdec/loader/loader/psx_overlay_image.h).
+Its immutable [`PsxMemoryContext`](include/retdec/common/psx_memory.h) records
+original-file hashes, payload slices, load metadata and visible byte ownership.
+Later mounts replace overlaps. Dismounting restores earlier static mappings.
+Invalid batches preserve the previous context. PS1 RAM aliases resolve to the
+same owner.
+
+The decoder and data readers use one composed native image. Original-only direct
+callee discovery records bounded instruction-derived nodes separately from
+reviewed function extents. Context changes select different decompilation caches.
+See the [plugin overlay commands](https://github.com/loopyd/rz-psxdec#overlay-state)
+for metadata fields and mount, dismount and inspection commands.
+
+An explicit static mount state does not prove historical runtime residency or
+original C declarations. These remain evidence requirements for cross-image
+decompilation.
+
 ## Evidence limits
 
 Generated C and inferred declarations require independent review. A successful

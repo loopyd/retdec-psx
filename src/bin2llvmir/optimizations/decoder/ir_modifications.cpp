@@ -240,7 +240,7 @@ void Decoder::getOrCreateBranchTarget(
 	tFnc = nullptr;
 
 	auto* fromFnc = from->getFunction();
-	if (const auto* reviewed = getReviewedOriginalFunction(addr))
+	if (const auto reviewed = getOriginalDecodeOwner(addr))
 	{
 		if (addr.getValue() != reviewed->start)
 		{
@@ -490,7 +490,7 @@ bool Decoder::canSplitFunctionOn(
  */
 llvm::Function* Decoder::splitFunctionOn(common::Address addr)
 {
-	if (const auto* reviewed = getReviewedOriginalFunction(addr))
+	if (const auto reviewed = getOriginalDecodeOwner(addr))
 	{
 		if (addr.getValue() != reviewed->start) refuseOriginalOwnership(addr);
 		if (auto* block = getBasicBlockAtAddress(addr))
@@ -538,7 +538,7 @@ llvm::Function* Decoder::splitFunctionOn(
 		common::Address addr,
 		llvm::BasicBlock* splitOnBb)
 {
-	if (const auto* reviewed = getReviewedOriginalFunction(addr))
+	if (const auto reviewed = getOriginalDecodeOwner(addr))
 	{
 		if (addr.getValue() != reviewed->start
 				|| splitOnBb->getParent() != getFunctionAtAddress(addr))
@@ -566,7 +566,7 @@ llvm::Function* Decoder::splitFunctionOn(
 				&& _config->getConfig().parameters.isOriginalOnlyReturnRecovery()
 				&& _config->getConfig().parameters.getOriginalCallScope())
 			refuseOriginalOwnership(addr);
-		if (const auto* reviewed = getReviewedOriginalFunction(splitAddr))
+		if (const auto reviewed = getOriginalDecodeOwner(splitAddr))
 			if (splitAddr.getValue() != reviewed->start || getFunctionAtAddress(splitAddr))
 				refuseOriginalOwnership(splitAddr);
 	}

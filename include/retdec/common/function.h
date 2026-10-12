@@ -38,6 +38,12 @@ struct OriginalCallScope {
 	ReviewedOriginalFunction root;
 	std::vector<ReviewedOriginalFunction> callees;
 };
+struct OriginalDiscoveredFunction {
+	std::string key, target, imageId, contextHash;
+	uint64_t start = 0, end = 0;
+	std::map<uint64_t, uint32_t> words;
+	std::vector<std::string> remaining;
+};
 struct OriginalCalleeContext {
 	uint32_t entry = 0;
 	std::vector<uint64_t> callPcs;
@@ -424,6 +430,7 @@ class Function : public retdec::common::AddressRange
 		std::optional<ReturnDisposition> returnDisposition;
 		std::optional<OriginalFunctionSummary> originalCallSummary;
 		std::optional<OriginalCalleeContexts> originalCalleeContexts;
+		std::optional<OriginalDiscoveredFunction> originalDiscovered;
 		std::vector<OriginalJumpTableContext> originalJumpTables;
 		std::optional<OriginalBodyCandidate> originalBodyCandidate;
 		std::vector<OriginalSourceExpression> originalSourceExpressions;

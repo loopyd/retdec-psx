@@ -1216,13 +1216,24 @@ struct OriginalImageView {
     uint32_t mappingStart;
     const std::vector<uint8_t>& payload;
     bool physical;
+    const common::PsxMemoryContext* context = nullptr;
+    const common::PsxOriginalImage* owner = nullptr;
     bool contains(uint64_t address, uint64_t count) const {
+        if (context) {
+            auto span = context->resolve(address, count);
+            return span && span->image == owner;
+        }
         return address >= mappingStart && address <= UINT32_MAX
             && count <= (uint64_t(1) << 32) - address
             && address - mappingStart <= payload.size()
             && count <= payload.size() - (address - mappingStart);
     }
     uint32_t word(uint64_t address) const {
+        if (context) {
+            auto span = context->resolve(address, 4);
+            return uint32_t(span->bytes[0]) | uint32_t(span->bytes[1]) << 8
+                | uint32_t(span->bytes[2]) << 16 | uint32_t(span->bytes[3]) << 24;
+        }
         auto offset = address - mappingStart;
         return uint32_t(payload[offset]) | uint32_t(payload[offset + 1]) << 8
             | uint32_t(payload[offset + 2]) << 16 | uint32_t(payload[offset + 3]) << 24;
@@ -1231,9 +1242,37 @@ struct OriginalImageView {
 
 std::optional<OriginalImageView> originalImageView(const FileImage* image,
     const common::OriginalCallScope& scope, const config::Parameters& parameters,
-    const Disposition::Evidence& evidence, const std::string& function)
+    const Disposition::Evidence& evidence, const std::string& function,
+    const common::OriginalDiscoveredFunction* discovered = nullptr)
 {
     if (!image || evidence.start % 4 || evidence.end % 4 || evidence.start >= evidence.end) return {};
+    if (const auto& context = parameters.getPsxMemoryContext()) {
+        auto span = context->resolve(evidence.start, evidence.end - evidence.start);
+        if (!span) return {};
+        bool identity = false;
+        auto reviewed = [&](const auto& row) {
+            if (row.start == evidence.start && row.end == evidence.end && row.key == function
+                && row.imageId == span->image->id) identity = true;
+        };
+        reviewed(scope.root); for (const auto& row : scope.callees) reviewed(row);
+        if (discovered) identity = discovered->start == evidence.start && discovered->end == evidence.end
+            && discovered->key == function && discovered->imageId == span->image->id
+            && discovered->contextHash == context->identity();
+        if (!identity) return {};
+        OriginalImageView view{uint32_t(*common::psxRamAddress(span->image->loadAddress)),
+            *span->image->payload, true, context.get(), span->image};
+        std::set<uint64_t> pcs;
+        for (const auto& row : evidence.instructions) {
+            if (row.pc < evidence.start || row.pc >= evidence.end || row.pc % 4 || row.bytes != 4
+                || row.owner != evidence.symbol || !row.mapped || row.undef || !pcs.insert(row.pc).second
+                || !view.contains(row.pc, 4) || view.word(row.pc) != row.word) return {};
+            if (discovered && (!discovered->words.count(row.pc) || discovered->words.at(row.pc) != row.word)) return {};
+            auto physical = image->getImage()->getRawSegmentData(row.pc);
+            auto original = context->resolve(row.pc, 4);
+            if (!physical.first || physical.second < 4 || !std::equal(original->bytes, original->bytes + 4, physical.first)) return {};
+        }
+        return view;
+    }
     unsigned identities = 0;
     auto matchIdentity = [&](const common::ReviewedOriginalFunction& row) {
         identities += row.start == evidence.start && row.end == evidence.end && row.key == function;
@@ -1338,7 +1377,7 @@ struct OriginalDispatchSite {
     const std::map<uint64_t, const Disposition::Instruction*>& instructions;
     const std::map<unsigned, Disposition::Definition>& definitions;
     const OriginalImageView& image;
-    const common::ReviewedOriginalFunction& identity;
+    const std::string& imageId;
     const std::string& payloadHash;
 };
 
@@ -1483,9 +1522,13 @@ std::optional<OriginalSnapshotDispatch> sampleOriginalJumpTable(
     common::OriginalJumpTableContext report;
     report.jumpPc = jump->pc; report.loadPc = load->pc; report.comparePc = compare->pc;
     report.guardPc = guard->pc; report.defaultPc = defaultPc; report.selectorRegister = selector;
-    report.tableAddress = address; report.imageId = site.identity.imageId; report.payloadHash = site.payloadHash;
+    report.tableAddress = address; report.imageId = site.imageId; report.payloadHash = site.payloadHash;
     report.tableBytes.mappingStart = site.image.mappingStart; report.tableBytes.mappingBytes = site.image.payload.size();
-    report.tableBytes.payloadOffset = uint64_t(address) - site.image.mappingStart;
+    if (site.image.context) {
+        auto span = site.image.context->resolve(address, bytes);
+        if (!span || span->image != site.image.owner) return {};
+        report.tableBytes.payloadOffset = span->payloadOffset;
+    } else report.tableBytes.payloadOffset = uint64_t(address) - site.image.mappingStart;
     report.tableBytes.bytes.assign(site.image.payload.begin() + report.tableBytes.payloadOffset,
         site.image.payload.begin() + report.tableBytes.payloadOffset + bytes);
     for (uint32_t index = 0; index < count; ++index) {
@@ -1606,6 +1649,9 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     if (summary) {
         std::map<unsigned, std::set<uint64_t>> uses;
         for (const auto& use : summary->demands) uses[use.reg].insert(use.pc);
+        for (const auto& transfer : summary->transfers)
+            if (transfer.kind == "assigned" && transfer.proof.isComplete() && !transfer.pending)
+                for (auto entry : transfer.entries) uses.try_emplace(entry);
         for (const auto& use : uses) {
             const auto& value = before[use.first];
             common::OriginalInputBinding binding; binding.reg = use.first; binding.missing = value.missing;
@@ -1616,7 +1662,8 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
             binding.equalEntry = value.equalEntry; binding.constant = value.constant;
             bindings &= !value.missing && value.bad.empty();
             proof.bindings.push_back(std::move(binding));
-            for (auto incoming : value.entries) demands.emplace(call.pc, incoming, "call-input");
+            if (!use.second.empty())
+                for (auto incoming : value.entries) demands.emplace(call.pc, incoming, "call-input");
         }
         proof.inputs = bindings ? common::OriginalFact::complete() : common::OriginalFact::partial(pending ? "pending-call-boundary-load-unresolved" : "actual-live-in-binding-unresolved");
         bool control = summary->control.isComplete() && proof.actualIncomingLink == std::optional<uint32_t>{uint32_t(proof.continuation)};
@@ -1842,8 +1889,19 @@ void ParamReturn::qualifyReturns()
     const auto& parameters = _config->getConfig().parameters;
     const auto& scope = parameters.getOriginalCallScope();
     if (scope) {
-        graph.identities.emplace(scope->root.start, scope->root);
-        for (const auto& identity : scope->callees) graph.identities.emplace(identity.start, identity);
+        auto add = [&](const auto& identity) {
+            graph.identities.emplace(identity.start, OriginalContractGraph::Identity{
+                identity.key, identity.imageId, identity.start, identity.end});
+        };
+        add(scope->root); for (const auto& identity : scope->callees) add(identity);
+        for (const auto& function : _config->getConfig().functions) {
+            if (!function.originalDiscovered) continue;
+            const auto& identity = *function.originalDiscovered;
+            const auto& context = parameters.getPsxMemoryContext();
+            if (!context || identity.contextHash != context->identity()) continue;
+            auto span = context->resolve(identity.start, identity.end - identity.start);
+            if (span && span->image->id == identity.imageId) add(identity);
+        }
     }
     for (auto& pair : _fnc2calls) {
         auto& de = pair.second;
@@ -1934,7 +1992,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 		};
 		try {
 			auto extent = revised ? graph.identities.at(cf->getStart().getValue())
-				: common::ReviewedOriginalFunction{"", "", "", "", selected.getStart().getValue(), selected.getEnd().getValue()};
+				: OriginalContractGraph::Identity{"", "", selected.getStart().getValue(), selected.getEnd().getValue()};
 			if (evidence.start != extent.start || evidence.end != extent.end)
 				throw std::runtime_error("decode-selection-evidence-missing");
 			std::map<uint64_t, const Disposition::Instruction*> instructions;
@@ -1943,7 +2001,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 					throw std::runtime_error("duplicate-decode-evidence");
 			}
 			auto imageView = revised ? originalImageView(_image, *scope, _config->getConfig().parameters,
-				evidence, summary.function) : std::optional<OriginalImageView>{};
+				evidence, summary.function, cf->originalDiscovered ? &*cf->originalDiscovered : nullptr) : std::optional<OriginalImageView>{};
             const auto calleePreservation = originalCalleePreservation(cf->originalCalleeContexts,
                 _config->getConfig().parameters, evidence, instructions, imageView);
 			RegisterState entry;
@@ -2037,7 +2095,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     std::optional<OriginalSnapshotDispatch> dispatch;
                     if (imageView && !rejectedDispatches.count(pc))
                         dispatch = sampleOriginalJumpTable({pc, evidence, instructions, definitions,
-                            *imageView, extent, scope->payloadHash}, state);
+                            *imageView, extent.imageId, imageView->owner ? imageView->owner->payloadHash : scope->payloadHash}, state);
                     if (dispatch) {
                         dispatchChanged = sampledDispatches.emplace(pc, std::move(*dispatch)).second;
                     } else {

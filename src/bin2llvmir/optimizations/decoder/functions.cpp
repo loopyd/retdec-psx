@@ -102,21 +102,20 @@ llvm::Function* Decoder::getFunctionContainingAddress(common::Address a)
 	return nullptr;
 }
 
-const common::ReviewedOriginalFunction* Decoder::getReviewedOriginalFunction(
-		common::Address addr) const
+std::optional<Decoder::OriginalDecodeOwner> Decoder::getOriginalDecodeOwner(common::Address addr) const
 {
-	if (!_config || addr.isUndefined()
-			|| !_config->getConfig().parameters.isOriginalOnlyReturnRecovery())
-		return nullptr;
+	if (!_config || addr.isUndefined() || !_config->getConfig().parameters.isOriginalOnlyReturnRecovery()) return {};
 	const auto& scope = _config->getConfig().parameters.getOriginalCallScope();
-	if (!scope) return nullptr;
-	auto contains = [&](const common::ReviewedOriginalFunction& function) {
+	if (!scope) return {};
+	auto contains = [&](const auto& function) {
 		return function.start <= addr.getValue() && addr.getValue() < function.end;
 	};
-	if (contains(scope->root)) return &scope->root;
+	if (contains(scope->root)) return OriginalDecodeOwner{scope->root.start, scope->root.end};
 	for (const auto& function : scope->callees)
-		if (contains(function)) return &function;
-	return nullptr;
+		if (contains(function)) return OriginalDecodeOwner{function.start, function.end};
+	for (const auto& entry : _originalDiscovered)
+		if (contains(entry.second)) return OriginalDecodeOwner{entry.second.start, entry.second.end};
+	return {};
 }
 
 /**
@@ -125,7 +124,7 @@ const common::ReviewedOriginalFunction* Decoder::getReviewedOriginalFunction(
  */
 llvm::Function* Decoder::createFunction(common::Address a, bool declaration)
 {
-	if (const auto* reviewed = getReviewedOriginalFunction(a))
+	if (const auto reviewed = getOriginalDecodeOwner(a))
 		if (a.getValue() != reviewed->start) refuseOriginalOwnership(a);
 	auto existing = _addr2fnc.find(a);
 	if (existing != _addr2fnc.end())

@@ -450,6 +450,19 @@ void serialize(Writer& writer, const common::Function& f)
             && std::holds_alternative<common::OriginalEntryStackWordBody>(*f.originalBodyCandidate));
     if (f.returnDisposition) disposition(writer, *f.returnDisposition);
     if (f.originalCallSummary) summary(writer, *f.originalCallSummary);
+	if (f.originalDiscovered) {
+		const auto& node = *f.originalDiscovered;
+		writer.Key("originalDiscovered"); writer.StartObject();
+		writer.Key("kind"); writer.String("native-bounded-callee/v1");
+		writer.Key("key"); writer.String(node.key); writer.Key("target"); writer.String(node.target);
+		writer.Key("imageId"); writer.String(node.imageId); writer.Key("contextHash"); writer.String(node.contextHash);
+		writer.Key("start"); writer.Uint64(node.start); writer.Key("end"); writer.Uint64(node.end);
+		writer.Key("words"); writer.StartArray();
+		for (const auto& word : node.words) {
+			writer.StartObject(); writer.Key("pc"); writer.Uint64(word.first); writer.Key("word"); writer.Uint(word.second); writer.EndObject();
+		}
+		writer.EndArray(); strings(writer, "remaining", node.remaining); writer.EndObject();
+	}
 	if (!f.originalJumpTables.empty()) {
 		writer.Key("originalJumpTables"); writer.StartArray();
 		for (const auto& table : f.originalJumpTables) {
@@ -616,6 +629,8 @@ void deserialize(const rapidjson::Value& val, common::Function& f)
     f.originalCallSummary.reset();
     if (val.HasMember("originalCallSummary")) throw std::runtime_error("original-call-summary-is-invocation-output-only");
 	f.originalCalleeContexts.reset();
+	f.originalDiscovered.reset();
+	if (val.HasMember("originalDiscovered")) throw std::runtime_error("original-discovered-function-is-invocation-output-only");
 	if (val.HasMember("originalCalleeContexts")) throw std::runtime_error("original-callee-context-is-invocation-output-only");
 	f.originalJumpTables.clear();
 	if (val.HasMember("originalJumpTables")) throw std::runtime_error("original-jump-tables-is-invocation-output-only");

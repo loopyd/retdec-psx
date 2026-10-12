@@ -20,7 +20,7 @@ class SegmentDataSource
 {
 public:
 	SegmentDataSource();
-	SegmentDataSource(const llvm::StringRef& data);
+	SegmentDataSource(const llvm::StringRef& data, bool readOnly = false);
 	SegmentDataSource(const SegmentDataSource& dataLoader);
 
 	bool isDataSet() const;
@@ -36,6 +36,7 @@ public:
 
 private:
 	llvm::StringRef _data;
+	bool _readOnly = false;
 };
 
 } // namespace loader

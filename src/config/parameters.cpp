@@ -521,6 +521,9 @@ void Parameters::serialize(Writer& writer) const
 	serdes::serializeBool(writer, JSON_keepAllFuncs, isKeepAllFunctions());
 	serdes::serializeBool(writer, JSON_selectedDecodeOnly, isSelectedDecodeOnly());
 	serdes::serializeBool(writer, JSON_originalOnlyReturnRecovery, isOriginalOnlyReturnRecovery(), false);
+	if (_psxMemoryContext) {
+		writer.Key("psxMemoryContext"); _psxMemoryContext->serialize(writer);
+	}
 	if (_originalSourceForm) {
 		writer.Key("originalSourceForm"); writer.String(common::originalSourceFormName(*_originalSourceForm));
 	}
@@ -601,6 +604,9 @@ template void Parameters::serialize(
  */
 void Parameters::deserialize(const rapidjson::Value& val)
 {
+	_psxMemoryContext.reset();
+	if (val.IsObject() && val.HasMember("psxMemoryContext"))
+		throw std::runtime_error("psx-memory-context-requires-native-validation");
 	_originalCallScope.reset();
 	_originalSourceForm.reset();
 	if (val.IsObject() && val.HasMember("originalSourceForm"))

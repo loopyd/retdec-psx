@@ -16,13 +16,13 @@ SegmentDataSource::SegmentDataSource() : _data(nullptr, 0)
 {
 }
 
-SegmentDataSource::SegmentDataSource(const llvm::StringRef& data)
-	: _data(data.data(), data.size())
+SegmentDataSource::SegmentDataSource(const llvm::StringRef& data, bool readOnly)
+	: _data(data.data(), data.size()), _readOnly(readOnly)
 {
 }
 
 SegmentDataSource::SegmentDataSource(const SegmentDataSource& dataSource)
-	: _data(dataSource._data.data(), dataSource._data.size())
+	: _data(dataSource._data.data(), dataSource._data.size()), _readOnly(dataSource._readOnly)
 {
 }
 
@@ -84,7 +84,7 @@ bool SegmentDataSource::loadData(std::uint64_t loadOffset, std::uint64_t loadSiz
 
 bool SegmentDataSource::saveData(std::uint64_t saveOffset, std::uint64_t saveSize, const std::vector<std::uint8_t>& data)
 {
-	if (!isDataSet())
+	if (_readOnly || !isDataSet())
 		return false;
 
 	if (saveOffset >= getDataSize())

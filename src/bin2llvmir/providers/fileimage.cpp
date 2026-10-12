@@ -9,6 +9,7 @@
 #include "retdec/bin2llvmir/utils/ir_modifier.h"
 #include "retdec/loader/image_factory.h"
 #include "retdec/loader/loader/raw_data/raw_data_image.h"
+#include "retdec/loader/loader/psx_overlay_image.h"
 
 using namespace llvm;
 
@@ -88,6 +89,13 @@ FileImage::FileImage(
 			_image.get()))
 	{
 		imgRaw->reload();
+	}
+	if (const auto& context = c.parameters.getPsxMemoryContext()) {
+		if (!ca.isMipsOrPic32() || !ca.isEndianLittle() || !c.fileFormat.isRaw())
+			throw std::runtime_error("psx-memory-context-requires-raw-mips-little-endian");
+		auto composed = std::make_unique<loader::PsxOverlayImage>(_image->getFileFormatWptr().lock(), context);
+		if (!composed->load()) throw std::runtime_error("psx-memory-context-empty");
+		_image = std::move(composed);
 	}
 
 	if (_image->getSegments().empty()
