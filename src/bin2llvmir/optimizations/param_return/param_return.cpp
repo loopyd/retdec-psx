@@ -625,7 +625,38 @@ struct OriginalIdentityFlow {
     const std::map<unsigned, Disposition::Definition>& definitions;
     const std::map<std::pair<uint64_t, uint64_t>, RegisterState>& states;
     const std::multimap<uint64_t, const Disposition::Edge*>& incoming;
+    const std::map<uint64_t, Disposition::Call>& calls;
 };
+
+bool originalIdentityCall(const OriginalIdentityFlow& flow, uint64_t pc, unsigned reg)
+{
+    auto call = flow.calls.find(pc);
+    auto instruction = flow.instructions.find(pc), delay = flow.instructions.find(pc + 4);
+    if (pc > UINT32_MAX - 8 || reg >= Disposition::RegisterCount || call == flow.calls.end()
+        || instruction == flow.instructions.end() || delay == flow.instructions.end()
+        || call->second.pc != pc || !call->second.contract || instruction->second->word >> 26 != 3
+        || call->second.target != originalOperation(*instruction->second).target) return false;
+    const auto* proof = std::get_if<common::OriginalPartialCall>(&*call->second.contract);
+    if (!proof) proof = &std::get<common::OriginalCompleteCall>(*call->second.contract).proof();
+    if (proof->callee.empty() || !proof->identity.isComplete() || !proof->inputs.isComplete()
+        || !proof->control.isComplete() || !proof->transfers.isComplete()
+        || proof->delay != pc + 4 || proof->continuation != pc + 8
+        || proof->actualIncomingLink != std::optional<uint32_t>{uint32_t(pc + 8)}
+        || proof->registerTransfers.size() != Disposition::RegisterCount) return false;
+    for (unsigned i = 0; i < Disposition::RegisterCount; ++i) {
+        const auto& transfer = proof->registerTransfers[i];
+        if (transfer.reg != i || !transfer.proof.isComplete() || transfer.pending
+            || !transfer.mayNoPending || !transfer.pendingDefinitions.empty()) return false;
+    }
+    const auto& transfer = proof->registerTransfers[reg];
+    if (transfer.kind != "preserved" || transfer.equalEntry != std::optional<unsigned>{reg}) return false;
+    for (const auto* row : {instruction->second, delay->second}) {
+        if (!row->mapped || row->undef || row->bytes != 4 || row->pc % 4 || row->owner != flow.symbol) return false;
+        auto operation = originalOperation(*row);
+        if (std::find(operation.destinations.begin(), operation.destinations.end(), reg) != operation.destinations.end()) return false;
+    }
+    return true;
+}
 
 const RegisterState* originalIdentityState(const OriginalIdentityFlow& flow, uint64_t pc)
 {
@@ -653,11 +684,13 @@ bool originalIdentityWriter(const OriginalIdentityFlow& flow, uint64_t pc, unsig
         const auto& row = *instruction->second;
         if (!row.mapped || row.undef || row.bytes != 4 || pc % 4 || row.owner != flow.symbol) return false;
         auto operation = originalOperation(row);
-        if (operation.kind == MipsOperation::Call) return false;
+        if (operation.kind == MipsOperation::Call && !originalIdentityCall(flow, pc, reg)) return false;
         auto context = flow.states.lower_bound({pc, 0})->first.second;
         if (context) {
             auto owner = flow.instructions.find(context);
-            if (owner == flow.instructions.end() || originalOperation(*owner->second).kind == MipsOperation::Call) return false;
+            if (owner == flow.instructions.end()
+                || (originalOperation(*owner->second).kind == MipsOperation::Call
+                    && !originalIdentityCall(flow, context, reg))) return false;
         }
         if (point.second) {
             if (operation.kind == MipsOperation::Trap || operation.kind == MipsOperation::Unsupported) return false;
@@ -2362,7 +2395,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                 [](const auto& row) { return row.domain == "architectural"; })) {
                 std::multimap<uint64_t, const Disposition::Edge*> incoming;
                 for (const auto& edge : evidence.edges) incoming.emplace(edge.to, &edge);
-                OriginalIdentityFlow flow{evidence.start, evidence.symbol, instructions, definitions, states, incoming};
+                OriginalIdentityFlow flow{evidence.start, evidence.symbol, instructions, definitions, states, incoming, calls};
                 for (auto& pair : definitions) {
                     auto& definition = pair.second;
                     if (definition.equalEntry) continue;
