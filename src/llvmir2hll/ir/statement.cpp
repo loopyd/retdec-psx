@@ -55,15 +55,18 @@ Statement::Statement(Address a):
 * discarded, use appendStatement() instead.
 */
 void Statement::setSuccessor(ShPtr<Statement> newSucc) {
+	if (newSucc == succ) return;
+	auto self = ucast<Statement>(shared_from_this());
 	if (succ) {
 		// Update the predecessors of the old successor.
-		succ->preds.erase(succ);
+		auto jump = cast<GotoStmt>(self);
+		if (!jump || jump->getTarget() != succ) succ->removePredecessor(self);
 	}
 
 	if (newSucc) {
 		// Update the non-goto predecessors of the new successor.
 		newSucc->removePredecessors(true);
-		newSucc->addPredecessor(ucast<Statement>(shared_from_this()));
+		newSucc->addPredecessor(self);
 	}
 
 	succ = newSucc;
@@ -613,7 +616,8 @@ void Statement::removePredecessors(bool onlyNonGoto) {
 	auto thisStmt = shared_from_this();
 	for (const auto &pred : preds) {
 		if (pred->getSuccessor() == thisStmt) {
-			toRemoveStmts.insert(pred);
+			auto jump = cast<GotoStmt>(pred);
+			if (!jump || jump->getTarget() != thisStmt) toRemoveStmts.insert(pred);
 		}
 	}
 	// For each node to be removed...
@@ -714,7 +718,6 @@ void Statement::redirectGotosTo(ShPtr<Statement> stmt) {
 		if (auto gotoStmt = cast<GotoStmt>(pred)) {
 			if (targetIsCurrentStatement(gotoStmt)) {
 				gotoStmt->setTarget(stmt);
-				preds.erase(pred);
 			}
 		}
 	}

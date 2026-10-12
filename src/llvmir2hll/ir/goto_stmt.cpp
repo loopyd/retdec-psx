@@ -57,11 +57,13 @@ ShPtr<Statement> GotoStmt::getTarget() const {
 */
 void GotoStmt::setTarget(ShPtr<Statement> newTarget) {
 	PRECONDITION_NON_NULL(newTarget);
+	if (newTarget == target) return;
+	auto self = ucast<Statement>(shared_from_this());
 
-	target->removeObserver(shared_from_this());
-	target->removePredecessor(ucast<Statement>(shared_from_this()));
-	newTarget->addObserver(shared_from_this());
-	newTarget->addPredecessor(ucast<Statement>(shared_from_this()));
+	target->removeObserver(self);
+	if (getSuccessor() != target) target->removePredecessor(self);
+	newTarget->addObserver(self);
+	newTarget->addPredecessor(self);
 	target = newTarget;
 }
 
