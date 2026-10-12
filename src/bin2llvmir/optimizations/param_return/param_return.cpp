@@ -1621,7 +1621,7 @@ std::optional<OriginalSnapshotDispatch> sampleOriginalJumpTable(
 }
 
 void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Disposition& disposition,
-    const FileImage* image, const common::OriginalCallScope& scope, const config::Parameters& parameters,
+    const FileImage* image, const std::optional<OriginalImageView>& view,
     const std::map<uint64_t, common::OriginalMemoryAccess>& flowAccesses)
 {
     for (auto& access : summary.accesses) {
@@ -1634,7 +1634,6 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
         || summary.exits.empty() || !evidence.calls.empty() || summary.pendingEntry != "requires-no-pending-gpr-loads"
         || evidence.start % 4 || evidence.end % 4 || evidence.start >= evidence.end
         || evidence.instructions.size() != (evidence.end - evidence.start) / 4 || !image) return;
-    auto view = originalImageView(image, scope, parameters, evidence, summary.function);
     if (!view) return;
     uint64_t load = view->mappingStart;
     const auto& payload = view->payload;
@@ -2450,7 +2449,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                         call.contract = std::move(complete); call.qualified = true; call.unresolved.clear();
                     }
                 }
-                recoverOriginalMemory(summary, disposition, _image, *scope, _config->getConfig().parameters, accesses);
+                recoverOriginalMemory(summary, disposition, _image, imageView, accesses);
 				if (imageView && cf->parameters.empty())
 					stackWordBody = proposeIncomingStackWordBody(disposition, summary, states);
             }
