@@ -679,7 +679,7 @@ bool originalIdentityWriter(const OriginalIdentityFlow& flow, uint64_t pc, unsig
         if (visited.size() > Disposition::RowLimit) return false;
         auto instruction = flow.instructions.find(pc);
         const auto* state = originalIdentityState(flow, pc);
-        if (instruction == flow.instructions.end() || !state || (*state)[reg].missing
+        if (instruction == flow.instructions.end() || !state
             || state->mayPending[reg] || !state->mayNoPending[reg]) return false;
         const auto& row = *instruction->second;
         if (!row.mapped || row.undef || row.bytes != 4 || pc % 4 || row.owner != flow.symbol) return false;
@@ -700,6 +700,7 @@ bool originalIdentityWriter(const OriginalIdentityFlow& flow, uint64_t pc, unsig
                 ++terminals; continue;
             }
         }
+        if ((*state)[reg].missing) return false;
         if (pc == flow.start) {
             if (expected) return false;
             ++terminals;
