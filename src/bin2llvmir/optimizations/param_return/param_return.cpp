@@ -1614,7 +1614,22 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
         }
         if (!originalMemoryPrefix(evidence, instructions, outgoing, incoming, access.pc, address->equalityEvidence)) continue;
         uint64_t count = access.width / 8, value = address->value;
-        if (view->physical && address->alignment.isComplete() && value >= load
+        if (view->context && address->alignment.isComplete() && value + count <= (uint64_t(1) << 32)) {
+            auto span = view->context->resolve(value, count);
+            auto canonical = common::psxRamAddress(value);
+            if (span && canonical) {
+                auto mapping = common::psxRamAddress(span->image->loadAddress);
+                if (mapping) {
+                    common::OriginalFileBytes bytes;
+                    bytes.mappingStart = uint32_t(*mapping); bytes.mappingBytes = span->image->payload->size();
+                    bytes.payloadOffset = span->payloadOffset;
+                    bytes.bytes.assign(span->bytes, span->bytes + span->size);
+                    std::vector<uint8_t> physical;
+                    if (loaded->getXBytes(*canonical, count, physical) && physical == bytes.bytes)
+                        address->fileBytes = std::move(bytes);
+                }
+            }
+        } else if (!view->context && view->physical && address->alignment.isComplete() && value >= load
             && value + count <= (uint64_t(1) << 32) && value - load <= payload.size()
             && count <= payload.size() - (value - load)) {
             common::OriginalFileBytes bytes;
