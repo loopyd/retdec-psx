@@ -1909,7 +1909,13 @@ void recoverOriginalAddressViews(llvm::Function& function, common::Function& sou
 		mixed |= access->width == 8 && overlap->view.width > 8;
 		overlap->view.accessPcs.push_back(access->pc);
 	}
-	if (!mixed) return;
+	bool byteRead = value && ordered.size() == 1 && ordered.front()->kind == "read"
+		&& ordered.front()->width == 8 && ordered.front()->extension == "zero"
+		&& std::all_of(evidence.obligations.begin(), evidence.obligations.end(), [&](const auto& obligation) {
+			return obligation.domain == "memory" && obligation.pc == ordered.front()->pc
+				&& obligation.reason == "contents-object-address-alias-effect-placement-unresolved";
+		});
+	if (!mixed && !byteRead) return;
 	std::sort(spans.begin(), spans.end(), [](const auto& a, const auto& b) { return a.view.start < b.view.start; });
 	for (auto& span : spans) {
 		span.view.symbol = "original_address_" + std::to_string(span.view.start);

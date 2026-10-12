@@ -573,6 +573,15 @@ void CHLLWriter::visit(ShPtr<GlobalVarDef> varDef) {
 				|| var->getInitialName() != global->getName().str()
 				|| (view.symbol != global->getName().str() && view.symbol != var->getName()))
 			throw std::runtime_error("invalid-original-address-view-emission");
+		if (source->sharedOriginalAddressViews->size() == 1 && summary.accesses.size() == 1 && view.width == 8) {
+			const auto& access = summary.accesses.front();
+			const auto* address = std::get_if<common::OriginalFixedMemoryAddress>(&access.address);
+			if (!value || access.kind != "read" || access.width != 8 || access.extension != "zero"
+					|| !access.delayed || !address || address->value != view.start
+					|| view.accessPcs != std::vector<uint64_t>{access.pc})
+				throw std::runtime_error("invalid-original-byte-read-view-emission");
+			var->setType(IntType::create(8, false));
+		}
 		view.symbol = var->getName();
 		conditional = true;
 	}
