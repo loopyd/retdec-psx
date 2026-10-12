@@ -1601,6 +1601,135 @@ private:
 	}
 };
 
+struct ConditionalValueSite {
+	ShPtr<AssignStmt> calculation;
+	ShPtr<IfStmt> branch;
+};
+
+class ConditionalValuePlacement final : public FuncOptimizer {
+public:
+	explicit ConditionalValuePlacement(ShPtr<Module> module) : FuncOptimizer(module) {}
+	std::string getId() const override { return "ConditionalValuePlacement"; }
+private:
+	ShPtr<ValueAnalysis> values;
+	ShPtr<VarUsesVisitor> uses;
+	StmtVector statements;
+	StmtSet seenStatements;
+
+	bool collect(ShPtr<Statement> statement, ShPtr<Statement> parent) {
+		ShPtr<Statement> previous;
+		for (; statement; previous = statement, statement = statement->getSuccessor()) {
+			if (!seenStatements.insert(statement).second || seenStatements.size() > common::ReturnDisposition::RowLimit
+					|| statement->getParent() != parent || statement->hasLabel() || statement->isGotoTarget()
+					|| (previous ? statement->getUniquePredecessor() != previous : statement->hasPredecessors())) return false;
+			statements.push_back(statement);
+			if (auto branch = cast<IfStmt>(statement)) {
+				if (branch->hasElseIfClauses() || !collect(branch->getFirstIfBody(), branch)
+						|| !collect(branch->getElseClause(), branch)) return false;
+			} else if (!isa<AssignStmt>(statement) && !isa<VarDefStmt>(statement)
+					&& !isa<ReturnStmt>(statement) && !isa<EmptyStmt>(statement)) return false;
+		}
+		return true;
+	}
+
+	bool local(ShPtr<Variable> variable) {
+		return variable && currFunc->hasLocalVar(variable) && !variable->isExternal()
+			&& !variable->isVolatile() && isa<IntType>(variable->getType())
+			&& !values->mayBePointed(variable);
+	}
+
+	bool pure(ShPtr<Expression> expression, ShPtr<Variable> result, VarSet& inputs,
+			std::set<ShPtr<Expression>>& seen, unsigned& count) {
+		if (!expression || ++count > common::ReturnDisposition::ReferenceLimit) return false;
+		if (isa<ConstInt>(expression)) return isa<IntType>(expression->getType());
+		if (auto variable = cast<Variable>(expression)) {
+			if (variable == result || !local(variable)) return false;
+			inputs.insert(variable);
+			return true;
+		}
+		if (!seen.insert(expression).second) return false;
+		if (isa<BitCastExpr>(expression) || isa<ExtCastExpr>(expression) || isa<TruncCastExpr>(expression)) {
+			auto extension = cast<ExtCastExpr>(expression);
+			auto truncation = cast<TruncCastExpr>(expression);
+			if ((extension && extension->getOriginalExtraction())
+					|| (truncation && truncation->getOriginalExtraction())) return false;
+			return pure(cast<CastExpr>(expression)->getOperand(), result, inputs, seen, count)
+				&& isa<IntType>(expression->getType());
+		}
+		if (isa<AddOpExpr>(expression) || isa<SubOpExpr>(expression)) {
+			auto operation = cast<BinaryOpExpr>(expression);
+			return pure(operation->getFirstOperand(), result, inputs, seen, count)
+				&& pure(operation->getSecondOperand(), result, inputs, seen, count)
+				&& isa<IntType>(expression->getType());
+		}
+		return false;
+	}
+
+	std::optional<ConditionalValueSite> prove(ShPtr<AssignStmt> calculation) {
+		auto result = cast<Variable>(calculation->getLhs());
+		auto branch = cast<IfStmt>(calculation->getSuccessor());
+		if (!local(result) || !branch || !branch->hasElseClause() || branch->hasElseIfClauses()
+				|| branch->getParent() != calculation->getParent() || branch->getUniquePredecessor() != calculation
+				|| !branch->getFirstIfBody() || !branch->getElseClause()
+				|| branch->getFirstIfBody() == branch->getElseClause()) return {};
+		auto condition = branch->getFirstIfCond();
+		if (!isa<EqOpExpr>(condition) && !isa<NeqOpExpr>(condition)) return {};
+		auto comparison = cast<BinaryOpExpr>(condition);
+		auto left = comparison->getFirstOperand(), right = comparison->getSecondOperand();
+		if (!((isa<Variable>(left) && isa<ConstInt>(right))
+				|| (isa<ConstInt>(left) && isa<Variable>(right)))) return {};
+		VarSet inputs;
+		std::set<ShPtr<Expression>> seen;
+		unsigned count = 0;
+		if (!pure(calculation->getRhs(), result, inputs, seen, count)
+				|| !pure(left, result, inputs, seen, count) || !pure(right, result, inputs, seen, count)) return {};
+		inputs.insert(result);
+		for (const auto& variable : inputs) {
+			auto accesses = uses->getUses(variable, currFunc);
+			if (!accesses->indirUses.empty()) return {};
+			StmtSet observed;
+			unsigned declarations = 0;
+			for (const auto& statement : statements) {
+				auto data = values->getValueData(statement);
+				if (data->hasAddressTaken(variable) || data->mayBeIndirAccessed(variable)
+						|| data->mustBeIndirAccessed(variable)) return {};
+				if (data->isDirAccessed(variable)) observed.insert(statement);
+				if (variable != result || !data->isDirWritten(result) || statement == calculation) continue;
+				auto declaration = cast<VarDefStmt>(statement);
+				if (!declaration || declaration->getVar() != result || declaration->getInitializer()
+						|| ++declarations > 1) return {};
+			}
+			if (accesses->dirUses != observed || (variable == result && !observed.count(calculation))) return {};
+		}
+		return ConditionalValueSite{calculation, branch};
+	}
+
+	void place(const ConditionalValueSite& site) {
+		auto first = cast<AssignStmt>(site.calculation->clone());
+		auto second = cast<AssignStmt>(site.calculation->clone());
+		first->setSuccessor(site.branch->getFirstIfBody());
+		second->setSuccessor(site.branch->getElseClause());
+		site.branch->setFirstIfBody(first);
+		site.branch->setElseClause(second);
+		Statement::removeStatement(site.calculation);
+	}
+
+	void runOnFunction(ShPtr<Function> function) override {
+		currFunc = function;
+		if (!function->getBody()) return;
+		statements.clear();
+		seenStatements.clear();
+		if (!collect(function->getBody(), nullptr)) return;
+		values = ValueAnalysis::create(SimpleAliasAnalysis::create(), false);
+		values->initAliasAnalysis(module);
+		uses = VarUsesVisitor::create(values, false);
+		for (const auto& statement : statements) if (auto calculation = cast<AssignStmt>(statement))
+			if (auto site = prove(calculation)) { place(*site); break; }
+		uses.reset();
+		values.reset();
+	}
+};
+
 bool onlyLowBitsUsed(const llvm::Argument &arg, unsigned bits) {
 	if (arg.use_empty()) return false;
 	for (auto *user : arg.users()) {
@@ -1935,7 +2064,10 @@ void recoverSourceSignatures(ShPtr<Module> module, const config::Config &config)
 		}
 		function->setParams(params);
 	}
-	if (config.parameters.isOriginalOnlyReturnRecovery()) OriginalZeroExtendedByteLocals(module, config).optimize();
+	if (config.parameters.isOriginalOnlyReturnRecovery()) {
+		OriginalZeroExtendedByteLocals(module, config).optimize();
+		ConditionalValuePlacement(module).optimize();
+	}
 }
 
 namespace {
