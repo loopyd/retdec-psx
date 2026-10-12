@@ -3,6 +3,7 @@ if(NOT TARGET retdec::llvmir2hll)
     find_package(retdec @PROJECT_VERSION@
         REQUIRED
         COMPONENTS
+            bin2llvmir
             config
             utils
             rapidjson

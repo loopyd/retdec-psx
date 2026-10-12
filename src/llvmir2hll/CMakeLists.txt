@@ -306,6 +306,8 @@ target_include_directories(llvmir2hll
 )
 
 target_link_libraries(llvmir2hll
+	PRIVATE
+		retdec::bin2llvmir
 	PUBLIC
 		retdec::config
 		retdec::utils
