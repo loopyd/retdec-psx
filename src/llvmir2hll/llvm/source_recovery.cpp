@@ -2441,6 +2441,364 @@ bool validateOriginalByteWriteViews(llvm::Function& function,
 	return true;
 }
 
+namespace {
+using StoreBaseEvidence = common::ReturnDisposition::Evidence;
+
+struct SharedStoreSite {
+	llvm::StoreInst* store;
+	llvm::IntToPtrInst* pointer;
+	llvm::BinaryOperator* address;
+	int32_t offset;
+};
+
+struct ProvenSharedStoreBase {
+	llvm::BinaryOperator* index;
+	uint64_t producerPc;
+	uint32_t constant;
+	std::vector<SharedStoreSite> sites;
+	bool nsw = false, nuw = false;
+};
+
+const common::ReturnDisposition::Definition* storeBaseDefinition(
+		const StoreBaseEvidence& evidence, unsigned id) {
+	auto* definition = original_expression::unique(evidence.definitions,
+		[&](const auto& row) { return row.id == id; });
+	if (!definition || definition->origin != "instruction" || definition->width != 32
+			|| !definition->reg || definition->reg > 31 || !definition->bad.empty()
+			|| !definition->entries.empty() || !definition->formals.empty()
+			|| definition->equalEntry || !definition->callee.empty() || definition->available || definition->delay
+			|| !definition->calleeDefinitions.empty() || !definition->substitutedEntries.empty()
+			|| definition->pc < evidence.start || definition->pc >= evidence.end
+			|| definition->pc % 4) return nullptr;
+	if (original_expression::unique(evidence.definitions, [&](const auto& row) {
+			return row.pc == definition->pc && row.reg == definition->reg;
+		}) != definition) return nullptr;
+	const auto& instruction = evidence.instructions[(definition->pc - evidence.start) / 4];
+	return std::count(instruction.fullWidthRegisters.begin(), instruction.fullWidthRegisters.end(),
+		definition->reg) == 1 ? definition : nullptr;
+}
+
+uint32_t storeBaseWord(const StoreBaseEvidence& evidence, uint64_t pc) {
+	return evidence.instructions[(pc - evidence.start) / 4].word;
+}
+
+bool storeBaseFallthrough(const StoreBaseEvidence& evidence, uint64_t pc) {
+	auto* edge = original_expression::unique(evidence.edges,
+		[&](const auto& row) { return row.to == pc; });
+	return edge && edge->from + 4 == pc && edge->kind == "fallthrough" && !edge->delayOwner;
+}
+
+std::optional<uint32_t> originalAddressConstant(const StoreBaseEvidence& evidence, unsigned id) {
+	auto* definition = storeBaseDefinition(evidence, id);
+	if (!definition || definition->delayed || !definition->constant) return {};
+	uint32_t word = storeBaseWord(evidence, definition->pc);
+	auto lui = [&](const common::ReturnDisposition::Definition& row) {
+		uint32_t instruction = storeBaseWord(evidence, row.pc);
+		return !row.delayed && row.inputs.empty() && row.operation == "lui"
+			&& instruction >> 26 == 15 && !((instruction >> 21) & 31)
+			&& ((instruction >> 16) & 31) == row.reg && row.constant
+			&& *row.constant == uint32_t(instruction << 16);
+	};
+	if (lui(*definition)) return definition->constant;
+	unsigned op = word >> 26;
+	if ((op != 9 && op != 13) || definition->operation != "integer-immediate"
+			|| definition->inputs.size() != 1 || ((word >> 16) & 31) != definition->reg) return {};
+	auto* high = storeBaseDefinition(evidence, definition->inputs.front());
+	if (!high || !lui(*high) || ((word >> 21) & 31) != high->reg
+			|| high->pc + 4 != definition->pc || !storeBaseFallthrough(evidence, definition->pc)) return {};
+	llvm::APInt value(32, *high->constant);
+	if (op == 9) value += llvm::APInt(16, word & 0xffff).sext(32);
+	else value |= llvm::APInt(32, word & 0xffff);
+	return value.getZExtValue() == *definition->constant ? definition->constant : std::nullopt;
+}
+
+bool storeBaseProducerControl(const StoreBaseEvidence& evidence, uint64_t pc) {
+	auto* incoming = original_expression::unique(evidence.edges,
+		[&](const auto& row) { return row.to == pc; });
+	if (!incoming || incoming->from + 4 != pc) return false;
+	if (!incoming->delayOwner) return incoming->kind == "fallthrough";
+	if (incoming->kind != "delay-slot" || *incoming->delayOwner != incoming->from
+			|| incoming->from < evidence.start || incoming->from >= evidence.end) return false;
+	uint32_t word = storeBaseWord(evidence, incoming->from);
+	unsigned op = word >> 26, rt = (word >> 16) & 31;
+	if (op != 4 && op != 5 && !((op == 6 || op == 7) && !rt)
+			&& !(op == 1 && rt <= 1)) return false;
+	int64_t target = int64_t(pc) + llvm::APInt(16, word & 0xffff).getSExtValue() * 4;
+	if (target < int64_t(evidence.start) || target >= int64_t(evidence.end)) return false;
+	unsigned fallthrough = 0, branch = 0, outgoing = 0;
+	for (const auto& edge : evidence.edges) if (edge.from == pc) {
+		++outgoing;
+		if (edge.delayOwner) return false;
+		fallthrough += edge.kind == "fallthrough" && edge.to == pc + 4;
+		branch += edge.kind == "branch" && edge.to == uint64_t(target);
+	}
+	return outgoing == 2 && fallthrough == 1 && branch == 1;
+}
+
+std::optional<uint64_t> originalStoreIndexBound(llvm::BinaryOperator& index,
+		const StoreBaseEvidence& evidence, const common::OriginalFunctionSummary& summary, unsigned id) {
+	auto* last = storeBaseDefinition(evidence, id);
+	if (!last || last->delayed || last->operation != "shift-immediate" || last->inputs.size() != 1
+			|| originalInstructionPc(index) != std::optional<uint64_t>{last->pc}) return {};
+	auto* sum = storeBaseDefinition(evidence, last->inputs.front());
+	if (!sum || sum->delayed || sum->operation != "integer-binary" || sum->inputs.size() != 2) return {};
+	const common::ReturnDisposition::Definition *first = nullptr, *byte = nullptr;
+	for (unsigned position = 0; position < 2; ++position) {
+		auto* shift = storeBaseDefinition(evidence, sum->inputs[position]);
+		auto* load = storeBaseDefinition(evidence, sum->inputs[1 - position]);
+		if (shift && load && shift->operation == "shift-immediate" && !shift->delayed
+				&& shift->inputs == std::vector<unsigned>{load->id}
+				&& load->operation == "full-register-load" && load->delayed) {
+			if (first) return {};
+			first = shift;
+			byte = load;
+		}
+	}
+	if (!first || first->pc != byte->pc + 8 || sum->pc != first->pc + 4 || last->pc != sum->pc + 4
+			|| !storeBaseFallthrough(evidence, byte->pc + 4) || !storeBaseFallthrough(evidence, first->pc)
+			|| !storeBaseFallthrough(evidence, sum->pc) || !storeBaseFallthrough(evidence, last->pc)) return {};
+	const auto& delay = evidence.instructions[(byte->pc + 4 - evidence.start) / 4];
+	if (std::find(delay.fullWidthRegisters.begin(), delay.fullWidthRegisters.end(), byte->reg)
+			!= delay.fullWidthRegisters.end()) return {};
+	uint32_t firstWord = storeBaseWord(evidence, first->pc), sumWord = storeBaseWord(evidence, sum->pc);
+	uint32_t lastWord = storeBaseWord(evidence, last->pc), loadWord = storeBaseWord(evidence, byte->pc);
+	auto shiftMatches = [](uint32_t word, unsigned destination, unsigned input) {
+		return !(word >> 26) && !(word & 63) && !((word >> 21) & 31)
+			&& ((word >> 11) & 31) == destination && ((word >> 16) & 31) == input;
+	};
+	if (!shiftMatches(firstWord, first->reg, byte->reg) || !shiftMatches(lastWord, last->reg, sum->reg)
+			|| (sumWord & 0xfc0007ffu) != 33 || ((sumWord >> 11) & 31) != sum->reg
+			|| !((((sumWord >> 21) & 31) == first->reg && ((sumWord >> 16) & 31) == byte->reg)
+				|| (((sumWord >> 16) & 31) == first->reg && ((sumWord >> 21) & 31) == byte->reg))
+			|| loadWord >> 26 != 36 || ((loadWord >> 16) & 31) != byte->reg
+			|| byte->inputs.size() != 1) return {};
+	auto* loadBase = storeBaseDefinition(evidence, byte->inputs.front());
+	auto loadConstant = originalAddressConstant(evidence, byte->inputs.front());
+	auto* read = original_expression::unique(summary.accesses,
+		[&](const auto& row) { return row.pc == byte->pc; });
+	if (!loadBase || !loadConstant || loadBase->pc + 4 != byte->pc
+			|| !storeBaseFallthrough(evidence, byte->pc) || ((loadWord >> 21) & 31) != loadBase->reg
+			|| !read || read->kind != "read" || read->width != 8 || read->extension != "zero"
+			|| !read->delayed || !read->addressEntries.empty()
+			|| read->addressDefinitions != byte->inputs) return {};
+	uint64_t scale = ((uint64_t(1) << ((firstWord >> 6) & 31)) + 1) << ((lastWord >> 6) & 31);
+	if (scale > uint64_t(INT32_MAX) / 255 || index.getOpcode() != llvm::Instruction::Mul
+			|| !index.getType()->isIntegerTy(32)) return {};
+	llvm::ZExtInst* extension = nullptr;
+	for (unsigned position = 0; position < 2; ++position) {
+		auto* factor = llvm::dyn_cast<llvm::ConstantInt>(index.getOperand(position));
+		if (factor && factor->getValue() == llvm::APInt(32, scale))
+			extension = llvm::dyn_cast<llvm::ZExtInst>(index.getOperand(1 - position));
+	}
+	auto* load = extension ? llvm::dyn_cast<llvm::LoadInst>(extension->getOperand(0)) : nullptr;
+	auto* pointer = load ? llvm::dyn_cast<llvm::ConstantExpr>(load->getPointerOperand()) : nullptr;
+	auto* address = pointer && pointer->getOpcode() == llvm::Instruction::IntToPtr
+		? llvm::dyn_cast<llvm::ConstantInt>(pointer->getOperand(0)) : nullptr;
+	llvm::APInt expected(32, *loadConstant);
+	expected += llvm::APInt(16, loadWord & 0xffff).sext(32);
+	if (!extension || !extension->getType()->isIntegerTy(32) || !load || !load->getType()->isIntegerTy(8)
+			|| !address || !address->getType()->isIntegerTy(32) || address->getValue() != expected
+			|| load->getPointerAddressSpace() || load->getParent() != index.getParent()
+			|| extension->getParent() != index.getParent()
+			|| originalInstructionPc(*load) != std::optional<uint64_t>{byte->pc}
+			|| originalInstructionPc(*extension) != std::optional<uint64_t>{byte->pc}) return {};
+	unsigned indexes = 0, loads = 0, extensions = 0;
+	for (const auto& block : *index.getFunction()) for (const auto& instruction : block) {
+		auto pc = originalInstructionPc(instruction);
+		indexes += pc == std::optional<uint64_t>{last->pc};
+		loads += pc == std::optional<uint64_t>{byte->pc} && llvm::isa<llvm::LoadInst>(instruction);
+		extensions += pc == std::optional<uint64_t>{byte->pc} && llvm::isa<llvm::ZExtInst>(instruction);
+	}
+	return indexes == 1 && loads == 1 && extensions == 1 ? std::optional<uint64_t>{scale * 255} : std::nullopt;
+}
+
+bool storeBaseRangeFits(const llvm::APInt& low, const llvm::APInt& high, bool nsw, bool nuw) {
+	return (!nsw || (low.sge(llvm::APInt::getSignedMinValue(32).sext(64))
+			&& high.sle(llvm::APInt::getSignedMaxValue(32).sext(64))))
+		&& (!nuw || high.ule(llvm::APInt::getMaxValue(32).zext(64)));
+}
+
+void recoverSharedOriginalStoreBases(llvm::Function& function,
+		const common::Function& source, const config::Config& config) {
+	const auto& scope = config.parameters.getOriginalCallScope();
+	const auto& context = config.parameters.getPsxMemoryContext();
+	const auto& layout = function.getParent()->getDataLayout();
+	if (!scope || !context || !source.returnDisposition || !source.originalCallSummary
+			|| function.isDeclaration() || source.getName() != function.getName().str()
+			|| !source.getStart().isDefined() || !source.getEnd().isDefined()
+			|| !layout.isLittleEndian() || layout.getPointerSizeInBits() != 32) return;
+	const auto& evidence = source.returnDisposition->evidence;
+	const auto& summary = *source.originalCallSummary;
+	if (!evidence.decodeComplete || !evidence.analysisComplete || !summary.entry.isComplete()
+			|| !summary.control.isComplete() || evidence.selection != "selected-root"
+			|| evidence.symbol != source.getName() || evidence.start != source.getStart().getValue()
+			|| evidence.end != source.getEnd().getValue() || scope->root.start != evidence.start
+			|| scope->root.end != evidence.end || scope->root.key != summary.function
+			|| evidence.start >= evidence.end || evidence.start % 4 || evidence.end % 4
+			|| evidence.end > uint64_t(UINT32_MAX) + 1
+			|| evidence.instructions.size() != (evidence.end - evidence.start) / 4
+			|| evidence.instructions.size() > common::ReturnDisposition::RowLimit
+			|| evidence.definitions.size() > common::ReturnDisposition::RowLimit
+			|| evidence.edges.size() > common::ReturnDisposition::ReferenceLimit
+			|| summary.accesses.size() > common::ReturnDisposition::RowLimit) return;
+	auto bytes = context->resolve(evidence.start, evidence.end - evidence.start);
+	if (!bytes || bytes->image->id != scope->root.imageId || bytes->image->payloadHash != scope->payloadHash) return;
+	for (size_t i = 0; i < evidence.instructions.size(); ++i) {
+		const auto& row = evidence.instructions[i];
+		uint32_t word = uint32_t(bytes->bytes[4 * i]) | (uint32_t(bytes->bytes[4 * i + 1]) << 8)
+			| (uint32_t(bytes->bytes[4 * i + 2]) << 16) | (uint32_t(bytes->bytes[4 * i + 3]) << 24);
+		if (row.pc != evidence.start + 4 * i || row.owner != source.getName()
+				|| row.bytes != 4 || !row.mapped || row.undef || row.word != word) return;
+	}
+	std::set<unsigned> ids;
+	for (const auto& row : evidence.definitions) if (!ids.insert(row.id).second) return;
+	std::map<uint64_t, const common::OriginalMemoryAccess*> accesses;
+	for (const auto& access : summary.accesses) {
+		if (access.pc < evidence.start || access.pc >= evidence.end || access.pc % 4
+				|| !accesses.emplace(access.pc, &access).second) return;
+	}
+	for (const auto& row : evidence.instructions) if (row.word >> 26 == 40) {
+		auto access = accesses.find(row.pc);
+		if (access == accesses.end() || access->second->kind != "write" || access->second->width != 8
+				|| access->second->extension != "none" || access->second->delayed) return;
+	}
+	std::map<llvm::Instruction*, size_t> order;
+	std::map<uint64_t, std::vector<llvm::StoreInst*>> stores;
+	std::map<std::pair<llvm::BinaryOperator*, unsigned>, std::vector<SharedStoreSite>> groups;
+	for (auto& block : function) for (auto& instruction : block) {
+		order.emplace(&instruction, order.size());
+		auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+		auto pc = originalInstructionPc(instruction);
+		if (!store || !pc) continue;
+		stores[*pc].push_back(store);
+		auto found = accesses.find(*pc);
+		if (found == accesses.end() || !store->getValueOperand()->getType()->isIntegerTy(8)) continue;
+		const auto& access = *found->second;
+		auto* pointer = llvm::dyn_cast<llvm::IntToPtrInst>(store->getPointerOperand());
+		auto* address = pointer ? llvm::dyn_cast<llvm::BinaryOperator>(pointer->getOperand(0)) : nullptr;
+		if (access.kind != "write" || access.addressDefinitions.size() != 1 || !access.addressEntries.empty()
+				|| !pointer || pointer->getType()->getPointerAddressSpace() || layout.isNonIntegralPointerType(pointer->getType())
+				|| !pointer->getType()->getPointerElementType()->isIntegerTy(8)
+				|| !address || address->getOpcode() != llvm::Instruction::Add || !address->getType()->isIntegerTy(32)
+				|| pointer->isUsedByMetadata() || address->isUsedByMetadata()
+				|| !hasOnlyLocationMetadata(*pointer) || !hasOnlyLocationMetadata(*address)
+				|| originalInstructionPc(*pointer) != pc || originalInstructionPc(*address) != pc) continue;
+		llvm::BinaryOperator* index = nullptr;
+		for (unsigned position = 0; position < 2; ++position)
+			if (llvm::isa<llvm::ConstantInt>(address->getOperand(position)))
+				index = llvm::dyn_cast<llvm::BinaryOperator>(address->getOperand(1 - position));
+		if (index) groups[{index, access.addressDefinitions.front()}].push_back({store, pointer, address, 0});
+	}
+	std::vector<ProvenSharedStoreBase> plans;
+	std::set<llvm::Instruction*> claimed;
+	for (auto& group : groups) {
+		auto* index = group.first.first;
+		auto* producer = storeBaseDefinition(evidence, group.first.second);
+		if (!producer || producer->delayed || producer->operation != "integer-binary"
+				|| producer->inputs.size() != 2 || !storeBaseProducerControl(evidence, producer->pc)) continue;
+		uint32_t word = storeBaseWord(evidence, producer->pc);
+		if ((word & 0xfc0007ffu) != 33 || ((word >> 11) & 31) != producer->reg) continue;
+		const common::ReturnDisposition::Definition *dynamic = nullptr, *constantDefinition = nullptr;
+		std::optional<uint32_t> constant;
+		for (unsigned position = 0; position < 2; ++position) {
+			auto candidate = originalAddressConstant(evidence, producer->inputs[position]);
+			if (candidate) {
+				if (constant) { dynamic = nullptr; break; }
+				constant = candidate;
+				constantDefinition = storeBaseDefinition(evidence, producer->inputs[position]);
+				dynamic = storeBaseDefinition(evidence, producer->inputs[1 - position]);
+			}
+		}
+		if (!constant || !dynamic || !constantDefinition || dynamic->pc >= producer->pc
+				|| constantDefinition->pc >= producer->pc
+				|| !((((word >> 21) & 31) == dynamic->reg && ((word >> 16) & 31) == constantDefinition->reg)
+					|| (((word >> 16) & 31) == dynamic->reg && ((word >> 21) & 31) == constantDefinition->reg))) continue;
+		auto bound = originalStoreIndexBound(*index, evidence, summary, dynamic->id);
+		if (!bound) continue;
+		std::set<uint64_t> originalPcs, boundPcs;
+		bool valid = true;
+		for (const auto& access : summary.accesses) {
+			if (access.kind != "write" || std::find(access.addressDefinitions.begin(), access.addressDefinitions.end(),
+					producer->id) == access.addressDefinitions.end()) continue;
+			uint32_t instruction = storeBaseWord(evidence, access.pc);
+			if (access.width != 8 || access.extension != "none" || access.delayed || !access.addressEntries.empty()
+					|| access.addressDefinitions != std::vector<unsigned>{producer->id}
+					|| instruction >> 26 != 40 || ((instruction >> 21) & 31) != producer->reg
+					|| access.pc <= producer->pc) { valid = false; break; }
+			originalPcs.insert(access.pc);
+		}
+		ProvenSharedStoreBase plan{index, producer->pc, *constant, group.second};
+		std::set<llvm::Instruction*> nodes;
+		for (auto& site : plan.sites) {
+			uint64_t pc = *originalInstructionPc(*site.store);
+			site.offset = int32_t(llvm::APInt(16, storeBaseWord(evidence, pc) & 0xffff).getSExtValue());
+			auto* folded = llvm::dyn_cast<llvm::ConstantInt>(site.address->getOperand(0));
+			if (!folded) folded = llvm::dyn_cast<llvm::ConstantInt>(site.address->getOperand(1));
+			llvm::APInt expected(32, plan.constant);
+			expected += llvm::APInt(32, uint32_t(site.offset));
+			if (!boundPcs.insert(pc).second || stores[pc].size() != 1 || !originalPcs.count(pc)
+					|| !folded || folded->getValue() != expected || site.address->getParent() != index->getParent()
+					|| site.pointer->getParent() != index->getParent() || site.store->getParent() != index->getParent()
+					|| order[index] >= order[site.address] || order[site.address] >= order[site.pointer]
+					|| order[site.pointer] >= order[site.store] || claimed.count(site.address) || claimed.count(site.pointer)
+					|| !nodes.insert(site.address).second || !nodes.insert(site.pointer).second) { valid = false; break; }
+			plan.nsw |= site.address->hasNoSignedWrap();
+			plan.nuw |= site.address->hasNoUnsignedWrap();
+		}
+		if (!valid || originalPcs.size() < 2 || boundPcs != originalPcs) continue;
+		auto known = llvm::computeKnownBits(index, layout);
+		if (known.hasConflict() || !known.isNonNegative()) continue;
+		llvm::APInt low = known.One.zext(64), high = (~known.Zero).zext(64);
+		if (high.ugt(llvm::APInt(64, *bound))) high = llvm::APInt(64, *bound);
+		if (low.ugt(high)) continue;
+		llvm::APInt base(32, plan.constant), signedLow = low + base.sext(64), signedHigh = high + base.sext(64);
+		llvm::APInt unsignedLow = low + base.zext(64), unsignedHigh = high + base.zext(64);
+		if (!storeBaseRangeFits(signedLow, signedHigh, plan.nsw, false)
+				|| !storeBaseRangeFits(unsignedLow, unsignedHigh, false, plan.nuw)) continue;
+		for (const auto& site : plan.sites) {
+			llvm::APInt offset(32, uint32_t(site.offset)), folded = base + offset;
+			bool nsw = site.address->hasNoSignedWrap(), nuw = site.address->hasNoUnsignedWrap();
+			if (!storeBaseRangeFits(low + folded.sext(64), high + folded.sext(64), nsw, false)
+					|| !storeBaseRangeFits(low + folded.zext(64), high + folded.zext(64), false, nuw)
+					|| !storeBaseRangeFits(signedLow + offset.sext(64), signedHigh + offset.sext(64), nsw, false)
+					|| !storeBaseRangeFits(unsignedLow + offset.zext(64), unsignedHigh + offset.zext(64), false, nuw)) {
+				valid = false; break;
+			}
+		}
+		if (!valid) continue;
+		std::sort(plan.sites.begin(), plan.sites.end(), [&](const auto& a, const auto& b) {
+			return order[a.address] < order[b.address];
+		});
+		claimed.insert(nodes.begin(), nodes.end());
+		plans.push_back(std::move(plan));
+	}
+	for (const auto& plan : plans) {
+		auto* base = llvm::BinaryOperator::CreateAdd(plan.index,
+			llvm::ConstantInt::get(plan.index->getType(), plan.constant), "", plan.index->getNextNode());
+		base->setHasNoSignedWrap(plan.nsw);
+		base->setHasNoUnsignedWrap(plan.nuw);
+		base->setMetadata("insn.addr", llvm::MDNode::get(function.getContext(), llvm::ConstantAsMetadata::get(
+			llvm::ConstantInt::get(llvm::Type::getInt64Ty(function.getContext()), plan.producerPc))));
+		for (const auto& site : plan.sites) {
+			auto* address = llvm::BinaryOperator::CreateAdd(base,
+				llvm::ConstantInt::get(base->getType(), uint32_t(site.offset)), "", site.address);
+			address->setHasNoSignedWrap(site.address->hasNoSignedWrap());
+			address->setHasNoUnsignedWrap(site.address->hasNoUnsignedWrap());
+			address->copyMetadata(*site.address);
+			address->setDebugLoc(site.address->getDebugLoc());
+			auto* pointer = new llvm::IntToPtrInst(address, site.pointer->getType(), "", site.pointer);
+			pointer->copyMetadata(*site.pointer);
+			pointer->setDebugLoc(site.pointer->getDebugLoc());
+			site.store->setOperand(1, pointer);
+		}
+		for (const auto& site : plan.sites) {
+			if (site.pointer->use_empty()) site.pointer->eraseFromParent();
+			if (site.address->use_empty()) site.address->eraseFromParent();
+		}
+	}
+}
+}
+
 void recoverPointerExpressions(llvm::Module &module, config::Config &config) {
 	if (config.parameters.isOriginalOnlyReturnRecovery()) {
 		for (auto& function : module) {
@@ -2465,6 +2823,7 @@ void recoverPointerExpressions(llvm::Module &module, config::Config &config) {
 					for (const auto& row : scope->callees) matchIdentity(row);
 					if (identities == 1) {
 						restoreSignedNarrowLoadEqualities(function, *source);
+						recoverSharedOriginalStoreBases(function, *source, config);
 						recoverOriginalAddressViews(function, const_cast<common::Function&>(*source), config);
 					}
 				}
