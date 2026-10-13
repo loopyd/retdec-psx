@@ -2258,16 +2258,23 @@ void recoverSourceSignatures(ShPtr<Module> module, const config::Config &config)
 		auto *machine = module->getLLVMModule()->getFunction(function->getInitialName());
 		auto *source = config.functions.getFunctionByName(function->getInitialName());
 		if (source && source->originalBodyCandidate) {
+			const bool stackWord = std::holds_alternative<common::OriginalEntryStackWordBody>(*source->originalBodyCandidate);
+			const bool valueStackWord = stackWord && source->returnDisposition
+				&& source->returnDisposition->kind == common::ReturnDisposition::Kind::Value
+				&& source->originalCallSummary && source->originalCallSummary->result.isComplete()
+				&& std::none_of(source->returnDisposition->evidence.obligations.begin(),
+					source->returnDisposition->evidence.obligations.end(),
+					[](const auto& obligation) { return obligation.domain == "architectural"; });
 			if (!config.parameters.isOriginalOnlyReturnRecovery()
 					|| source->getStart() != config.parameters.getEntryPoint()
 					|| !source->returnDisposition
-					|| source->returnDisposition->kind != common::ReturnDisposition::Kind::Unknown)
+					|| (source->returnDisposition->kind != common::ReturnDisposition::Kind::Unknown && !valueStackWord))
 				throw std::runtime_error("invalid-original-body-candidate-projection");
 			if (std::holds_alternative<common::OriginalOrdinaryBody>(*source->originalBodyCandidate)
-					|| std::holds_alternative<common::OriginalEntryStackWordBody>(*source->originalBodyCandidate)) {
+					|| stackWord) {
 				if (!machine || machine->isDeclaration() || !function->getBody())
 					throw std::runtime_error("original-body-proposal-lowering-incomplete");
-				if (std::holds_alternative<common::OriginalEntryStackWordBody>(*source->originalBodyCandidate)
+				if (stackWord
 						&& (machine->arg_size() != 5 || function->getNumOfParams() != 5
 							|| !machine->getReturnType()->isIntegerTy(32)))
 					throw std::runtime_error("conditional-stack-word-projection-incomplete");

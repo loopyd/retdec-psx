@@ -1716,15 +1716,28 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
 }
 
 namespace {
+bool stackWordResultSupported(const Disposition& disposition,
+	const common::OriginalFunctionSummary& summary)
+{
+	if (disposition.kind == Disposition::Kind::Unknown) {
+		if (summary.result.kind != common::OriginalFact::Kind::Partial) return false;
+	} else if (disposition.kind != Disposition::Kind::Value || !summary.result.isComplete()) return false;
+	return std::all_of(disposition.evidence.obligations.begin(), disposition.evidence.obligations.end(),
+		[&](const auto& obligation) {
+			return obligation.domain != "architectural" || (disposition.kind == Disposition::Kind::Unknown
+				&& obligation.pc == disposition.evidence.start
+				&& obligation.reason == "all-path-v0-definition-unresolved");
+		});
+}
+
 std::optional<common::OriginalEntryStackWordBody> proposeIncomingStackWordBody(
 	const Disposition& disposition, const common::OriginalFunctionSummary& summary,
 	const std::map<std::pair<uint64_t, uint64_t>, RegisterState>& states)
 {
 	const auto& evidence = disposition.evidence;
-	if (disposition.kind != Disposition::Kind::Unknown || evidence.selection != "selected-root"
+	if (!stackWordResultSupported(disposition, summary) || evidence.selection != "selected-root"
 		|| !evidence.decodeComplete || !evidence.analysisComplete || !evidence.calls.empty()
 		|| !summary.entry.isComplete() || !summary.control.isComplete()
-		|| summary.result.kind != common::OriginalFact::Kind::Partial
 		|| summary.declaration.kind != common::OriginalFact::Kind::Partial
 		|| summary.effects.kind != common::OriginalFact::Kind::Partial
 		|| summary.pendingEntry != "requires-no-pending-gpr-loads"
@@ -1824,8 +1837,6 @@ std::optional<common::OriginalEntryStackWordBody> proposeIncomingStackWordBody(
 			|| (demand.reg == 29 && taintedUses.count(demand.pc)))) return {};
 	bool entryObligation = false;
 	for (const auto& obligation : evidence.obligations) {
-		if (obligation.domain == "architectural" && (obligation.pc != evidence.start
-			|| obligation.reason != "all-path-v0-definition-unresolved")) return {};
 		if (obligation.domain == "entry") {
 			if (obligation.reason != "unproved-control-or-effect-input" || !taintedUses.count(obligation.pc)) return {};
 			entryObligation = true;
@@ -2461,7 +2472,8 @@ void ParamReturn::projectConditionalStackWordBody(const common::OriginalEntrySta
 	auto* selected = original.getFunctionByStartAddress(_config->getConfig().parameters.getEntryPoint());
 	if (!selected || !selected->originalBodyCandidate
 		|| !std::holds_alternative<common::OriginalEntryStackWordBody>(*selected->originalBodyCandidate)
-		|| !selected->returnDisposition || selected->returnDisposition->kind != Disposition::Kind::Unknown)
+		|| !selected->returnDisposition || !selected->originalCallSummary
+		|| !stackWordResultSupported(*selected->returnDisposition, *selected->originalCallSummary))
 		throw std::runtime_error("conditional-stack-word-proposal-scope-differs");
 	auto* function = _module->getFunction(selected->getName());
 	if (!function || function->isDeclaration() || function->arg_size() || function->isVarArg())
