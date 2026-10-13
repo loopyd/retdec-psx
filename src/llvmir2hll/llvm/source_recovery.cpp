@@ -1,4 +1,5 @@
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/IR/DataLayout.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/Analysis/ValueTracking.h>
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
+#include <variant>
 #include "retdec/config/config.h"
 #include "retdec/llvmir2hll/ir/function.h"
 #include "retdec/llvmir2hll/ir/int_type.h"
@@ -255,6 +257,268 @@ void recoverSignedScaledPredicates(llvm::Function &function) {
 		comparison->setOperand(1, llvm::ConstantInt::get(function.getContext(), proof->boundary));
 		comparison->setPredicate(proof->predicate);
 		if (scale->operation->use_empty()) scale->operation->eraseFromParent();
+	}
+}
+
+struct IntegerClampResult {};
+struct IntegralPointerClampResult { llvm::PointerType *type; };
+using ClampResult = std::variant<IntegerClampResult, IntegralPointerClampResult>;
+enum class ClampLocation { Retained, Sign, Lower, Range, Upper, Address, Pointer };
+struct CorrelatedClamp {
+	llvm::SelectInst *root;
+	llvm::Value *raw, *signedView, *base;
+	llvm::APInt upper;
+	ClampResult result;
+	std::map<llvm::Instruction*, ClampLocation> locations;
+};
+struct ClampComparison {
+	llvm::ICmpInst *instruction;
+	llvm::Value *value;
+	llvm::APInt boundary;
+	bool below;
+};
+
+std::optional<ClampComparison> proveClampComparison(llvm::Value *value) {
+	auto *comparison = llvm::dyn_cast<llvm::ICmpInst>(value);
+	if (!comparison || !comparison->getOperand(0)->getType()->isIntegerTy(32)) return {};
+	auto predicate = comparison->getPredicate();
+	auto *constant = llvm::dyn_cast<llvm::ConstantInt>(comparison->getOperand(1));
+	llvm::Value *input = comparison->getOperand(0);
+	if (!constant) {
+		constant = llvm::dyn_cast<llvm::ConstantInt>(comparison->getOperand(0));
+		input = comparison->getOperand(1);
+		predicate = llvm::ICmpInst::getSwappedPredicate(predicate);
+	}
+	if (!constant) return {};
+	llvm::APInt boundary = constant->getValue();
+	if (predicate == llvm::ICmpInst::ICMP_SLE || predicate == llvm::ICmpInst::ICMP_SGT) {
+		if (boundary.isMaxSignedValue()) return {};
+		boundary += llvm::APInt(32, 1);
+		predicate = predicate == llvm::ICmpInst::ICMP_SLE
+			? llvm::ICmpInst::ICMP_SLT : llvm::ICmpInst::ICMP_SGE;
+	}
+	if (predicate != llvm::ICmpInst::ICMP_SLT && predicate != llvm::ICmpInst::ICMP_SGE) return {};
+	return ClampComparison{comparison, input, boundary, predicate == llvm::ICmpInst::ICMP_SLT};
+}
+
+bool hasUnsupportedClampInput(llvm::Value *value) {
+	auto unsupported = [](llvm::Value *input) {
+		auto *operation = llvm::dyn_cast<llvm::Operator>(input);
+		return !input->getType()->isIntegerTy() || llvm::isa<llvm::UndefValue>(input)
+			|| (operation && operation->getOpcode() == llvm::Instruction::PtrToInt);
+	};
+	if (unsupported(value)) return true;
+	if (llvm::isa<llvm::LoadInst>(value) || llvm::isa<llvm::CallInst>(value)
+			|| llvm::isa<llvm::InvokeInst>(value)) return false;
+	auto *user = llvm::dyn_cast<llvm::User>(value);
+	return user && std::any_of(user->op_begin(), user->op_end(),
+		[&](const llvm::Use &operand) { return unsupported(operand.get()); });
+}
+
+std::optional<CorrelatedClamp> matchCorrelatedClamp(
+		llvm::SelectInst &root, const llvm::DataLayout &layout) {
+	ClampResult result = IntegerClampResult{};
+	auto *pointer = llvm::dyn_cast<llvm::PointerType>(root.getType());
+	if (pointer) {
+		if (layout.isNonIntegralPointerType(pointer)
+				|| layout.getPointerSizeInBits(pointer->getAddressSpace()) != 32) return {};
+		result = IntegralPointerClampResult{pointer};
+	} else if (!root.getType()->isIntegerTy(32)) return {};
+	CorrelatedClamp proof{&root, nullptr, nullptr, nullptr, llvm::APInt(32, 0), result, {}};
+	auto bind = [&](llvm::Value *value, ClampLocation location) {
+		if (llvm::isa<llvm::UndefValue>(value)) return false;
+		auto *instruction = llvm::dyn_cast<llvm::Instruction>(value);
+		if (!instruction) return true;
+		if (instruction->isUsedByMetadata() || !hasOnlyLocationMetadata(*instruction)) return false;
+		auto inserted = proof.locations.emplace(instruction, location);
+		return inserted.second || inserted.first->second == location;
+	};
+	if (!bind(&root, pointer ? ClampLocation::Pointer : ClampLocation::Address)) return {};
+	auto scalar = [&](llvm::Value *value) -> llvm::Value* {
+		if (!pointer) return value->getType()->isIntegerTy(32) ? value : nullptr;
+		if (value->getType() != pointer) return nullptr;
+		auto *operation = llvm::dyn_cast<llvm::Operator>(value);
+		if (!operation || operation->getOpcode() != llvm::Instruction::IntToPtr
+				|| (!llvm::isa<llvm::IntToPtrInst>(value) && !llvm::isa<llvm::ConstantExpr>(value))
+				|| !operation->getOperand(0)->getType()->isIntegerTy(32)
+				|| !bind(value, ClampLocation::Pointer)) return nullptr;
+		return operation->getOperand(0);
+	};
+	auto range = proveClampComparison(root.getCondition());
+	llvm::Value *negative = nullptr;
+	if (!range) {
+		auto *guard = llvm::dyn_cast<llvm::BinaryOperator>(root.getCondition());
+		if (!guard || guard->getOpcode() != llvm::Instruction::Or
+				|| !guard->getType()->isIntegerTy(1) || !bind(guard, ClampLocation::Upper)) return {};
+		for (unsigned i = 0; i < 2; ++i) {
+			auto candidate = proveClampComparison(guard->getOperand(i));
+			if (!candidate || !candidate->below || !candidate->boundary.isStrictlyPositive()) continue;
+			if (range) return {};
+			range = candidate;
+			negative = guard->getOperand(1 - i);
+		}
+	}
+	if (!range || !range->boundary.isStrictlyPositive()
+			|| !bind(range->instruction, ClampLocation::Range)) return {};
+	auto *low = scalar(root.getOperand(range->below ? 1 : 2));
+	auto *high = scalar(root.getOperand(range->below ? 2 : 1));
+	auto *lower = llvm::dyn_cast_or_null<llvm::SelectInst>(negative ? low : range->value);
+	if (!low || !high || !lower || !lower->getType()->isIntegerTy(32)
+			|| !bind(lower, ClampLocation::Lower)) return {};
+	llvm::Value *view = range->value;
+	if (!negative) {
+		auto *trueConstant = llvm::dyn_cast<llvm::ConstantInt>(lower->getTrueValue());
+		auto *falseConstant = llvm::dyn_cast<llvm::ConstantInt>(lower->getFalseValue());
+		if (trueConstant && trueConstant->isZero()) view = lower->getFalseValue();
+		else if (falseConstant && falseConstant->isZero()) view = lower->getTrueValue();
+		else return {};
+	}
+	auto *extend = llvm::dyn_cast<llvm::SExtInst>(view);
+	auto *truncate = extend ? llvm::dyn_cast<llvm::TruncInst>(extend->getOperand(0)) : nullptr;
+	if (!extend || !extend->getType()->isIntegerTy(32) || !truncate
+			|| !truncate->getOperand(0)->getType()->isIntegerTy(32)
+			|| !bind(extend, ClampLocation::Retained) || !bind(truncate, ClampLocation::Retained)) return {};
+	unsigned width = truncate->getType()->getIntegerBitWidth();
+	proof.upper = range->boundary - llvm::APInt(32, 1);
+	if (width <= 1 || width >= 32 || !proof.upper.ult(llvm::APInt(32, 1).shl(width - 1))) return {};
+	proof.raw = truncate->getOperand(0);
+	proof.signedView = extend;
+	auto sign = [&](llvm::Value *condition) -> std::optional<bool> {
+		if (auto comparison = proveClampComparison(condition)) {
+			if (comparison->value == view && comparison->boundary.isNullValue()
+					&& bind(comparison->instruction, ClampLocation::Sign)) return !comparison->below;
+			return {};
+		}
+		auto *comparison = llvm::dyn_cast<llvm::ICmpInst>(condition);
+		if (!comparison || (comparison->getPredicate() != llvm::ICmpInst::ICMP_EQ
+				&& comparison->getPredicate() != llvm::ICmpInst::ICMP_NE)) return {};
+		for (unsigned i = 0; i < 2; ++i) {
+			auto *constant = llvm::dyn_cast<llvm::ConstantInt>(comparison->getOperand(i));
+			auto *mask = llvm::dyn_cast<llvm::BinaryOperator>(comparison->getOperand(1 - i));
+			if (!constant || !constant->getType()->isIntegerTy(32) || !mask
+					|| mask->getOpcode() != llvm::Instruction::And) continue;
+			const llvm::APInt bit = llvm::APInt(32, 1).shl(width - 1);
+			if (!constant->isZero() && constant->getValue() != bit) continue;
+			for (unsigned j = 0; j < 2; ++j) {
+				auto *maskedBit = llvm::dyn_cast<llvm::ConstantInt>(mask->getOperand(j));
+				if (mask->getOperand(1 - j) != proof.raw || !maskedBit || maskedBit->getValue() != bit) continue;
+				if (!bind(mask, ClampLocation::Sign) || !bind(comparison, ClampLocation::Sign)) return {};
+				return (comparison->getPredicate() == llvm::ICmpInst::ICMP_EQ) == constant->isZero();
+			}
+		}
+		return {};
+	};
+	auto nonnegative = sign(lower->getCondition());
+	if (!nonnegative) return {};
+	auto *positiveValue = *nonnegative ? lower->getTrueValue() : lower->getFalseValue();
+	auto *negativeValue = *nonnegative ? lower->getFalseValue() : lower->getTrueValue();
+	if (negative) {
+		bool proved = negative == lower->getCondition() && !*nonnegative;
+		if (auto separate = sign(negative)) proved |= !*separate;
+		auto *operation = llvm::dyn_cast<llvm::BinaryOperator>(negative);
+		auto *comparison = llvm::dyn_cast<llvm::ICmpInst>(negative);
+		for (unsigned i = 0; i < 2 && !proved; ++i) {
+			llvm::Value *input = operation ? operation->getOperand(i)
+				: comparison ? comparison->getOperand(i) : nullptr;
+			auto *constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(operation ? operation->getOperand(1 - i)
+				: comparison ? comparison->getOperand(1 - i) : nullptr);
+			if (input != lower->getCondition() || !constant || !constant->getType()->isIntegerTy(1)) continue;
+			if (operation && operation->getOpcode() == llvm::Instruction::Xor)
+				proved = constant->isOne() == *nonnegative;
+			if (comparison && (comparison->getPredicate() == llvm::ICmpInst::ICMP_EQ
+					|| comparison->getPredicate() == llvm::ICmpInst::ICMP_NE))
+				proved = ((comparison->getPredicate() == llvm::ICmpInst::ICMP_EQ) == constant->isOne()) != *nonnegative;
+		}
+		if (!proved || !bind(negative, ClampLocation::Sign)) return {};
+	} else {
+		auto *zero = llvm::dyn_cast<llvm::ConstantInt>(negativeValue);
+		if (positiveValue != view || !zero || !zero->isZero()) return {};
+	}
+	auto *offset = negative ? view : static_cast<llvm::Value*>(lower);
+	auto *addition = llvm::dyn_cast<llvm::BinaryOperator>(negative ? positiveValue : low);
+	if (!addition || addition->getOpcode() != llvm::Instruction::Add
+			|| addition->hasNoSignedWrap() || addition->hasNoUnsignedWrap()
+			|| !bind(addition, ClampLocation::Address)) return {};
+	for (unsigned i = 0; i < 2; ++i)
+		if (addition->getOperand(i) == offset) proof.base = addition->getOperand(1 - i);
+	if (!proof.base || (negative && negativeValue != proof.base)
+			|| hasUnsupportedClampInput(proof.raw) || hasUnsupportedClampInput(proof.base)) return {};
+	bool sameHigh = proof.upper.isNullValue() && high == proof.base;
+	if (auto *base = llvm::dyn_cast<llvm::ConstantInt>(proof.base)) {
+		auto *constant = llvm::dyn_cast<llvm::ConstantInt>(high);
+		sameHigh |= constant && constant->getValue() == base->getValue() + proof.upper;
+	}
+	if (auto *highAdd = llvm::dyn_cast<llvm::BinaryOperator>(high)) {
+		if (highAdd->getOpcode() != llvm::Instruction::Add || highAdd->hasNoSignedWrap()
+				|| highAdd->hasNoUnsignedWrap() || !bind(highAdd, ClampLocation::Address)) return {};
+		for (unsigned i = 0; i < 2; ++i) {
+			auto *constant = llvm::dyn_cast<llvm::ConstantInt>(highAdd->getOperand(i));
+			sameHigh |= highAdd->getOperand(1 - i) == proof.base
+				&& constant && constant->getValue() == proof.upper;
+		}
+	}
+	if (!sameHigh) return {};
+	std::map<std::pair<ClampLocation, unsigned>, llvm::MDNode*> metadata;
+	for (const auto &location : proof.locations) {
+		if (location.second == ClampLocation::Retained) continue;
+		llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 4> attachments;
+		location.first->getAllMetadata(attachments);
+		for (const auto &attachment : attachments) {
+			auto inserted = metadata.emplace(std::make_pair(location.second, attachment.first), attachment.second);
+			if (!inserted.second && inserted.first->second != attachment.second) return {};
+		}
+	}
+	return proof;
+}
+
+void replaceCorrelatedClamp(const CorrelatedClamp &proof) {
+	auto *zero = llvm::ConstantInt::get(proof.signedView->getType(), 0);
+	auto *sign = new llvm::ICmpInst(proof.root, llvm::ICmpInst::ICMP_SGE, proof.signedView, zero);
+	auto *lower = llvm::SelectInst::Create(sign, proof.signedView, zero, "", proof.root);
+	auto *range = new llvm::ICmpInst(proof.root, llvm::ICmpInst::ICMP_SLT, lower,
+		llvm::ConstantInt::get(proof.root->getContext(), proof.upper + llvm::APInt(32, 1)));
+	auto *upper = llvm::SelectInst::Create(range, lower,
+		llvm::ConstantInt::get(proof.root->getContext(), proof.upper), "", proof.root);
+	auto *address = llvm::BinaryOperator::CreateAdd(proof.base, upper, "", proof.root);
+	llvm::Instruction *result = address;
+	if (auto *pointer = std::get_if<IntegralPointerClampResult>(&proof.result))
+		result = new llvm::IntToPtrInst(address, pointer->type, "", proof.root);
+	std::map<ClampLocation, llvm::Instruction*> owners{{ClampLocation::Sign, sign},
+		{ClampLocation::Lower, lower}, {ClampLocation::Range, range}, {ClampLocation::Upper, upper},
+		{ClampLocation::Address, address}, {ClampLocation::Pointer, result}};
+	std::vector<llvm::WeakTrackingVH> cleanup;
+	for (const auto &location : proof.locations) {
+		if (location.second == ClampLocation::Retained) continue;
+		llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 4> attachments;
+		location.first->getAllMetadata(attachments);
+		for (const auto &attachment : attachments)
+			owners.at(location.second)->setMetadata(attachment.first, attachment.second);
+		if (location.first != proof.root) cleanup.emplace_back(location.first);
+	}
+	proof.root->replaceAllUsesWith(result);
+	proof.root->eraseFromParent();
+	bool changed;
+	do {
+		changed = false;
+		for (auto &handle : cleanup) {
+			llvm::Value *live = handle;
+			auto *instruction = llvm::dyn_cast_or_null<llvm::Instruction>(live);
+			if (!instruction || !instruction->use_empty()) continue;
+			instruction->eraseFromParent();
+			changed = true;
+		}
+	} while (changed);
+}
+
+void recoverCorrelatedSignedClamps(llvm::Function &function, const llvm::DataLayout &layout) {
+	std::vector<llvm::WeakTrackingVH> roots;
+	for (auto &block : function) for (auto &instruction : block)
+		if (llvm::isa<llvm::SelectInst>(instruction)) roots.emplace_back(&instruction);
+	for (auto &handle : roots) {
+		llvm::Value *live = handle;
+		auto *root = llvm::dyn_cast_or_null<llvm::SelectInst>(live);
+		if (!root || !root->getParent()) continue;
+		if (auto proof = matchCorrelatedClamp(*root, layout)) replaceCorrelatedClamp(*proof);
 	}
 }
 
@@ -2205,6 +2469,8 @@ void recoverPointerExpressions(llvm::Module &module, config::Config &config) {
 					}
 				}
 			}
+			if (config.architecture.isMipsOrPic32())
+				recoverCorrelatedSignedClamps(function, module.getDataLayout());
 		}
 		return;
 	}
