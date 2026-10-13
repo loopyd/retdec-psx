@@ -53,6 +53,7 @@
 #include "retdec/llvmir2hll/ir/return_stmt.h"
 #include "retdec/llvmir2hll/ir/switch_stmt.h"
 #include "retdec/llvmir2hll/ir/break_stmt.h"
+#include "retdec/llvmir2hll/ir/while_loop_stmt.h"
 #include "retdec/llvmir2hll/ir/deref_op_expr.h"
 #include "retdec/llvmir2hll/graphs/cfg/cfg_builders/non_recursive_cfg_builder.h"
 #include "retdec/llvmir2hll/optimizer/func_optimizer.h"
@@ -1378,6 +1379,15 @@ struct ProvenScalarReturnMerge {
 	ShPtr<ReturnStmt> exit;
 };
 
+struct ProvenLoopReturnMerge {
+	ShPtr<Variable> source, result;
+	ShPtr<VarDefStmt> declaration;
+	ShPtr<Statement> initialization;
+	ShPtr<AssignStmt> fallback, copy;
+	ShPtr<BreakStmt> stop;
+	ShPtr<ReturnStmt> exit;
+};
+
 class ScalarReturnMergeRecovery final : public FuncOptimizer {
 public:
 	explicit ScalarReturnMergeRecovery(ShPtr<Module> module) : FuncOptimizer(module) {}
@@ -1409,6 +1419,19 @@ private:
 			Statement::removeStatementButKeepDebugComment(merge->copy);
 			currFunc->removeLocalVar(merge->source);
 		}
+		if (auto merge = proveLoop()) {
+			auto returned = ReturnStmt::create(
+				cast<Expression>(merge->fallback->getRhs()->clone()), nullptr, merge->stop->getAddress());
+			returned->setMetadata(merge->stop->getMetadata());
+			Statement::replaceStatement(merge->stop, returned);
+			merge->exit->setRetVal(merge->source);
+			Statement::removeStatementButKeepDebugComment(merge->initialization);
+			Statement::removeStatementButKeepDebugComment(merge->fallback);
+			Statement::removeStatementButKeepDebugComment(merge->copy);
+			if (merge->declaration != merge->initialization)
+				Statement::removeStatementButKeepDebugComment(merge->declaration);
+			currFunc->removeLocalVar(merge->result);
+		}
 	}
 
 	bool local(ShPtr<Variable> variable) {
@@ -1417,6 +1440,92 @@ private:
 			&& !variable->hasMetadata() && !values->mayBePointed(variable)
 			&& !module->hasAssignedDebugName(variable)
 			&& module->getDebugNameForLocalVar(currFunc, variable).empty();
+	}
+
+	bool sequence(ShPtr<Statement> first, ShPtr<Statement> parent, StmtSet &all, StmtVector &body) {
+		for (auto statement = first; statement; statement = statement->getSuccessor()) {
+			if (!all.insert(statement).second || statement->getParent() != parent
+					|| statement->hasLabel() || statement->isGotoTarget()
+					|| values->getValueData(statement)->hasCalls()) return false;
+			if (!isa<EmptyStmt>(statement)) body.push_back(statement);
+		}
+		return true;
+	}
+
+	std::optional<ProvenLoopReturnMerge> proveLoop() {
+		StmtSet all;
+		StmtVector prefix;
+		if (!sequence(currFunc->getBody(), nullptr, all, prefix) || prefix.size() < 3) return {};
+		auto loop = cast<WhileLoopStmt>(prefix[prefix.size() - 2]);
+		auto exit = cast<ReturnStmt>(prefix.back());
+		if (!loop || !exit) return {};
+		prefix.resize(prefix.size() - 2);
+		for (const auto& statement : prefix)
+			if (!isa<AssignStmt>(statement) && !isa<VarDefStmt>(statement)) return {};
+		auto initialization = prefix.back();
+		auto result = cast<Variable>(exit->getRetVal());
+		auto source = cast<Variable>(getRhs(initialization));
+		if (source == result || !local(source) || !local(result)
+				|| getLhs(initialization) != result
+				|| !source->getType()->isEqualTo(result->getType())) return {};
+		StmtVector body, stopped;
+		if (!sequence(loop->getBody(), loop, all, body) || body.size() < 3) return {};
+		auto copy = cast<AssignStmt>(body.back());
+		auto branch = cast<IfStmt>(body[body.size() - 2]);
+		auto fallback = cast<AssignStmt>(body[body.size() - 3]);
+		if (!copy || !branch || !fallback || branch->hasElseIfClauses() || branch->hasElseClause()
+				|| copy->getLhs() != result || copy->getRhs() != source || fallback->getLhs() != result) return {};
+		for (std::size_t i = 0; i + 2 < body.size(); ++i)
+			if (!isa<AssignStmt>(body[i])) return {};
+		auto constant = cast<ConstInt>(fallback->getRhs());
+		if (!constant || constant->hasMetadata() || !constant->getType()->isEqualTo(result->getType())
+				|| !sequence(branch->getFirstIfBody(), branch, all, stopped) || stopped.size() != 1) return {};
+		auto stop = cast<BreakStmt>(stopped.front());
+		if (!stop) return {};
+		ShPtr<VarDefStmt> declaration;
+		for (const auto& statement : prefix) {
+			auto candidate = cast<VarDefStmt>(statement);
+			if (!candidate || candidate->getVar() != result) continue;
+			if (declaration || (candidate->getInitializer() && candidate != initialization)) return {};
+			declaration = candidate;
+		}
+		if (!declaration) return {};
+		auto uses = VarUsesVisitor::create(values, false)->getUses(result, currFunc);
+		if (uses->dirUses != StmtSet{declaration, initialization, fallback, copy, exit}
+				|| !uses->indirUses.empty()) return {};
+		for (const auto& statement : all) {
+			auto accesses = values->getValueData(statement);
+			if ((accesses->isDirRead(result) && statement != exit)
+					|| accesses->hasAddressTaken(result) || accesses->hasAddressTaken(source)
+					|| accesses->mayBeIndirAccessed(result) || accesses->mustBeIndirAccessed(result)
+					|| accesses->mayBeIndirAccessed(source) || accesses->mustBeIndirAccessed(source)) return {};
+		}
+		auto cfg = NonRecursiveCFGBuilder::create()->getCFG(currFunc);
+		for (const auto& statement : all)
+			if (!isa<EmptyStmt>(statement) && !cfg->hasNodeForStmt(statement)) return {};
+		auto condition = cfg->getNodeForStmt(loop).first;
+		auto decision = cfg->getNodeForStmt(branch).first;
+		auto interrupted = cfg->getNodeForStmt(stop).first;
+		auto continued = cfg->getNodeForStmt(copy).first;
+		auto returned = cfg->getNodeForStmt(exit).first;
+		if (condition == decision || decision == interrupted || decision == continued
+				|| interrupted == continued || continued == returned || interrupted == returned
+				|| condition->getNumberOfSuccs() != 2 || decision->getNumberOfSuccs() != 2
+				|| interrupted->getNumberOfPreds() != 1 || interrupted->getNumberOfSuccs() != 1
+				|| (*interrupted->pred_begin())->getSrc() != decision
+				|| interrupted->getFirstSucc()->getDst() != returned || interrupted->getFirstSucc()->getLabel()
+				|| continued->getNumberOfPreds() != 1 || continued->getNumberOfSuccs() != 1
+				|| (*continued->pred_begin())->getSrc() != decision
+				|| continued->getFirstSucc()->getDst() != condition || continued->getFirstSucc()->getLabel()
+				|| returned->getNumberOfPreds() != 2) return {};
+		std::set<ShPtr<CFG::Node>> destinations, predecessors;
+		for (auto edge = decision->succ_begin(); edge != decision->succ_end(); ++edge)
+			destinations.insert((*edge)->getDst());
+		for (auto edge = returned->pred_begin(); edge != returned->pred_end(); ++edge)
+			predecessors.insert((*edge)->getSrc());
+		if (destinations != std::set<ShPtr<CFG::Node>>{interrupted, continued}
+				|| predecessors != std::set<ShPtr<CFG::Node>>{condition, interrupted}) return {};
+		return ProvenLoopReturnMerge{source, result, declaration, initialization, fallback, copy, stop, exit};
 	}
 
 	std::optional<ProvenScalarReturnMerge> prove() {
