@@ -33,8 +33,9 @@ void Decoder::discoverOriginalDirectTarget(uint64_t callPc, uint64_t target, boo
 	}
 	std::deque<uint64_t> pending{target};
 	std::set<uint64_t> slots;
+	auto outsideSpan = [target](uint64_t pc) { return pc < target || pc - target >= 1024; };
 	auto read = [&](uint64_t pc, uint32_t& word, bool& transfer) {
-		if (pc < target || pc - target >= 1024 || pc % 4 || conflict(pc)) return false;
+		if (outsideSpan(pc) || pc % 4 || conflict(pc)) return false;
 		auto bytes = context->resolve(pc, 4);
 		if (!bytes || bytes->image->id != node.imageId) return false;
 		if (!node.words.count(pc) && (node.words.size() >= 256 || _originalDiscoveredWords + node.words.size() >= 4096)) return false;
@@ -63,7 +64,11 @@ void Decoder::discoverOriginalDirectTarget(uint64_t callPc, uint64_t target, boo
 		}
 		uint32_t word;
 		bool transfer = false;
-		if (!read(pc, word, transfer)) { fail("discovered-image-or-instruction-bound"); break; }
+		if (!read(pc, word, transfer)) {
+			fail("discovered-image-or-instruction-bound");
+			if (outsideSpan(pc)) continue;
+			break;
+		}
 		auto op = word >> 26, rt = (word >> 16) & 31;
 		bool ret = word == 0x03e00008;
 		bool branch = op == 4 || op == 5 || ((op == 6 || op == 7) && rt == 0)
