@@ -56,8 +56,9 @@ An all-exit incoming-link restoration can support assigned register-2 flow into 
 direct caller under those retained conditions. Conditional call flow still
 refuses ordinary C body admission.
 
-Without an entry observation, original-only analysis can recover canonical
-full-word frame saves and restores across an acyclic original control-flow graph.
+For functions without a matching entry observation, original-only analysis can
+recover canonical full-word frame saves and restores across an acyclic original
+control-flow graph.
 The `symbolicFrame` report can retain caller register identities and assigned
 register-2 flow at a direct call. It requires an aligned frame wholly in ordinary
 RAM, frame writes disjoint from fetched code, stable mapping and instructions,

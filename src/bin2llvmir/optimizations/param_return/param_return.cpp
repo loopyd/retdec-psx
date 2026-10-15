@@ -2222,17 +2222,19 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
             const auto calleePreservation = originalCalleePreservation(cf->originalCalleeContexts,
                 _config->getConfig().parameters, evidence, instructions, imageView);
 			RegisterState entry;
-            const auto& observation = _config->getConfig().parameters.getOriginalEntryObservation();
-            if (observation && observation->function == summary.function && observation->pc == extent.start
-                && observation->imageId == extent.imageId && imageView && imageView->owner
-                && observation->imageHash == imageView->owner->fileHash) {
+            const auto& configuredObservation = _config->getConfig().parameters.getOriginalEntryObservation();
+            const common::OriginalEntryObservation* observation = nullptr;
+            if (configuredObservation && configuredObservation->function == summary.function
+                && configuredObservation->pc == extent.start && configuredObservation->imageId == extent.imageId
+                && imageView && imageView->owner && configuredObservation->imageHash == imageView->owner->fileHash) {
+                observation = &*configuredObservation;
                 summary.entryContext = common::OriginalObservedEntryContext{
                     observation->identity, observation->stateHash, observation->pc, observation->cpu};
                 if (observation->cpu.inIsr)
                     obligation(extent.start, "architectural", "observed-isr-context-preservation-unresolved");
             }
             std::map<uint64_t, OriginalFrameContract> frameUses;
-            entry.storage = OriginalMemoryState::bind(observation ? &*observation : nullptr,
+            entry.storage = OriginalMemoryState::bind(observation,
                 summary.function, extent.imageId, imageView && imageView->owner ? imageView->owner->fileHash : "", evidence);
             entry.mayNoPending.fill(true);
 			for (unsigned reg = 0; reg < Disposition::RegisterCount; ++reg)
@@ -2565,14 +2567,10 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 			for (auto& pair : definitions) {
 				references += pair.second.inputs.size() + pair.second.formals.size() + pair.second.bad.size();
 				if (references > Disposition::ReferenceLimit) throw std::runtime_error("return-references-exhausted");
-				if (observation) evidence.definitions.push_back(std::move(pair.second));
-                else evidence.definitions.push_back(pair.second);
+				evidence.definitions.push_back(pair.second);
 			}
 			for (auto& pair : exits) evidence.exits.push_back(std::move(pair.second));
-			for (auto& pair : calls) {
-                if (observation) evidence.calls.push_back(std::move(pair.second));
-                else evidence.calls.push_back(pair.second);
-            }
+			for (const auto& pair : calls) evidence.calls.push_back(pair.second);
 			evidence.decodeComplete = std::none_of(evidence.obligations.begin(), evidence.obligations.end(),
 				[](const auto& row) { return row.domain == "architectural"; });
 			evidence.analysisComplete = true;
