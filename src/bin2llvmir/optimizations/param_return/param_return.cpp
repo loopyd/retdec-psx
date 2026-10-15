@@ -534,6 +534,14 @@ void establishIdentity(RegisterFact& output, const RegisterState& state,
     else if (op == 0 && (fn == 33 || fn == 37 || fn == 38) && state[rs].constant == std::optional<uint32_t>{0}) copy(rt);
     else if (op == 0 && fn == 35 && state[rt].constant == std::optional<uint32_t>{0}) copy(rs);
     else if ((op == 9 || op == 13 || op == 14) && (row.word & 0xffff) == 0) copy(rs);
+    else if (state[rs].constant && (op == 10 || op == 11)) {
+        const auto value = *state[rs].constant;
+        const auto immediate = row.word & 0xffff;
+        const auto extended = (immediate & 0x8000) ? immediate | 0xffff0000u : immediate;
+        output.constant = op == 10
+            ? uint32_t((value ^ 0x80000000u) < (extended ^ 0x80000000u))
+            : uint32_t(value < extended);
+    }
     else if (state[rs].constant && (op == 9 || op == 12 || op == 13 || op == 14)) {
         auto value = *state[rs].constant;
         output.constant = op == 9 ? value + uint32_t(int32_t(int16_t(row.word & 0xffff)))

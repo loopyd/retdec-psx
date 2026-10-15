@@ -43,6 +43,10 @@ To clear a previous source override, reconfigure with `-U GOOGLETEST_LOCAL_DIR`.
 
 ## Original-only recovery
 
+Original register facts evaluate `SLTI` and `SLTIU` when the source is constant.
+Both sign-extend the immediate before the signed or unsigned 32-bit comparison.
+The result retains its input dependencies and establishes no entry or memory facts.
+
 Original-only analysis can bind a checked runtime entry observation after native
 discovery matches its function identity and original instructions. Native stores,
 calls, joins and delayed loads recover saved-register relationships within a
