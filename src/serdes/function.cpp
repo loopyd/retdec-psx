@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <rapidjson/prettywriter.h>
 #include <rapidjson/stringbuffer.h>
+#include <rapidjson/writer.h>
 
 #include "retdec/common/function.h"
 #include "retdec/serdes/address.h"
@@ -109,9 +110,24 @@ void transfer(Writer& writer, const retdec::common::OriginalTransfer& row)
 }
 
 template<typename Writer>
+void transferArray(Writer& writer, const std::vector<retdec::common::OriginalTransfer>& rows)
+{
+    writer.StartArray(); for (const auto& row : rows) transfer(writer, row); writer.EndArray();
+}
+
+template<typename Writer>
 void transfers(Writer& writer, const char* key, const std::vector<retdec::common::OriginalTransfer>& rows)
 {
-    writer.Key(key); writer.StartArray(); for (const auto& row : rows) transfer(writer, row); writer.EndArray();
+    writer.Key(key); transferArray(writer, rows);
+}
+
+std::string serializedTransfers(const std::vector<retdec::common::OriginalTransfer>& rows)
+{
+    rapidjson::StringBuffer buffer;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    transferArray(writer, rows);
+    if (!writer.IsComplete()) throw std::runtime_error("invalid-original-transfer-vector-serialization");
+    return std::string(buffer.GetString(), buffer.GetSize());
 }
 
 template<typename Writer>
@@ -207,8 +223,10 @@ void memoryAddress(Writer& writer, const retdec::common::OriginalMemoryAccess& a
 template<typename Writer>
 void summary(Writer& writer, const retdec::common::OriginalFunctionSummary& value)
 {
+    const auto joinedTransfers = serializedTransfers(value.transfers);
     writer.Key("originalCallSummary"); writer.StartObject(); writer.Key("function"); writer.String(value.function);
     writer.Key("pendingEntry"); writer.String(value.pendingEntry);
+    writer.Key("transferEncoding"); writer.String("summary-or-inline/v1");
     fact(writer, "entry", value.entry); fact(writer, "result", value.result); fact(writer, "control", value.control);
     fact(writer, "effects", value.effects); fact(writer, "declaration", value.declaration);
     fact(writer, "noMemoryWrites", value.noMemoryWrites);
@@ -276,13 +294,21 @@ void summary(Writer& writer, const retdec::common::OriginalFunctionSummary& valu
         writer.StartObject(); writer.Key("pc"); writer.Uint64(row.pc); writer.Key("register"); writer.Uint(row.reg);
         writer.Key("role"); writer.String(row.role); writer.EndObject();
     }
-    writer.EndArray(); transfers(writer, "transfers", value.transfers);
+    writer.EndArray(); writer.Key("transfers");
+    writer.RawValue(joinedTransfers.data(), joinedTransfers.size(), rapidjson::kArrayType);
     writer.Key("exits"); writer.StartArray();
     for (const auto& row : value.exits) {
+        const auto exitTransfers = serializedTransfers(row.transfers);
         writer.StartObject(); writer.Key("pc"); writer.Uint64(row.pc); writer.Key("delay"); writer.Uint64(row.delay);
         fact(writer, "incomingLink", row.incomingLink); optional(writer, "sampledEntry", row.sampledEntry);
         optional(writer, "sampledConstant", row.sampledConstant); numbers(writer, "sampledDefinitions", row.sampledDefinitions); numbers(writer, "equalityEvidence", row.equalityEvidence);
-        transfers(writer, "transfers", row.transfers); writer.EndObject();
+        writer.Key("transferSource"); writer.StartObject(); writer.Key("kind");
+        if (exitTransfers == joinedTransfers) writer.String("summary");
+        else {
+            writer.String("inline"); writer.Key("rows");
+            writer.RawValue(exitTransfers.data(), exitTransfers.size(), rapidjson::kArrayType);
+        }
+        writer.EndObject(); writer.EndObject();
     }
     writer.EndArray(); writer.Key("accesses"); writer.StartArray();
     for (const auto& row : value.accesses) {
