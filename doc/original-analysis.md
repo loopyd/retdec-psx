@@ -61,6 +61,16 @@ normal accesses, settled load delays and no external interference. Those
 conditions remain unresolved. Physical frame writes stay in the access report,
 and conditional frame flow refuses ordinary C body admission.
 
+Direct-call evidence can include an `entryPath` diagnostic derived from settled
+caller constants and the callee's original instructions. It records one complete
+finite path, branch operands and delay slots. Loads produce unknown values with
+MIPS-I timing. Unknown branches, reachable calls, loops and unsupported instructions
+refuse this diagnostic, as do observed entry states and copied instruction scopes.
+The generic callee summary and call contract remain authoritative. This path
+establishes no memory effects, stack separation, return target or C declaration.
+It assumes original fetched words, normal accesses and no external interference.
+Writes that may overlap code and exception behavior remain unresolved.
+
 The `entry-register-relative-first-use/v1` address report describes an operand's
 first reach from the original entry through checked instructions and call
 bindings. It records the entry, operand boundary, arithmetic evidence and crossed

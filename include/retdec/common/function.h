@@ -294,12 +294,30 @@ struct ReturnDisposition
 		std::vector<unsigned> definitions, formals, pendingDefinitions;
 		std::vector<std::string> bad;
 	};
+	struct EntryPath {
+		struct Binding {
+			unsigned reg = 0;
+			uint32_t constant = 0;
+			std::vector<unsigned> definitions;
+			std::vector<uint64_t> equalityEvidence;
+		};
+		struct Word { uint64_t pc; uint32_t word; };
+		struct Operand { unsigned reg; uint32_t constant; };
+		struct Branch { uint64_t pc; bool taken; std::vector<Operand> operands; };
+		std::string callee, contextHash;
+		std::vector<Binding> bindings;
+		std::vector<Word> instructions;
+		std::vector<Edge> edges;
+		std::vector<Branch> branches;
+		uint64_t terminalPc = 0;
+	};
 	struct Call {
 		uint64_t pc = 0;
 		std::optional<uint64_t> target;
 		bool required = true, qualified = false;
 		std::vector<std::string> unresolved;
 		std::optional<OriginalCallContract> contract;
+		std::optional<EntryPath> entryPath;
 	};
 	struct Obligation {
 		uint64_t pc = 0;

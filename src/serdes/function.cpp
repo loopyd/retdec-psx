@@ -302,6 +302,43 @@ void summary(Writer& writer, const retdec::common::OriginalFunctionSummary& valu
 }
 
 template<typename Writer>
+void entryPath(Writer& writer, const Disposition::EntryPath& path)
+{
+    writer.Key("entryPath"); writer.StartObject(); writer.Key("kind"); writer.String("mips-bound-call-path/v1");
+    writer.Key("callee"); writer.String(path.callee); writer.Key("contextHash"); writer.String(path.contextHash);
+    writer.Key("bindings"); writer.StartArray();
+    for (const auto& binding : path.bindings) {
+        writer.StartObject(); writer.Key("register"); writer.Uint(binding.reg);
+        writer.Key("constant"); writer.Uint(binding.constant); numbers(writer, "definitions", binding.definitions);
+        numbers(writer, "equalityEvidence", binding.equalityEvidence); writer.EndObject();
+    }
+    writer.EndArray(); writer.Key("instructions"); writer.StartArray();
+    for (const auto& row : path.instructions) {
+        writer.StartObject(); writer.Key("pc"); writer.Uint64(row.pc); writer.Key("word"); writer.Uint(row.word); writer.EndObject();
+    }
+    writer.EndArray(); writer.Key("edges"); writer.StartArray();
+    for (const auto& edge : path.edges) {
+        writer.StartObject(); writer.Key("from"); writer.Uint64(edge.from); writer.Key("to"); writer.Uint64(edge.to);
+        writer.Key("delayOwner"); if (edge.delayOwner) writer.Uint64(*edge.delayOwner); else writer.Null();
+        writer.Key("kind"); writer.String(edge.kind); writer.EndObject();
+    }
+    writer.EndArray(); writer.Key("branches"); writer.StartArray();
+    for (const auto& branch : path.branches) {
+        writer.StartObject(); writer.Key("pc"); writer.Uint64(branch.pc); writer.Key("taken"); writer.Bool(branch.taken);
+        writer.Key("operands"); writer.StartArray();
+        for (const auto& operand : branch.operands) {
+            writer.StartObject(); writer.Key("register"); writer.Uint(operand.reg);
+            writer.Key("constant"); writer.Uint(operand.constant); writer.EndObject();
+        }
+        writer.EndArray(); writer.EndObject();
+    }
+    writer.EndArray(); writer.Key("terminalPc"); writer.Uint64(path.terminalPc);
+    strings(writer, "remaining", std::vector<std::string>{"conditional-entry-state-unresolved", "declaration-unresolved",
+        "normal-return-target-unresolved", "original-memory-effects-unresolved", "stack-alias-restoration-unresolved"});
+    writer.EndObject();
+}
+
+template<typename Writer>
 void disposition(Writer& writer, const Disposition& value)
 {
 	writer.Key("returnDisposition"); writer.StartObject();
@@ -366,6 +403,7 @@ void disposition(Writer& writer, const Disposition& value)
             if (!row.contract) throw std::runtime_error("missing-original-call-contract");
             contract(writer, *row.contract);
         }
+        if (row.entryPath) entryPath(writer, *row.entryPath);
         writer.EndObject();
 	}
 	writer.EndArray(); writer.Key("obligations"); writer.StartArray();
