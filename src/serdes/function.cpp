@@ -212,6 +212,20 @@ void summary(Writer& writer, const retdec::common::OriginalFunctionSummary& valu
     fact(writer, "entry", value.entry); fact(writer, "result", value.result); fact(writer, "control", value.control);
     fact(writer, "effects", value.effects); fact(writer, "declaration", value.declaration);
     fact(writer, "noMemoryWrites", value.noMemoryWrites);
+    if (value.entryContext) {
+        const auto& context = *value.entryContext;
+        writer.Key("entryContext"); writer.StartObject();
+        writer.Key("kind"); writer.String("psx-observed-entry-context/v1");
+        writer.Key("observation"); writer.String(context.observation);
+        writer.Key("stateHash"); writer.String(context.stateHash);
+        writer.Key("entryPc"); writer.Uint(context.entryPc);
+        writer.Key("cpu"); writer.StartObject();
+        writer.Key("inIsr"); writer.Bool(context.cpu.inIsr);
+        writer.Key("status"); writer.Uint(context.cpu.status);
+        writer.Key("cause"); writer.Uint(context.cpu.cause);
+        writer.Key("epc"); writer.Uint(context.cpu.epc);
+        writer.EndObject(); writer.EndObject();
+    }
     if (value.scopedRestoration) {
         const auto& scoped = *value.scopedRestoration;
         writer.Key("scopedRestoration"); writer.StartObject();

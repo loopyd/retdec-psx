@@ -1970,6 +1970,14 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                 _config->getConfig().parameters, evidence, instructions, imageView);
 			RegisterState entry;
             const auto& observation = _config->getConfig().parameters.getOriginalEntryObservation();
+            if (observation && observation->function == summary.function && observation->pc == extent.start
+                && observation->imageId == extent.imageId && imageView && imageView->owner
+                && observation->imageHash == imageView->owner->fileHash) {
+                summary.entryContext = common::OriginalObservedEntryContext{
+                    observation->identity, observation->stateHash, observation->pc, observation->cpu};
+                if (observation->cpu.inIsr)
+                    obligation(extent.start, "architectural", "observed-isr-context-preservation-unresolved");
+            }
             std::map<uint64_t, OriginalFrameContract> frameUses;
             entry.storage = OriginalMemoryState::bind(observation ? &*observation : nullptr,
                 summary.function, extent.imageId, imageView && imageView->owner ? imageView->owner->fileHash : "", evidence);

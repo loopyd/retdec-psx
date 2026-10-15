@@ -39,9 +39,19 @@ struct OriginalCallScope {
 	ReviewedOriginalFunction root;
 	std::vector<ReviewedOriginalFunction> callees;
 };
+struct OriginalEntryCpuContext {
+	bool inIsr = false;
+	uint32_t status = 0, cause = 0, epc = 0;
+};
+struct OriginalObservedEntryContext {
+	std::string observation, stateHash;
+	uint32_t entryPc = 0;
+	OriginalEntryCpuContext cpu;
+};
 struct OriginalEntryObservation {
 	std::string identity, function, imageId, imageHash, stateHash;
 	uint32_t pc = 0, sp = 0;
+	OriginalEntryCpuContext cpu;
 	std::vector<uint8_t> ram;
 };
 struct OriginalScopedRestoration {
@@ -201,6 +211,7 @@ struct OriginalFunctionSummary {
 	std::vector<OriginalMemoryAccess> accesses;
 	std::vector<unsigned> parameterRegisters;
 	std::string pendingEntry = "requires-no-pending-gpr-loads";
+	std::optional<OriginalObservedEntryContext> entryContext;
 	std::optional<OriginalScopedRestoration> scopedRestoration;
 	std::optional<OriginalSymbolicFrame> symbolicFrame;
 };
