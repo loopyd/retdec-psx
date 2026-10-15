@@ -80,7 +80,14 @@ void Decoder::discoverOriginalDirectTarget(uint64_t callPc, uint64_t target)
 			}
 			slots.insert(pc + 4);
 			if (ret) continue;
-			if (indirect) { fail("discovered-indirect-transfer-unresolved"); break; }
+			if (indirect) {
+				fail("discovered-indirect-transfer-unresolved");
+				bool linkedCall = (word & 63) == 9 && rt == 0
+					&& ((word >> 6) & 31) == 0 && ((word >> 11) & 31) == 31
+					&& ((word >> 21) & 31) != 31;
+				if (linkedCall) pending.push_back(pc + 8);
+				continue;
+			}
 			if (branch) {
 				auto destination = int64_t(pc) + 4 + int64_t(int16_t(word)) * 4;
 				if (destination < 0 || destination > UINT32_MAX) { fail("discovered-branch-overflow"); break; }
