@@ -2015,6 +2015,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 			std::map<uint64_t, Disposition::Call> calls;
 			std::map<uint64_t, RegisterState> exitStates;
 			std::map<uint64_t, RegisterFact> sampledTargets;
+			std::map<uint64_t, RegisterFact> sampledBranchTargets;
 			std::set<std::tuple<uint64_t, unsigned, std::string>> demands;
 			std::map<uint64_t, common::OriginalMemoryAccess> accesses;
 			std::set<std::tuple<uint64_t, uint64_t, uint64_t, std::string>> edges;
@@ -2066,8 +2067,13 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     branchPathsChanged = widened != paths; paths = widened;
                 }
                 bool dispatchChanged = false;
+                bool branchTargetChanged = false;
                 if (revised && !owner && operation.kind == MipsOperation::Branch
                     && !operation.target && operation.name == "jr") {
+                    auto target = state[operation.inputs.front()];
+                    if (!trustedInstruction) target.bad.insert("unsupported-pc-ir-join");
+                    auto sampled = sampledBranchTargets.emplace(pc, target);
+                    branchTargetChanged = sampled.second || joinFact(sampled.first->second, target);
                     std::optional<OriginalSnapshotDispatch> dispatch;
                     if (imageView && !rejectedDispatches.count(pc))
                         dispatch = sampleOriginalJumpTable({pc, evidence, instructions, definitions,
@@ -2183,9 +2189,12 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 						});
 					obligation(pc, entryInput ? "entry" : "architectural", "unproved-control-or-effect-input");
 				}
-				auto send = [&](uint64_t target, uint64_t delayOwner, const std::string& kind, bool forceQueue = false) {
+				auto recordEdge = [&](uint64_t target, uint64_t delayOwner, const std::string& kind) {
 					edges.emplace(pc, target, delayOwner, kind);
 					if (edges.size() > Disposition::RowLimit) throw std::runtime_error("return-edges-exhausted");
+				};
+				auto send = [&](uint64_t target, uint64_t delayOwner, const std::string& kind, bool forceQueue = false) {
+					recordEdge(target, delayOwner, kind);
 					Node next{target, delayOwner};
 					auto insertion = states.emplace(next, state);
 					if (states.size() > Disposition::RowLimit) throw std::runtime_error("return-states-exhausted");
@@ -2224,19 +2233,37 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                         if (paths & BranchTaken) {
                             if (branch.target) send(*branch.target, 0, "branch");
                             else {
-                                obligation(owner, "architectural", "unresolved-branch-target");
-                                auto dispatch = sampledDispatches.find(owner);
-                                if (dispatch != sampledDispatches.end()) {
-                                    state.conditionalTables.insert(owner);
-                                    for (auto target : dispatch->second.distinctTargets())
-                                        send(target, 0, "conditional-table-branch");
+                                auto sampled = sampledBranchTargets.find(owner);
+                                if (sampled != sampledBranchTargets.end() && !sampled->second.missing
+                                    && sampled->second.bad.empty() && sampled->second.constant.has_value()
+                                    && *sampled->second.constant % 4 == 0) {
+                                    auto target = *sampled->second.constant;
+                                    if (target >= evidence.start && target < evidence.end)
+                                        send(target, 0, "branch");
+                                    else {
+                                        recordEdge(target, 0, "branch");
+                                        obligation(owner, "architectural", "external-tail-transfer-contract-unresolved");
+                                        const auto& context = _config->getConfig().parameters.getPsxMemoryContext();
+                                        bool owned = context ? bool(context->resolve(target, 4))
+                                            : imageView && imageView->contains(target, 4);
+                                        if (!owned)
+                                            obligation(owner, "architectural", "external-tail-transfer-owner-unresolved");
+                                    }
+                                } else {
+                                    obligation(owner, "architectural", "unresolved-branch-target");
+                                    auto dispatch = sampledDispatches.find(owner);
+                                    if (dispatch != sampledDispatches.end()) {
+                                        state.conditionalTables.insert(owner);
+                                        for (auto target : dispatch->second.distinctTargets())
+                                            send(target, 0, "conditional-table-branch");
+                                    }
                                 }
                             }
                         }
 						if (branch.conditional && (paths & BranchFallthrough)) send(owner + 8, 0, "fallthrough");
 					}
 				}
-				else if (control) send(pc + 4, pc, "delay-slot", branchPathsChanged || dispatchChanged);
+				else if (control) send(pc + 4, pc, "delay-slot", branchPathsChanged || dispatchChanged || branchTargetChanged);
 				else send(pc + 4, 0, "fallthrough");
 			}
 			for (const auto& edge : edges) evidence.edges.push_back({std::get<0>(edge), std::get<1>(edge),
