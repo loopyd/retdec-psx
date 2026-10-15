@@ -533,6 +533,8 @@ void establishIdentity(RegisterFact& output, const RegisterState& state,
     else if (op == 0 && (fn == 33 || fn == 37 || fn == 38) && state[rt].constant == std::optional<uint32_t>{0}) copy(rs);
     else if (op == 0 && (fn == 33 || fn == 37 || fn == 38) && state[rs].constant == std::optional<uint32_t>{0}) copy(rt);
     else if (op == 0 && fn == 35 && state[rt].constant == std::optional<uint32_t>{0}) copy(rs);
+    else if (op == 0 && fn == 36 && shift == 0 && state[rs].constant && state[rt].constant)
+        output.constant = *state[rs].constant & *state[rt].constant;
     else if ((op == 9 || op == 13 || op == 14) && (row.word & 0xffff) == 0) copy(rs);
     else if (state[rs].constant && (op == 10 || op == 11)) {
         const auto value = *state[rs].constant;
