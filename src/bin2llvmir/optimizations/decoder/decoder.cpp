@@ -242,6 +242,11 @@ bool Decoder::run()
 	initEnvironment();
 	initRanges();
 	initJumpTargets();
+	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery()) {
+		const auto& context = _config->getConfig().parameters.getPsxMemoryContext();
+		if (context && context->observedInstructionEntry())
+			discoverOriginalDirectTarget(0, *context->observedInstructionEntry(), true);
+	}
 
 	LOG << _ranges << std::endl;
 	LOG << _jumpTargets << std::endl;
@@ -441,6 +446,12 @@ void Decoder::publishOriginalDecodeCoverage(const std::string& failure)
 		disposition.contractGraph = bool(c.parameters.getOriginalCallScope());
 		auto& evidence = disposition.evidence;
 		evidence.start = extent.first; evidence.end = extent.second;
+		const auto& context = c.parameters.getPsxMemoryContext();
+		if (context && !context->instructionScopeHash().empty()
+			&& std::none_of(evidence.obligations.begin(), evidence.obligations.end(), [&](const auto& row) {
+				return row.pc == extent.first && row.domain == "architectural"
+					&& row.reason == "observed-copy-context-is-not-universal";
+			})) evidence.obligations.push_back({extent.first, "architectural", "observed-copy-context-is-not-universal"});
 		evidence.selection = extent.first == c.parameters.getEntryPoint().getValue() ? "selected-root" : "analysis-callee";
 		auto* f = getFunctionAtAddress(Address(extent.first));
 		auto* cf = _config->getConfigFunction(Address(extent.first));

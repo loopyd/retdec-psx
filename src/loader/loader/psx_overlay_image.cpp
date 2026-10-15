@@ -98,6 +98,12 @@ uint32_t word(const std::vector<uint8_t>& bytes, size_t offset) {
 }
 
 common::PsxOriginalImage validateImage(common::PsxOriginalImage image) {
+	if (image.mappingKind == "observed-original-copy/v1") {
+		auto checked = readPsxCopiedOriginal(image.mappingPath, image.mappingHash);
+		require(sameMapping(image, checked) && image.filePath == checked.filePath
+			&& image.target == checked.target, "psx-copied-image-identity-differs");
+		return checked;
+	}
 	require(digest(image.fileHash) && digest(image.payloadHash) && image.fileBytes <= ImageLimit
 		&& image.payloadBytes > 0 && image.payloadOffset <= image.fileBytes
 		&& image.payloadBytes <= image.fileBytes - image.payloadOffset, "psx-image-extent-invalid");
@@ -185,6 +191,8 @@ std::vector<common::PsxOriginalImage> readPsxImageMetadata(const std::string& pa
 		} else {
 			image.target = text(row, "target"); image.filePath = text(row, "file_path");
 			image.mappingKind = text(row, "mapping_kind");
+			require(image.mappingKind == "psx-exe-header" || image.mappingKind == "original-catalog",
+				"psx-overlay-mapping-kind-invalid");
 			if (image.mappingKind != "psx-exe-header") {
 				image.mappingPath = text(row, "mapping_path"); image.mappingHash = text(row, "mapping_sha256");
 			}
@@ -193,6 +201,91 @@ std::vector<common::PsxOriginalImage> readPsxImageMetadata(const std::string& pa
 		result.push_back(std::move(image));
 	}
 	return result;
+}
+
+common::PsxOriginalImage readPsxCopiedOriginal(const std::string& path, const std::string& expectedHash) {
+	auto encoded = readFile(path, 64 << 10);
+	auto identity = hash(encoded);
+	require(expectedHash.empty() || identity == expectedHash, "psx-copy-descriptor-identity-differs");
+	auto doc = document(encoded);
+	auto fields = [](const rapidjson::Value& row, std::initializer_list<const char*> names) {
+		require(row.IsObject(), "psx-copy-object-required");
+		std::set<std::string> expected(names.begin(), names.end()), found;
+		for (auto it = row.MemberBegin(); it != row.MemberEnd(); ++it) {
+			std::string name(it->name.GetString(), it->name.GetStringLength());
+			require(expected.count(name) && found.insert(name).second, "psx-copy-field-invalid");
+		}
+		require(found == expected, "psx-copy-field-missing");
+	};
+	fields(doc, {"kind", "source_offset", "bytes", "destination", "entry", "sha256", "scope", "files"});
+	require(text(doc, "kind") == "observed-original-copy/v1", "psx-copy-kind-invalid");
+	auto offset = number(doc, "source_offset"), count = number(doc, "bytes");
+	auto destination = number(doc, "destination"), entry = number(doc, "entry");
+	auto canonical = common::psxRamAddress(destination);
+	require(offset % 4 == 0 && count > 0 && count <= (64 << 10) && count % 4 == 0
+		&& offset <= 0x80000 && count <= 0x80000 - offset, "psx-copy-source-extent-invalid");
+	require(canonical && destination == *canonical && destination % 4 == 0
+		&& count <= 0x80200000 - destination && entry % 4 == 0
+		&& entry == destination, "psx-copy-destination-extent-invalid");
+	const auto& scope = doc["scope"];
+	fields(scope, {"receipt_sha256", "caller_pc", "entry_pc", "stop_pc", "first_instruction_sequence",
+		"last_instruction_sequence", "begin_cycle", "end_cycle"});
+	require(digest(text(scope, "receipt_sha256")), "psx-copy-receipt-digest-invalid");
+	for (auto name : {"caller_pc", "entry_pc", "stop_pc"}) {
+		auto pc = number(scope, name);
+		require(pc % 4 == 0 && common::psxRamAddress(pc), "psx-copy-scope-pc-invalid");
+	}
+	require(*common::psxRamAddress(number(scope, "entry_pc")) == entry, "psx-copy-entry-differs");
+	auto first = number(scope, "first_instruction_sequence"), last = number(scope, "last_instruction_sequence");
+	require(first > 0 && first <= last && last <= 65536, "psx-copy-sequence-invalid");
+	auto cycle = [&](const char* name) {
+		auto value = text(scope, name);
+		require(value.size() <= 20 && (value.size() == 1 || value.front() != '0'), "psx-copy-cycle-invalid");
+		uint64_t result = 0;
+		for (char digit : value) {
+			require(digit >= '0' && digit <= '9' && result <= (UINT64_MAX - (digit - '0')) / 10,
+				"psx-copy-cycle-invalid");
+			result = result * 10 + (digit - '0');
+		}
+		return result;
+	};
+	auto begin = cycle("begin_cycle"), end = cycle("end_cycle");
+	require(begin < end, "psx-copy-cycle-order-invalid");
+	const auto& files = doc["files"];
+	fields(files, {"bios.bin", "receipt.json", "history.json", "events.json", "events.ndjson", "payload.bin", "observations.json"});
+	require(path.size() > 27 && path.substr(path.size() - 27) == "/input/copy-descriptor.json", "psx-copy-descriptor-path-invalid");
+	auto workspace = path.substr(0, path.size() - 27);
+	std::map<std::string, uint64_t> limits{{"bios.bin", 0x80000}, {"receipt.json", 2 << 20},
+		{"history.json", 64 << 10}, {"events.json", 1 << 20}, {"events.ndjson", 64 << 20},
+		{"payload.bin", 8 << 20}, {"observations.json", 64 << 10}};
+	std::vector<uint8_t> bios;
+	for (const auto& item : limits) {
+		const auto& row = files[item.first.c_str()];
+		fields(row, {"path", "bytes", "sha256"});
+		auto relative = text(row, "path");
+		require(relative == "input/copy-" + item.first, "psx-copy-file-path-invalid");
+		auto size = number(row, "bytes");
+		auto pin = text(row, "sha256");
+		require(size > 0 && size <= item.second && digest(pin), "psx-copy-file-pin-invalid");
+		auto bytes = readFile(workspace + "/" + relative, item.second);
+		require(bytes.size() == size && hash(bytes) == pin, "psx-copy-file-identity-differs");
+		if (item.first == "receipt.json") require(pin == text(scope, "receipt_sha256"), "psx-copy-receipt-pin-differs");
+		if (item.first == "bios.bin") {
+			require(size == 0x80000, "psx-copy-bios-size-invalid");
+			bios = std::move(bytes);
+		}
+	}
+	common::PsxOriginalImage image;
+	image.id = "observed-copy:" + identity;
+	image.fileHash = text(files["bios.bin"], "sha256"); image.target = "bios/" + image.fileHash;
+	image.filePath = workspace + "/input/copy-bios.bin"; image.fileBytes = bios.size();
+	image.payloadOffset = offset; image.payloadBytes = count; image.loadAddress = destination;
+	image.payloadHash = text(doc, "sha256"); image.mappingKind = "observed-original-copy/v1";
+	image.mappingPath = path; image.mappingHash = identity; image.observedInstructionEntry = entry;
+	auto payload = std::make_shared<std::vector<uint8_t>>(bios.begin() + offset, bios.begin() + offset + count);
+	require(digest(image.payloadHash) && hash(*payload) == image.payloadHash, "psx-copy-original-slice-identity-differs");
+	image.payload = std::move(payload);
+	return image;
 }
 
 PsxOverlayManager::PsxOverlayManager() { apply({}); }
@@ -226,6 +319,14 @@ std::shared_ptr<const common::PsxMemoryContext> PsxOverlayManager::apply(const s
 	for (const auto& image : candidate->_mounts) {
 		require(image.payloadBytes <= TotalLimit - total, "psx-overlay-aggregate-byte-bound");
 		total += image.payloadBytes;
+	}
+	for (size_t index = 0; index < candidate->_mounts.size(); ++index) {
+		const auto& image = candidate->_mounts[index];
+		if (image.mappingKind != "observed-original-copy/v1") continue;
+		require(candidate->_instructionScopeHash.empty() && index + 1 == candidate->_mounts.size(),
+			"psx-copy-must-be-the-single-final-scoped-mount");
+		candidate->_instructionScopeHash = image.mappingHash;
+		candidate->_observedInstructionEntry = image.observedInstructionEntry;
 	}
 	candidate->_intervals = visible(candidate->_mounts);
 	rapidjson::StringBuffer buffer;

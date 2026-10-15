@@ -5,12 +5,15 @@
 
 namespace retdec { namespace bin2llvmir {
 
-void Decoder::discoverOriginalDirectTarget(uint64_t callPc, uint64_t target)
+void Decoder::discoverOriginalDirectTarget(uint64_t callPc, uint64_t target, bool observedLead)
 {
 	const auto& context = _config->getConfig().parameters.getPsxMemoryContext();
 	if (!context || _originalExtents.count(target) || target % 4 || target > UINT32_MAX) return;
 	auto source = context->resolve(target, 4);
 	if (!source) return;
+	if (observedLead && (context->instructionScopeHash().empty()
+		|| context->observedInstructionEntry() != std::optional<uint64_t>{target}
+		|| source->image->mappingKind != "observed-original-copy/v1")) return;
 	auto conflict = [&](uint64_t pc) {
 		auto extent = _originalExtents.upper_bound(pc);
 		return extent != _originalExtents.begin() && pc < std::prev(extent)->second;
@@ -18,6 +21,7 @@ void Decoder::discoverOriginalDirectTarget(uint64_t callPc, uint64_t target)
 	common::OriginalDiscoveredFunction node;
 	node.start = target; node.target = source->image->target; node.imageId = source->image->id;
 	node.key = node.target + "@" + common::Address(target).toHexString(); node.contextHash = context->identity();
+	if (observedLead) node.remaining.push_back("observed-copy-entry-does-not-prove-caller-edge");
 	auto fail = [&](const char* reason) {
 		node.remaining.push_back(reason);
 	};
@@ -121,6 +125,8 @@ void Decoder::discoverOriginalDirectTarget(uint64_t callPc, uint64_t target)
 	}
 	_ranges.addPrimary(common::Address(first), common::Address(previous + 4));
 	createFunction(common::Address(target));
+	if (observedLead) _jumpTargets.push(common::Address(target), JumpTarget::eType::UNKNOWN,
+		_c2l->getBasicMode(), common::Address::Undefined);
 }
 
 } }

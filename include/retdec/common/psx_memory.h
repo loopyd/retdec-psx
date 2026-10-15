@@ -16,6 +16,7 @@ struct PsxOriginalImage {
 	std::string id, target, filePath, fileHash, payloadHash;
 	std::string mappingKind, mappingPath, mappingHash;
 	uint64_t fileBytes = 0, payloadOffset = 0, payloadBytes = 0, loadAddress = 0;
+	std::optional<uint64_t> observedInstructionEntry;
 	std::shared_ptr<const std::vector<uint8_t>> payload;
 };
 
@@ -43,6 +44,8 @@ public:
 	};
 
 	const std::string& identity() const { return _identity; }
+	const std::string& instructionScopeHash() const { return _instructionScopeHash; }
+	const std::optional<uint64_t>& observedInstructionEntry() const { return _observedInstructionEntry; }
 	const std::vector<PsxOriginalImage>& mounts() const { return _mounts; }
 	const std::vector<PsxVisibleInterval>& intervals() const { return _intervals; }
 	std::optional<ByteSpan> resolve(uint64_t address, uint64_t count) const {
@@ -61,6 +64,9 @@ public:
 	template<typename Writer> void serialize(Writer& writer) const {
 		writer.StartObject(); writer.Key("schema"); writer.String("psx.memory-context/v1");
 		writer.Key("identity_sha256"); writer.String(_identity);
+		if (!_instructionScopeHash.empty()) {
+			writer.Key("instruction_scope_sha256"); writer.String(_instructionScopeHash);
+		}
 		writer.Key("mounts"); writer.StartArray();
 		for (const auto& image : _mounts) {
 			writer.StartObject();
@@ -83,7 +89,8 @@ public:
 
 private:
 	friend class retdec::loader::PsxOverlayManager;
-	std::string _identity;
+	std::string _identity, _instructionScopeHash;
+	std::optional<uint64_t> _observedInstructionEntry;
 	std::vector<PsxOriginalImage> _mounts;
 	std::vector<PsxVisibleInterval> _intervals;
 };

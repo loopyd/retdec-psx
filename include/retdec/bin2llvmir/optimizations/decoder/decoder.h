@@ -67,7 +67,7 @@ class Decoder : public llvm::ModulePass
 		std::map<uint64_t, common::ReturnDisposition> _originalDispositions;
 		std::map<uint64_t, uint64_t> _originalExtents;
 		void admitOriginalDirectTarget(uint64_t callPc, uint64_t target);
-		void discoverOriginalDirectTarget(uint64_t callPc, uint64_t target);
+		void discoverOriginalDirectTarget(uint64_t callPc, uint64_t target, bool observedLead = false);
 		std::map<uint64_t, common::OriginalDiscoveredFunction> _originalDiscovered;
 		size_t _originalDiscoveredWords = 0;
 		struct OriginalDecodeOwner { uint64_t start, end; };

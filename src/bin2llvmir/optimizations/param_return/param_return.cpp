@@ -1428,7 +1428,8 @@ std::optional<OriginalSnapshotDispatch> sampleOriginalJumpTable(
     report.tableBytes.mappingStart = site.image.mappingStart; report.tableBytes.mappingBytes = site.image.payload.size();
     if (site.image.context) {
         auto span = site.image.context->resolve(address, bytes);
-        if (!span || span->image != site.image.owner) return {};
+        if (!span || span->image != site.image.owner
+            || span->image->mappingKind == "observed-original-copy/v1") return {};
         report.tableBytes.payloadOffset = span->payloadOffset;
     } else report.tableBytes.payloadOffset = uint64_t(address) - site.image.mappingStart;
     report.tableBytes.bytes.assign(site.image.payload.begin() + report.tableBytes.payloadOffset,
@@ -1533,7 +1534,7 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
         if (view->context && address->alignment.isComplete() && value + count <= (uint64_t(1) << 32)) {
             auto span = view->context->resolve(value, count);
             auto canonical = common::psxRamAddress(value);
-            if (span && canonical) {
+            if (span && canonical && span->image->mappingKind != "observed-original-copy/v1") {
                 auto mapping = common::psxRamAddress(span->image->loadAddress);
                 if (mapping) {
                     common::OriginalFileBytes bytes;
@@ -1572,7 +1573,9 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     for (unsigned reg = 1; reg < Disposition::GprCount; ++reg) pending |= state.mayPending[reg];
     const common::OriginalFunctionSummary* summary = nullptr;
     const Disposition* callee = nullptr;
-    if (call.target && graph.functions.count(*call.target) && !graph.unavailable.count(*call.target)) {
+    const auto& context = config.getConfig().parameters.getPsxMemoryContext();
+    bool universalInstructions = !context || context->instructionScopeHash().empty();
+    if (universalInstructions && call.target && graph.functions.count(*call.target) && !graph.unavailable.count(*call.target)) {
         auto* de = graph.functions.at(*call.target);
         auto* cf = config.getConfigFunction(de->getFunction());
         if (cf && cf->originalCallSummary && de->getReturnDisposition()) {
@@ -1583,7 +1586,7 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     }
     auto before = state;
     auto preserved = preservation.find(call.pc);
-    bool conditionalPreservation = !summary && preserved != preservation.end() && !pending
+    bool conditionalPreservation = universalInstructions && !summary && preserved != preservation.end() && !pending
         && proof.actualIncomingLink == std::optional<uint32_t>{uint32_t(proof.continuation)};
     bool bindings = summary && summary->entry.isComplete() && !pending;
     if (summary) {
