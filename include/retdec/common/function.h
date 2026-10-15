@@ -8,6 +8,7 @@
 #define RETDEC_COMMON_FUNCTION_H
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <optional>
 #include <map>
@@ -50,13 +51,19 @@ struct OriginalObservedEntryContext {
 };
 struct OriginalEntryObservation {
 	std::string identity, function, imageId, imageHash, stateHash;
-	uint32_t pc = 0, sp = 0;
+	uint32_t pc = 0;
+	std::array<uint32_t, 32> registers{};
 	OriginalEntryCpuContext cpu;
 	std::vector<uint8_t> ram;
 };
 struct OriginalScopedRestoration {
 	std::string observation, stateHash;
 	uint32_t entryPc = 0, entrySp = 0, frameBytes = 0;
+	struct EntryBinding {
+		unsigned reg = 0;
+		uint32_t value = 0;
+	};
+	std::vector<EntryBinding> entryBindings;
 	struct Register {
 		unsigned reg = 0;
 		int32_t offset = 0;

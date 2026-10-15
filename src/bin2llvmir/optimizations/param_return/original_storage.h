@@ -25,6 +25,7 @@ class OriginalMemoryState {
     std::optional<uint32_t> _frame;
     std::array<std::optional<int32_t>, Disposition::RegisterCount> _offsets;
     std::map<uint32_t, Word> _words;
+    std::set<unsigned> _usedEntries;
     std::array<std::optional<Word>, Disposition::RegisterCount> _relations;
     std::array<std::optional<Word>, Disposition::GprCount> _pending;
     std::array<bool, Disposition::GprCount> _hasPending{};
@@ -39,7 +40,7 @@ public:
     void step(const Disposition::Instruction& row, const MipsOperation& operation, const RegisterState& state);
     void call(uint64_t pc, const common::OriginalCallContract* contract);
     static void summarize(common::OriginalFunctionSummary& summary,
-        const std::map<uint64_t, RegisterState>& exits);
+        const std::map<uint64_t, RegisterState>& exits, const Disposition::Evidence& evidence);
 };
 struct RegisterFact {
 	bool missing = true;
@@ -67,15 +68,6 @@ struct RegisterState {
     OriginalMemoryState storage;
     RegisterFact& operator[](unsigned reg) { return registers[reg]; }
     const RegisterFact& operator[](unsigned reg) const { return registers[reg]; }
-};
-class ScopedCallTransfer {
-    const common::OriginalTransfer* _transfer;
-    explicit ScopedCallTransfer(const common::OriginalTransfer& transfer) : _transfer(&transfer) {}
-public:
-    static std::optional<ScopedCallTransfer> bind(const Disposition::Call& call,
-        const common::OriginalPartialCall& proof, const common::OriginalFunctionSummary& summary,
-        const RegisterState& before);
-    const common::OriginalTransfer& transfer() const { return *_transfer; }
 };
 struct MipsOperation {
 	enum Kind { Compute, Multiply, Divide, Load, Store, Branch, Return, Call, Trap, Unsupported } kind = Unsupported;

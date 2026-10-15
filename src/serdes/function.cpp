@@ -247,13 +247,19 @@ void summary(Writer& writer, const retdec::common::OriginalFunctionSummary& valu
     if (value.scopedRestoration) {
         const auto& scoped = *value.scopedRestoration;
         writer.Key("scopedRestoration"); writer.StartObject();
-        writer.Key("kind"); writer.String("mips-observed-frame-restoration/v1");
+        writer.Key("kind"); writer.String("mips-observed-frame-restoration/v2");
         writer.Key("observation"); writer.String(scoped.observation);
         writer.Key("stateHash"); writer.String(scoped.stateHash);
         writer.Key("entryPc"); writer.Uint(scoped.entryPc);
         writer.Key("entrySp"); writer.Uint(scoped.entrySp);
         writer.Key("frameBytes"); writer.Uint(scoped.frameBytes);
-        strings(writer, "conditions", std::vector<std::string>{"captured-entry-sp-and-settled-load-state",
+        writer.Key("entryBindings"); writer.StartArray();
+        for (const auto& binding : scoped.entryBindings) {
+            writer.StartObject(); writer.Key("register"); writer.Uint(binding.reg);
+            writer.Key("value"); writer.Uint(binding.value); writer.EndObject();
+        }
+        writer.EndArray();
+        strings(writer, "conditions", std::vector<std::string>{"captured-entry-registers-and-settled-load-state",
             "ordinary-ram-mapping-and-cache-mode-remain-active", "original-instructions-remain-active",
             "accesses-and-instruction-fetches-complete-normally",
             "no-asynchronous-or-external-state-interference", "mips-i-load-and-branch-delays"});

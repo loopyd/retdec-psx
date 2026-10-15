@@ -50,11 +50,13 @@ The result retains its input dependencies and establishes no entry or memory fac
 Original-only analysis can bind a checked runtime entry observation after native
 discovery matches its function identity and original instructions. Native stores,
 calls, joins and delayed loads recover saved-register relationships within a
-fixed RAM frame. The `scopedRestoration` report retains its entry and execution
-conditions. It does not establish universal control, effects or C declarations.
-An all-exit incoming-link restoration can support assigned register-2 flow into a
-direct caller under those retained conditions. Conditional call flow still
-refuses ordinary C body admission.
+fixed RAM frame across an acyclic original control-flow graph with settled exits. The
+`scopedRestoration` report uses `mips-observed-frame-restoration/v2`. It retains
+the entry SP and sorted distinct `entryBindings` for captured non-SP registers
+used to resolve RAM accesses through their incoming identities. Every store
+invalidates overlapping saved words, and an unresolved store refuses the report.
+Its entry and execution conditions remain explicit. This callee-local report
+does not establish caller bindings, universal control, effects or C declarations.
 
 For functions without a matching entry observation, original-only analysis can
 recover canonical full-word frame saves and restores across an acyclic original

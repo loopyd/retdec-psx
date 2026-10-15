@@ -359,35 +359,6 @@ bool joinState(RegisterState& destination, const RegisterState& incoming)
     return changed;
 }
 
-std::optional<ScopedCallTransfer> ScopedCallTransfer::bind(const Disposition::Call& call,
-    const common::OriginalPartialCall& proof, const common::OriginalFunctionSummary& summary,
-    const RegisterState& before) {
-    if (!proof.identity.isComplete() || proof.callee != summary.function || !summary.entry.isComplete()
-        || summary.pendingEntry != "requires-no-pending-gpr-loads" || !summary.scopedRestoration
-        || !call.target || *call.target != summary.scopedRestoration->entryPc
-        || proof.delay != call.pc + 4 || proof.continuation != call.pc + 8
-        || proof.actualIncomingLink != std::optional<uint32_t>{uint32_t(proof.continuation)}
-        || summary.transfers.size() != Disposition::RegisterCount || summary.exits.empty()
-        || std::any_of(before.mayPending.begin(), before.mayPending.end(), [](bool value) { return value; })) return {};
-    const auto& transfer = summary.transfers[2];
-    if (transfer.reg != 2 || transfer.kind != "assigned" || !transfer.proof.isComplete()
-        || transfer.definitions.empty() || !transfer.bad.empty() || transfer.pending
-        || !transfer.mayNoPending || !transfer.pendingDefinitions.empty()) return {};
-    const common::OriginalScopedRestoration::Register* link = nullptr;
-    for (const auto& row : summary.scopedRestoration->registers) {
-        if (row.reg != 31) continue;
-        if (link || row.loadPcs.empty()) return {};
-        link = &row;
-    }
-    std::vector<uint64_t> exits;
-    for (const auto& exit : summary.exits) exits.push_back(exit.pc);
-    std::sort(exits.begin(), exits.end());
-    if (!link || link->exitPcs != exits) return {};
-    for (auto entry : transfer.entries)
-        if (entry >= Disposition::RegisterCount || before[entry].missing || !before[entry].bad.empty()) return {};
-    return ScopedCallTransfer(transfer);
-}
-
 std::optional<common::OriginalSymbolicFrame> OriginalFrameContract::recover(
     const OriginalIdentityFlow& flow, const Disposition::Evidence& evidence,
     const common::OriginalFunctionSummary& summary, const std::map<uint64_t, RegisterState>& exits,
@@ -612,7 +583,7 @@ void OriginalMemoryState::invalidate() {
 }
 std::optional<uint32_t> OriginalMemoryState::physical(int32_t offset, unsigned bytes) const {
     if (!_observation) return {};
-    int64_t address = int64_t(_observation->sp) + offset;
+    int64_t address = int64_t(_observation->registers[29]) + offset;
     if (address < 0 || address > UINT32_MAX) return {};
     auto ram = common::psxRamAddress(uint64_t(address));
     if (!ram || bytes > 0x80200000 - *ram) return {};
@@ -648,6 +619,9 @@ bool OriginalMemoryState::join(const OriginalMemoryState& incoming) {
         invalidate(); return true;
     }
     bool changed = false;
+    auto usedEntries = _usedEntries.size();
+    _usedEntries.insert(incoming._usedEntries.begin(), incoming._usedEntries.end());
+    changed |= _usedEntries.size() != usedEntries;
     for (unsigned reg = 0; reg < Disposition::RegisterCount; ++reg) {
         if (_offsets[reg] != incoming._offsets[reg] && _offsets[reg]) {
             _offsets[reg].reset(); changed = true;
@@ -720,6 +694,17 @@ void OriginalMemoryState::step(const Disposition::Instruction& row, const MipsOp
         if (_offsets[rs]) {
             int64_t sum = int64_t(*_offsets[rs]) + immediate;
             if (sum >= INT32_MIN && sum <= INT32_MAX) { offset = int32_t(sum); address = physical(*offset, bytes); }
+        } else if (!state[rs].missing && state[rs].equalEntry
+            && *state[rs].equalEntry < Disposition::GprCount && *state[rs].equalEntry != 29) {
+            unsigned entry = *state[rs].equalEntry;
+            int64_t sum = int64_t(_observation->registers[entry]) + immediate;
+            if (sum >= 0 && sum <= UINT32_MAX) {
+                auto canonical = common::psxRamAddress(uint64_t(sum));
+                if (canonical && bytes <= 0x80200000 - *canonical) {
+                    address = uint32_t(*canonical & 0x1fffffff);
+                    _usedEntries.insert(entry);
+                }
+            }
         } else if (state[rs].constant) {
             int64_t sum = int64_t(*state[rs].constant) + immediate;
             if (sum >= 0 && sum <= UINT32_MAX) {
@@ -798,9 +783,33 @@ void OriginalMemoryState::call(uint64_t pc, const common::OriginalCallContract* 
     for (auto& word : _words) word.second.calls.insert(pc);
 }
 void OriginalMemoryState::summarize(common::OriginalFunctionSummary& summary,
-    const std::map<uint64_t, RegisterState>& exits) {
+    const std::map<uint64_t, RegisterState>& exits, const Disposition::Evidence& evidence) {
     summary.scopedRestoration.reset();
-    if (exits.empty()) return;
+    if (exits.empty() || !evidence.analysisComplete) return;
+    for (const auto& exit : exits) {
+        const auto& storage = exit.second.storage;
+        if (std::any_of(storage._hasPending.begin(), storage._hasPending.end(),
+            [](bool pending) { return pending; })) return;
+    }
+    std::map<uint64_t, std::set<uint64_t>> successors;
+    std::map<uint64_t, unsigned> indegrees;
+    indegrees.emplace(evidence.start, 0);
+    for (const auto& edge : evidence.edges) {
+        if (edge.from < evidence.start || edge.from >= evidence.end || edge.from % 4
+            || edge.to < evidence.start || edge.to >= evidence.end || edge.to % 4) return;
+        indegrees.try_emplace(edge.from, 0);
+        indegrees.try_emplace(edge.to, 0);
+        if (successors[edge.from].insert(edge.to).second) ++indegrees[edge.to];
+    }
+    std::vector<uint64_t> ready;
+    for (const auto& point : indegrees) if (!point.second) ready.push_back(point.first);
+    if (ready != std::vector<uint64_t>{evidence.start}) return;
+    size_t consumed = 0;
+    while (!ready.empty()) {
+        uint64_t pc = ready.back(); ready.pop_back(); ++consumed;
+        for (auto next : successors[pc]) if (!--indegrees[next]) ready.push_back(next);
+    }
+    if (consumed != indegrees.size()) return;
     auto joined = exits.begin()->second.storage;
     for (auto it = std::next(exits.begin()); it != exits.end(); ++it) joined.join(it->second.storage);
     if (!joined._observation || !joined._eligible || !joined._frame || joined._offsets[29] != 0
@@ -808,7 +817,9 @@ void OriginalMemoryState::summarize(common::OriginalFunctionSummary& summary,
     common::OriginalScopedRestoration report;
     const auto& observation = *joined._observation;
     report.observation = observation.identity; report.stateHash = observation.stateHash;
-    report.entryPc = observation.pc; report.entrySp = observation.sp; report.frameBytes = *joined._frame;
+    report.entryPc = observation.pc; report.entrySp = observation.registers[29]; report.frameBytes = *joined._frame;
+    for (unsigned entry : joined._usedEntries)
+        report.entryBindings.push_back({entry, observation.registers[entry]});
     for (unsigned reg = 1; reg < Disposition::GprCount; ++reg) {
         const auto& relation = joined._relations[reg];
         if (!relation || relation->entry != reg || relation->loads.empty() || joined._hasPending[reg]) continue;

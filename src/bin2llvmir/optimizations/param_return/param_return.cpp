@@ -456,7 +456,6 @@ std::optional<common::OriginalOrdinaryBody> canProposeOrdinaryBody(const common:
 	if (!body) return {};
 	if (std::any_of(evidence.obligations.begin(), evidence.obligations.end(), [](const auto& row) {
 		return row.domain == "architectural" && (row.reason == "conditional-callee-preservation-unresolved"
-			|| row.reason == "conditional-callee-assigned-transfer-unresolved"
             || row.reason == "conditional-symbolic-frame-restoration-unresolved");
 	})) return {};
 	const auto& exit = evidence.exits.front();
@@ -1865,11 +1864,9 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
         proof.result = summary->result; proof.effects = summary->effects; proof.declaration = summary->declaration;
         proof.registerTransfers = summary->transfers;
     }
-    auto scoped = summary ? ScopedCallTransfer::bind(call, proof, *summary, before) : std::nullopt;
     auto frame = summary && allowFrames ? OriginalFrameContract::bind(call, proof, *summary, before) : std::nullopt;
     if (frame) frameUses.insert_or_assign(call.pc, *frame);
     else frameUses.erase(call.pc);
-    bool conditionalAssigned = false;
     bool transfers = summary && summary->transfers.size() == Disposition::RegisterCount && proof.control.isComplete() && !pending;
     for (unsigned reg = 1; reg < Disposition::RegisterCount; ++reg) {
         state[reg] = RegisterFact{};
@@ -1888,9 +1885,8 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
         transfers &= usable;
         if (usable && transfer->kind == "preserved") { state[reg] = before[reg]; continue; }
         if (!usable && frame && frame->preserves(reg)) { state[reg] = before[reg]; continue; }
-        bool scopedAssigned = !usable && ((scoped && transfer == &scoped->transfer())
-            || (frame && transfer == frame->assignedResult(before)));
-        if ((usable || scopedAssigned) && transfer->kind == "assigned" && callee && !transfer->definitions.empty()) {
+        bool frameAssigned = !usable && frame && transfer == frame->assignedResult(before);
+        if ((usable || frameAssigned) && transfer->kind == "assigned" && callee && !transfer->definitions.empty()) {
             RegisterFact output; output.missing = false;
             for (auto entry : transfer->entries) {
                 output.formals.insert(before[entry].formals.begin(), before[entry].formals.end());
@@ -1919,7 +1915,7 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
             output.equalityEvidence.insert(call.pc); output.equalityEvidence.insert(proof.delay);
             definition.equalEntry = output.equalEntry; definition.constant = output.constant;
             definition.equalityEvidence.assign(output.equalityEvidence.begin(), output.equalityEvidence.end());
-            state[reg] = std::move(output); conditionalAssigned |= scopedAssigned; continue;
+            state[reg] = std::move(output); continue;
         }
         state[reg].bad.insert(reg == 2 ? "unknown-call-result" : "unknown-call-clobber");
     }
@@ -1927,12 +1923,12 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     if (summary && !proof.effects.isComplete() && evidence.obligations.size() < Disposition::RowLimit
         && std::none_of(evidence.obligations.begin(), evidence.obligations.end(), [&](const auto& row) { return row.pc == call.pc && row.reason == "callee-memory-effects-unresolved"; }))
         evidence.obligations.push_back({call.pc, "memory", "callee-memory-effects-unresolved"});
-    if (conditionalPreservation || conditionalAssigned || frame) {
+    if (conditionalPreservation || frame) {
         state.conditionalCallees.insert(call.pc);
         if (state.conditionalCallees.size() > Disposition::ReferenceLimit)
             throw std::runtime_error("conditional-callee-references-exhausted");
         const std::string reason = frame ? "conditional-symbolic-frame-restoration-unresolved"
-            : conditionalAssigned ? "conditional-callee-assigned-transfer-unresolved" : "conditional-callee-preservation-unresolved";
+            : "conditional-callee-preservation-unresolved";
         if (std::none_of(evidence.obligations.begin(), evidence.obligations.end(), [&](const auto& row) {
             return row.pc == call.pc && row.domain == "architectural" && row.reason == reason;
         })) {
@@ -2609,7 +2605,7 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                 }
                 summarizeOriginal(summary, disposition, exitStates, sampledTargets, demands, accesses, graph.unavailable.count(evidence.start));
                 if (flowComplete && summary.entry.isComplete()) {
-                    OriginalMemoryState::summarize(summary, exitStates);
+                    OriginalMemoryState::summarize(summary, exitStates, evidence);
                     if (!observation) {
                         std::multimap<uint64_t, const Disposition::Edge*> incoming;
                         for (const auto& edge : evidence.edges) incoming.emplace(edge.to, &edge);
