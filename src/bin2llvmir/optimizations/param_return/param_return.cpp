@@ -1571,6 +1571,67 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
 using EntryPath = Disposition::EntryPath;
 using PathConstants = std::array<std::optional<uint32_t>, Disposition::GprCount>;
 
+bool hasBoundEntryPathCalls(const Disposition::Evidence& evidence, const Disposition::Call& selected)
+{
+    std::map<uint64_t, const Disposition::Instruction*> instructions;
+    std::map<uint64_t, const Disposition::Call*> calls;
+    std::map<uint64_t, std::vector<uint64_t>> outgoing;
+    for (const auto& row : evidence.instructions)
+        if (!instructions.emplace(row.pc, &row).second) return false;
+    for (const auto& call : evidence.calls)
+        if (!calls.emplace(call.pc, &call).second) return false;
+    for (const auto& edge : evidence.edges) outgoing[edge.from].push_back(edge.to);
+    auto original = [&](uint64_t pc) -> const Disposition::Instruction* {
+        auto found = instructions.find(pc);
+        if (found == instructions.end()) return nullptr;
+        const auto& row = *found->second;
+        return pc >= evidence.start && pc < evidence.end && pc % 4 == 0 && row.bytes == 4
+            && row.mapped && !row.undef && row.owner == evidence.symbol ? &row : nullptr;
+    };
+    const auto* selectedWord = original(selected.pc);
+    if (!evidence.analysisComplete || !selectedWord || selectedWord->word >> 26 != 3) return false;
+    unsigned reg = (selectedWord->word >> 21) & 31;
+    auto boundCall = [&](const Disposition::Instruction& row) {
+        auto found = calls.find(row.pc);
+        const auto* slot = original(row.pc + 4);
+        if (row.pc > UINT32_MAX - 8 || row.word >> 26 != 3 || found == calls.end() || !slot) return false;
+        const auto& call = *found->second;
+        if (!call.contract || !std::holds_alternative<common::OriginalCompleteCall>(*call.contract)) return false;
+        const auto& proof = std::get<common::OriginalCompleteCall>(*call.contract).proof();
+        if (!call.target || *call.target != (((row.pc + 4) & 0xf0000000) | uint64_t(row.word & 0x03ffffff) << 2)
+            || proof.callee.empty() || !proof.identity.isComplete() || !proof.inputs.isComplete()
+            || !proof.control.isComplete() || !proof.transfers.isComplete()
+            || proof.delay != row.pc + 4 || proof.continuation != row.pc + 8
+            || proof.actualIncomingLink != row.pc + 8 || proof.registerTransfers.size() != Disposition::RegisterCount)
+            return false;
+        for (unsigned index = 0; index < Disposition::RegisterCount; ++index) {
+            const auto& transfer = proof.registerTransfers[index];
+            if (transfer.reg != index || !transfer.proof.isComplete() || transfer.pending
+                || !transfer.mayNoPending || !transfer.pendingDefinitions.empty()) return false;
+        }
+        const auto& transfer = proof.registerTransfers[reg];
+        if (transfer.kind != "preserved" || transfer.equalEntry != reg) return false;
+        for (const auto* word : {&row, slot}) {
+            const auto destinations = originalOperation(*word).destinations;
+            if (std::find(destinations.begin(), destinations.end(), reg) != destinations.end()) return false;
+        }
+        return true;
+    };
+    std::vector<uint64_t> pending{evidence.start};
+    std::set<uint64_t> visited;
+    while (!pending.empty()) {
+        auto pc = pending.back(); pending.pop_back();
+        if (!visited.insert(pc).second) continue;
+        if (visited.size() > Disposition::RowLimit) return false;
+        const auto* row = original(pc);
+        if (!row) return false;
+        if (pc == selected.pc) continue;
+        if (originalOperation(*row).kind == MipsOperation::Call && !boundCall(*row)) return false;
+        for (auto target : outgoing[pc]) pending.push_back(target);
+    }
+    return visited.count(selected.pc) != 0;
+}
+
 int64_t pathSigned(uint32_t value)
 {
     return value & 0x80000000 ? int64_t(value) - 0x100000000LL : int64_t(value);
@@ -2643,7 +2704,8 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 				evidence.obligations.push_back({evidence.start, "architectural", error.what()});
 		}
 		for (auto& call : evidence.calls)
-            if (call.qualified || disposition.kind == Disposition::Kind::Value || summary.declaration.isComplete())
+            if (call.qualified || disposition.kind == Disposition::Kind::Value || summary.declaration.isComplete()
+                || (call.entryPath && !hasBoundEntryPathCalls(evidence, call)))
                 call.entryPath.reset();
 		if (revised) {
             if (summary.exits.empty()) summary.control = common::OriginalFact::partial("nonempty-normal-exit-closure-unresolved");
