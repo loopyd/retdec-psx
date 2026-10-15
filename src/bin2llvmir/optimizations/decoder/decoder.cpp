@@ -4,6 +4,7 @@
 * @copyright (c) 2017 Avast Software, licensed under the MIT license
 */
 
+#include <algorithm>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/IR/ValueHandle.h>
@@ -32,9 +33,12 @@ namespace bin2llvmir {
 // store in place, but make reads in the following instruction observe the
 // pre-load value. A following write then naturally cancels the pending load.
 // Run before pseudo-call/CFG rewrites, while instruction ownership is intact.
-static void preserveMipsOneLoadDelay(llvm::Module* module, FileImage* image,
-		Abi* abi, bool originalOnlyReturnRecovery)
+void Decoder::preserveMipsOneLoadDelay()
 {
+	auto* module = _module;
+	auto* image = _image;
+	auto* abi = _abi;
+	bool originalOnlyReturnRecovery = _config->getConfig().parameters.isOriginalOnlyReturnRecovery();
 	auto* elf = dynamic_cast<ElfFormat*>(image->getFileFormat());
 	// ELF EF_MIPS_ARCH == 0 identifies MIPS I, not interlocked MIPS32.
 	if (!originalOnlyReturnRecovery && (!elf
@@ -100,6 +104,8 @@ static void preserveMipsOneLoadDelay(llvm::Module* module, FileImage* image,
 				}
 				if (independent) continue;
 			}
+			if (originalOnlyReturnRecovery && !next && !inDelaySlot
+					&& retainIncompleteOriginalLoadDelay(current)) continue;
 		}
 		if (!next || next.getBasicBlock() != current.getBasicBlock())
 			throw std::runtime_error("MIPS I load delay crosses an unsupported decode boundary at "
@@ -123,6 +129,49 @@ static void preserveMipsOneLoadDelay(llvm::Module* module, FileImage* image,
 			read->eraseFromParent();
 		}
 	}
+}
+
+bool Decoder::retainIncompleteOriginalLoadDelay(const AsmInstruction& instruction)
+{
+	const auto& parameters = _config->getConfig().parameters;
+	const auto& context = parameters.getPsxMemoryContext();
+	if (!parameters.isOriginalOnlyReturnRecovery() || !parameters.getOriginalCallScope() || !context) return false;
+	auto pc = instruction.getAddress().getValue();
+	auto found = _originalDiscovered.upper_bound(pc);
+	if (found == _originalDiscovered.begin()) return false;
+	const auto& node = std::prev(found)->second;
+	if (node.start == parameters.getEntryPoint().getValue() || pc + 4 != node.end
+			|| instruction.getEndAddress().getValue() != node.end
+			|| !node.words.count(pc) || !node.words.count(pc - 4) || node.words.count(node.end)
+			|| node.contextHash != context->identity()
+			|| std::find(node.remaining.begin(), node.remaining.end(),
+				"discovered-image-or-instruction-bound") == node.remaining.end()) return false;
+	auto* function = getFunctionAtAddress(Address(node.start));
+	if (!function || instruction.getBasicBlock()->getParent() != function) return false;
+	auto bytes = context->resolve(pc - 4, 8);
+	if (!bytes || bytes->image->id != node.imageId) return false;
+	uint32_t previous = uint32_t(bytes->bytes[0]) | uint32_t(bytes->bytes[1]) << 8
+			| uint32_t(bytes->bytes[2]) << 16 | uint32_t(bytes->bytes[3]) << 24;
+	uint32_t word = uint32_t(bytes->bytes[4]) | uint32_t(bytes->bytes[5]) << 8
+			| uint32_t(bytes->bytes[6]) << 16 | uint32_t(bytes->bytes[7]) << 24;
+	unsigned op = previous >> 26, fn = previous & 63;
+	if (previous != node.words.at(pc - 4) || (op >= 1 && op <= 7)
+			|| (op == 0 && (fn == 8 || fn == 9)) || (op >= 16 && op <= 19)) return false;
+	auto disposition = _originalDispositions.find(node.start);
+	if (disposition == _originalDispositions.end() || word != node.words.at(pc)) return false;
+	auto& evidence = disposition->second.evidence;
+	auto row = std::find_if(evidence.instructions.begin(), evidence.instructions.end(),
+			[&](const auto& value) { return value.pc == pc; });
+	if (row == evidence.instructions.end() || row->word != word || row->bytes != 4
+			|| !row->mapped || row->undef || row->owner != function->getName().str()
+			|| std::count_if(evidence.instructions.begin(), evidence.instructions.end(),
+				[&](const auto& value) { return value.pc == pc; }) != 1
+			|| evidence.obligations.size() >= common::ReturnDisposition::RowLimit) return false;
+	// The truncated body cannot supply trusted IR or complete call contracts.
+	row->mapped = false;
+	row->fullWidthRegisters.clear();
+	evidence.obligations.push_back({pc, "architectural", "original-load-delay-boundary-unresolved"});
+	return true;
 }
 
 static void markMipsBreakDelaySlot(llvm::Instruction* instruction,
@@ -255,8 +304,7 @@ bool Decoder::run()
 	if (_config->getConfig().parameters.isOriginalOnlyReturnRecovery())
 		publishOriginalDecodeCoverage();
 	if (_config->getConfig().architecture.isMipsOrPic32())
-		preserveMipsOneLoadDelay(_module, _image, _abi,
-			_config->getConfig().parameters.isOriginalOnlyReturnRecovery());
+		preserveMipsOneLoadDelay();
 
 	if (debug_enabled && fs::exists(_config->getOutputDirectory()))
 	{

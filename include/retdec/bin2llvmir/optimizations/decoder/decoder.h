@@ -64,6 +64,8 @@ class Decoder : public llvm::ModulePass
 			const capstone2llvmir::Capstone2LlvmIrTranslator::TranslationResultOne& result,
 			llvm::Instruction* continuation);
 		void publishOriginalDecodeCoverage(const std::string& failure = "");
+		void preserveMipsOneLoadDelay();
+		bool retainIncompleteOriginalLoadDelay(const AsmInstruction& instruction);
 		std::map<uint64_t, common::ReturnDisposition> _originalDispositions;
 		std::map<uint64_t, uint64_t> _originalExtents;
 		void admitOriginalDirectTarget(uint64_t callPc, uint64_t target);
