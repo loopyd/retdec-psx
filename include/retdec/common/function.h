@@ -74,7 +74,7 @@ struct OriginalScopedRestoration {
 	std::vector<Register> registers;
 };
 struct OriginalSymbolicFrame {
-    uint32_t entryPc = 0, frameBytes = 0;
+    uint32_t entryPc = 0, allocationPc = 0, frameBytes = 0;
     struct Register {
         unsigned reg = 0;
         int32_t offset = 0;
@@ -317,6 +317,7 @@ struct ReturnDisposition
 		std::vector<Edge> edges;
 		std::vector<Branch> branches;
 		uint64_t terminalPc = 0;
+		std::optional<OriginalSymbolicFrame> symbolicFrame;
 	};
 	struct Call {
 		uint64_t pc = 0;

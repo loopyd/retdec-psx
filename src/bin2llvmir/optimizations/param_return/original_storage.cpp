@@ -552,8 +552,31 @@ std::optional<OriginalFrameContract> OriginalFrameContract::bind(const Dispositi
             return OriginalFrameContract(summary);
     return {};
 }
+std::optional<OriginalFrameContract> OriginalFrameContract::bindPath(const Disposition::Call& call,
+    const common::OriginalPartialCall& proof, const RegisterState& before) {
+    if (!call.entryPath || !call.entryPath->symbolicFrame || !proof.identity.isComplete()
+        || proof.callee != call.entryPath->callee || call.pc > UINT32_MAX - 8
+        || proof.delay != call.pc + 4 || proof.continuation != call.pc + 8
+        || proof.actualIncomingLink != std::optional<uint32_t>{uint32_t(call.pc + 8)}
+        || before[31].constant != proof.actualIncomingLink
+        || std::any_of(before.mayPending.begin(), before.mayPending.end(), [](bool p) { return p; })) return {};
+    const auto& frame = *call.entryPath->symbolicFrame;
+    if (call.target != std::optional<uint64_t>{frame.entryPc}) return {};
+    bool incomingLink = false, restoredLink = false;
+    for (const auto& binding : call.entryPath->bindings)
+        if (binding.reg == 31 && binding.constant == uint32_t(call.pc + 8)) incomingLink = true;
+    std::set<unsigned> preserved{29};
+    for (const auto& row : frame.registers) {
+        if (row.exitPcs != std::vector<uint64_t>{call.entryPath->terminalPc} || row.loadPcs.empty()) return {};
+        if (row.reg == 31) restoredLink = true;
+        else preserved.insert(row.reg);
+    }
+    if (!incomingLink || !restoredLink) return {};
+    return OriginalFrameContract(std::move(preserved));
+}
 bool OriginalFrameContract::preserves(unsigned reg) const {
     if (reg >= Disposition::RegisterCount || reg == 31) return false;
+    if (!_summary) return _boundPreserved.count(reg) != 0;
     const auto& transfer = _summary->transfers[reg];
     if (transfer.reg == reg && transfer.kind == "preserved" && transfer.proof.isComplete()
         && transfer.equalEntry == reg && !transfer.pending && transfer.mayNoPending
@@ -562,6 +585,7 @@ bool OriginalFrameContract::preserves(unsigned reg) const {
         [&](const auto& row) { return row.reg == reg; });
 }
 const common::OriginalTransfer* OriginalFrameContract::assignedResult(const RegisterState& before) const {
+    if (!_summary) return nullptr;
     const auto& transfer = _summary->transfers[2];
     if (transfer.reg != 2 || transfer.kind != "assigned" || !transfer.proof.isComplete()
         || transfer.definitions.empty() || !transfer.bad.empty() || transfer.pending

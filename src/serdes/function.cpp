@@ -365,6 +365,28 @@ void entryPath(Writer& writer, const Disposition::EntryPath& path)
         writer.EndArray(); writer.EndObject();
     }
     writer.EndArray(); writer.Key("terminalPc"); writer.Uint64(path.terminalPc);
+    if (path.symbolicFrame) {
+        const auto& frame = *path.symbolicFrame;
+        writer.Key("symbolicFrame"); writer.StartObject();
+        writer.Key("kind"); writer.String("mips-bound-frame-restoration/v1");
+        writer.Key("entryPc"); writer.Uint(frame.entryPc);
+        writer.Key("allocationPc"); writer.Uint(frame.allocationPc);
+        writer.Key("frameBytes"); writer.Uint(frame.frameBytes);
+        strings(writer, "conditions", std::vector<std::string>{"settled-entry-loads-and-mips-i-delays",
+            "aligned-whole-frame-in-ordinary-ram", "frame-writes-disjoint-from-fetched-code",
+            "ordinary-ram-mapping-and-cache-mode-remain-active", "original-instructions-and-call-bindings-remain-active",
+            "accesses-and-instruction-fetches-complete-normally", "no-asynchronous-or-external-state-interference",
+            "non-frame-reads-access-ordinary-ram"});
+        writer.Key("registers"); writer.StartArray();
+        for (const auto& restored : frame.registers) {
+            writer.StartObject(); writer.Key("register"); writer.Uint(restored.reg);
+            writer.Key("offset"); writer.Int(restored.offset);
+            writer.Key("storePc"); writer.Uint64(restored.storePc);
+            numbers(writer, "loadPcs", restored.loadPcs); numbers(writer, "callPcs", restored.callPcs);
+            numbers(writer, "exitPcs", restored.exitPcs); writer.EndObject();
+        }
+        writer.EndArray(); writer.EndObject();
+    }
     strings(writer, "remaining", std::vector<std::string>{"conditional-entry-state-unresolved", "declaration-unresolved",
         "normal-return-target-unresolved", "original-memory-effects-unresolved", "stack-alias-restoration-unresolved"});
     writer.EndObject();

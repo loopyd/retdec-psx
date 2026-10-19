@@ -87,7 +87,10 @@ struct OriginalEntryOffset {
 };
 struct OriginalIdentityFlow;
 class OriginalFrameContract {
-    const common::OriginalFunctionSummary* _summary;
+    const common::OriginalFunctionSummary* _summary = nullptr;
+    std::set<unsigned> _boundPreserved;
+    explicit OriginalFrameContract(std::set<unsigned> preserved)
+        : _boundPreserved(std::move(preserved)) {}
     OriginalFrameContract(const common::OriginalFunctionSummary& summary)
         : _summary(&summary) {}
 public:
@@ -97,6 +100,8 @@ public:
     static std::optional<OriginalFrameContract> bind(const Disposition::Call& call,
         const common::OriginalPartialCall& proof, const common::OriginalFunctionSummary& summary,
         const RegisterState& before);
+    static std::optional<OriginalFrameContract> bindPath(const Disposition::Call& call,
+        const common::OriginalPartialCall& proof, const RegisterState& before);
     bool preserves(unsigned reg) const;
     const common::OriginalTransfer* assignedResult(const RegisterState& before) const;
 };
