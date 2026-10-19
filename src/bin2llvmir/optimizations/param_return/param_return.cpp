@@ -1647,8 +1647,9 @@ std::optional<EntryPath> deriveOriginalEntryPath(const Disposition::Call& call, 
     auto* function = config.getConfigFunction(de->getFunction());
     if (!function || !de->getReturnDisposition() || (function->originalDiscovered
         && function->originalDiscovered->contextHash != context->identity())) return {};
-    return deriveBoundEntryPath(call, before, definitions, caller, graph.identities.at(*call.target),
-        de->getReturnDisposition()->evidence, *context);
+    const auto& identity = graph.identities.at(*call.target);
+    return deriveBoundEntryPath(call, before, definitions, caller, identity.key, identity.imageId,
+        identity.start, identity.end, de->getReturnDisposition()->evidence, *context);
 }
 
 template<typename Graph>

@@ -182,8 +182,9 @@ std::optional<common::OriginalSymbolicFrame> recoverBoundPathFrame(const Disposi
 
 std::optional<Disposition::EntryPath> deriveBoundEntryPath(const Disposition::Call& call,
     const RegisterState& before, const std::map<unsigned, Disposition::Definition>& definitions,
-    const Disposition::Evidence& caller, const common::ReviewedOriginalFunction& identity,
-    const Disposition::Evidence& evidence, const common::PsxMemoryContext& context)
+    const Disposition::Evidence& caller, const std::string& key, const std::string& imageId,
+    uint64_t start, uint64_t end, const Disposition::Evidence& evidence,
+    const common::PsxMemoryContext& context)
 {
     if (!call.target || call.pc > UINT32_MAX - 8) return {};
     auto instruction = std::find_if(caller.instructions.begin(), caller.instructions.end(),
@@ -194,24 +195,24 @@ std::optional<Disposition::EntryPath> deriveBoundEntryPath(const Disposition::Ca
     auto callBytes = context.resolve(call.pc, 4);
     if (!callBytes || instruction->word != (uint32_t(callBytes->bytes[0]) | uint32_t(callBytes->bytes[1]) << 8
         | uint32_t(callBytes->bytes[2]) << 16 | uint32_t(callBytes->bytes[3]) << 24)) return {};
-    if (evidence.start != identity.start || evidence.end != identity.end || identity.start != *call.target
+    if (evidence.start != start || evidence.end != end || start != *call.target
         || evidence.start >= evidence.end || evidence.end - evidence.start > 1024
         || evidence.start % 4 || evidence.end % 4 || evidence.instructions.empty()
         || evidence.instructions.size() > 256) return {};
     auto span = context.resolve(evidence.start, evidence.end - evidence.start);
-    if (!span || span->image->id != identity.imageId) return {};
+    if (!span || span->image->id != imageId) return {};
     std::map<uint64_t, const Disposition::Instruction*> instructions;
     for (const auto& row : evidence.instructions) {
         auto bytes = context.resolve(row.pc, 4);
         if (row.pc < evidence.start || row.pc >= evidence.end || row.pc % 4 || row.bytes != 4
             || !row.mapped || row.undef || row.owner != evidence.symbol || !instructions.emplace(row.pc, &row).second
-            || !bytes || bytes->image->id != identity.imageId) return {};
+            || !bytes || bytes->image->id != imageId) return {};
         uint32_t word = uint32_t(bytes->bytes[0]) | uint32_t(bytes->bytes[1]) << 8
             | uint32_t(bytes->bytes[2]) << 16 | uint32_t(bytes->bytes[3]) << 24;
         if (word != row.word) return {};
     }
     EntryPath path;
-    path.callee = identity.key; path.contextHash = context.identity();
+    path.callee = key; path.contextHash = context.identity();
     PathConstants values{}; values[0] = 0;
     for (unsigned reg = 1; reg < Disposition::GprCount; ++reg) {
         const auto& value = before[reg];
