@@ -645,8 +645,16 @@ void finishOriginalDeclaration(common::OriginalFunctionSummary& summary)
     std::set<unsigned> parameters;
     bool supported = summary.entry.isComplete() && summary.result.isComplete();
     for (const auto& use : summary.demands) {
-        if (4 <= use.reg && use.reg <= 7) parameters.insert(use.reg);
-        else if (use.reg != 31 || use.role != "continuation") supported = false;
+        if (4 <= use.reg && use.reg <= 7) { parameters.insert(use.reg); continue; }
+        // O32 passes arguments in a0-a3 only. The stack pointer is the frame base and
+        // never an argument; a demanded callee-saved register is the caller's own
+        // context, which this function only saves or passes through.
+        if (use.reg == 29) continue;
+        const bool context = use.reg == 28 || use.reg == 30 || use.reg == 31
+            || (16 <= use.reg && use.reg <= 23);
+        const bool passThrough = use.role == "stored-value" || use.role == "call-input"
+            || use.role == "continuation";
+        if (!(context && passThrough)) supported = false;
     }
     summary.parameterRegisters.assign(parameters.begin(), parameters.end());
     summary.declaration = supported ? common::OriginalFact::complete() : common::OriginalFact::partial("supported-i32-declaration-projection-unresolved");
@@ -1168,10 +1176,10 @@ std::optional<OriginalImageView> originalImageView(const FileImage* image,
 
 bool originalEntryCoveredForResult(const Disposition::Evidence& evidence,
     const common::OriginalFunctionSummary& summary, const OriginalImageView& image,
-    const std::map<unsigned, Disposition::Definition>& definitions)
+    const std::map<unsigned, Disposition::Definition>& definitions, bool rootReturnOnly = false)
 {
     if (!image.physical || !evidence.decodeComplete || !evidence.analysisComplete
-        || !summary.entry.isComplete() || !summary.control.isComplete()
+        || !summary.entry.isComplete() || (!rootReturnOnly && !summary.control.isComplete())
         || summary.pendingEntry != "requires-no-pending-gpr-loads"
         || evidence.start % 4 || evidence.end % 4 || evidence.start >= evidence.end
         || evidence.end > (uint64_t(1) << 32)
@@ -1188,6 +1196,14 @@ bool originalEntryCoveredForResult(const Disposition::Evidence& evidence,
         if (pc < evidence.start || pc >= evidence.end || pc % 4) return nullptr;
         return &evidence.instructions[(pc - evidence.start) / 4];
     };
+    if (rootReturnOnly) {
+        std::set<uint64_t> returns;
+        for (const auto& row : evidence.instructions)
+            if (originalOperation(row).kind == MipsOperation::Return) returns.insert(row.pc);
+        if (returns.size() != evidence.exits.size()) return false;
+        for (const auto& exit : evidence.exits)
+            if (!returns.count(exit.pc)) return false;
+    }
     auto settled = [&](const common::OriginalTransfer& transfer) {
         if (transfer.reg != 2 || transfer.kind != "assigned" || !transfer.proof.isComplete()
             || transfer.definitions.empty() || !transfer.bad.empty() || transfer.pending
@@ -1209,7 +1225,8 @@ bool originalEntryCoveredForResult(const Disposition::Evidence& evidence,
             || !instruction(exit.delaySlot) || exit.missing || exit.definitions.empty()
             || !exit.bad.empty() || !exit.pendingDefinitions.empty()
             || normal.pc != exit.pc || normal.delay != exit.delaySlot
-            || !normal.incomingLink.isComplete() || normal.transfers.size() != Disposition::RegisterCount
+            || (!rootReturnOnly && !normal.incomingLink.isComplete())
+            || normal.transfers.size() != Disposition::RegisterCount
             || !settled(normal.transfers[2]) || normal.transfers[2].definitions != exit.definitions
             || normal.transfers[2].pendingDefinitions != exit.pendingDefinitions) return false;
     }
@@ -1714,6 +1731,7 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
     if (!frame && summary && allowFrames) frame = OriginalFrameContract::bind(call, proof, *summary, before);
     if (frame) frameUses.insert_or_assign(call.pc, *frame);
     else frameUses.erase(call.pc);
+    const bool admittedFrame = summary && !summary->exits.empty() && !pending;
     bool transfers = summary && summary->transfers.size() == Disposition::RegisterCount && proof.control.isComplete() && !pending;
     for (unsigned reg = 1; reg < Disposition::RegisterCount; ++reg) {
         state[reg] = RegisterFact{};
@@ -1732,6 +1750,12 @@ void composeOriginalCall(Disposition::Call& call, RegisterState& state, const Gr
         transfers &= usable;
         if (usable && transfer->kind == "preserved") { state[reg] = before[reg]; continue; }
         if (!usable && frame && frame->preserves(reg)) { state[reg] = before[reg]; continue; }
+        const bool settledOther = transfer && transfer->reg == reg && transfer->proof.isComplete()
+            && !(transfer->kind == "preserved" && transfer->equalEntry == std::optional<unsigned>{reg});
+        if (!usable && admittedFrame && !settledOther
+            && (reg == 29 || (16 <= reg && reg <= 23) || reg == 28 || reg == 30)) {
+            state[reg] = before[reg]; continue;
+        }
         bool frameAssigned = !usable && frame && transfer && transfer == frame->assignedResult(before);
         if ((usable || frameAssigned) && transfer->kind == "assigned" && callee && !transfer->definitions.empty()) {
             RegisterFact output; output.missing = false;
@@ -2461,8 +2485,9 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     }
                 }
             }
+            const bool rootReturn = evidence.selection == "selected-root";
             entryCovered |= revised && !observation && imageView
-                && originalEntryCoveredForResult(evidence, summary, *imageView, definitions);
+                && originalEntryCoveredForResult(evidence, summary, *imageView, definitions, rootReturn);
             value &= entryCovered;
             auto* v0 = _abi->getRegister(MIPS_REG_V0);
 			value &= v0 && v0->getValueType()->isIntegerTy(32);
