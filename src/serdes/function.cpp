@@ -203,11 +203,26 @@ void memoryAddress(Writer& writer, const retdec::common::OriginalMemoryAccess& a
         numbers(writer, "boundEvidence", address->boundEvidence); writer.EndObject(); return;
     }
     const auto& address = std::get<retdec::common::OriginalFixedMemoryAddress>(access.address);
+    bool firstUse = address.derivation == retdec::common::OriginalFixedMemoryAddress::Derivation::EntryFirstUse;
+    if (firstUse != bool(address.firstUse)) throw std::runtime_error("invalid-fixed-first-use-memory-domain");
+    if (firstUse && (address.firstUse->usePc != access.pc || address.firstUse->entryPc > UINT32_MAX
+        || address.firstUse->entryPc % 4 || address.firstUse->usePc > UINT32_MAX
+        || address.firstUse->usePc % 4 || !address.firstUse->callPcs.empty()
+        || !std::holds_alternative<retdec::common::OriginalFact>(address.fileBytes)))
+        throw std::runtime_error("invalid-fixed-first-use-memory-domain");
     writer.Key("address"); writer.StartObject(); writer.Key("kind");
-    writer.String(address.derivation == retdec::common::OriginalFixedMemoryAddress::Derivation::Flow
+    writer.String(firstUse ? "instruction-fixed-first-use/v1"
+        : address.derivation == retdec::common::OriginalFixedMemoryAddress::Derivation::Flow
         ? "instruction-fixed-flow/v1" : "entry-fallthrough-prefix/v1");
     writer.Key("base"); writer.Uint(address.base); writer.Key("value"); writer.Uint(address.value);
     numbers(writer, "equalityEvidence", address.equalityEvidence); fact(writer, "alignment", address.alignment);
+    if (firstUse) {
+        writer.Key("entryPc"); writer.Uint64(address.firstUse->entryPc);
+        writer.Key("usePc"); writer.Uint64(address.firstUse->usePc);
+        writer.Key("operandPhase"); writer.String("before-instruction");
+        numbers(writer, "callPcs", address.firstUse->callPcs);
+        strings(writer, "conditions", std::vector<std::string>{"first-reach-from-original-entry-before-unproved-control-crossing"});
+    }
     if (auto* partial = std::get_if<retdec::common::OriginalFact>(&address.fileBytes)) {
         if (partial->isComplete()) throw std::runtime_error("invalid-complete-file-bytes-fact");
         fact(writer, "fileBytes", *partial);
@@ -271,6 +286,115 @@ void summary(Writer& writer, const retdec::common::OriginalFunctionSummary& valu
             writer.Key("storePc"); writer.Uint64(restored.storePc);
             numbers(writer, "loadPcs", restored.loadPcs); numbers(writer, "callPcs", restored.callPcs);
             numbers(writer, "exitPcs", restored.exitPcs); writer.EndObject();
+        }
+        writer.EndArray(); writer.EndObject();
+    }
+    if (value.observedFrameCallAdmission) {
+        const auto& admission = *value.observedFrameCallAdmission;
+        writer.Key("observedFrameCallAdmission"); writer.StartObject();
+        writer.Key("kind"); writer.String("observed-frame-call-admission/v1");
+        writer.Key("observation"); writer.String(admission.observation);
+        writer.Key("stateHash"); writer.String(admission.stateHash);
+        writer.Key("entryPc"); writer.Uint(admission.entryPc);
+        writer.Key("entrySp"); writer.Uint(admission.entrySp);
+        writer.Key("frameBytes"); writer.Uint(admission.frameBytes);
+        strings(writer, "conditions", std::vector<std::string>{"captured-entry-registers-and-settled-load-state",
+            "ordinary-ram-mapping-and-cache-mode-remain-active", "original-instructions-remain-active",
+            "accesses-and-instruction-fetches-complete-normally",
+            "no-asynchronous-or-external-state-interference", "mips-i-load-and-branch-delays",
+            "each-crossed-call-returns-to-its-recorded-continuation"});
+        writer.Key("calls"); writer.StartArray();
+        for (const auto& call : admission.calls) {
+            writer.StartObject(); writer.Key("pc"); writer.Uint64(call.pc);
+            writer.Key("delay"); writer.Uint64(call.delay);
+            writer.Key("continuation"); writer.Uint64(call.continuation);
+            writer.Key("target"); writer.Uint(call.target); writer.Key("callee"); writer.String(call.callee);
+            writer.Key("outgoingBytes"); writer.Uint(call.outgoingBytes);
+            numbers(writer, "outgoingPcs", call.outgoingPcs);
+            strings(writer, "checks", std::vector<std::string>{"call-boundary-settled-and-direct",
+                "caller-and-callee-instructions-complete", "closed-reachable-call-inventory",
+                "callee-has-normal-exit", "outgoing-interval-complete",
+                "reachable-writes-disjoint-from-protected-words", "protected-addresses-not-exposed",
+                "ordinary-ram-aliases-normalized"});
+            writer.Key("protectedWords"); writer.StartArray();
+            for (const auto& word : call.protectedWords) {
+                writer.StartObject(); writer.Key("physicalWord"); writer.Uint(word.physicalWord);
+                writer.Key("entrySpOffset"); writer.Int(word.offset);
+                writer.Key("register"); writer.Uint(word.entry);
+                writer.Key("storePc"); writer.Uint64(word.storePc);
+                writer.EndObject();
+            }
+            writer.EndArray();
+            writer.Key("closure"); writer.StartArray();
+            for (const auto& member : call.closure) {
+                writer.StartObject(); writer.Key("function"); writer.String(member.function);
+                writer.Key("start"); writer.Uint(member.start); writer.Key("end"); writer.Uint(member.end);
+                writer.Key("entrySpOffset"); writer.Int(member.entrySpOffset);
+                writer.Key("instructions"); writer.Uint(member.instructions);
+                writer.Key("calls"); writer.Uint(member.calls);
+                writer.Key("accesses"); writer.Uint(member.accesses);
+                writer.Key("writes"); writer.Uint(member.writes); writer.EndObject();
+            }
+            writer.EndArray(); writer.EndObject();
+        }
+        writer.EndArray(); writer.EndObject();
+    }
+    if (value.observedPointerLoad) {
+        const auto& loads = *value.observedPointerLoad;
+        writer.Key("observedPointerLoad"); writer.StartObject();
+        writer.Key("kind"); writer.String("psx-observed-pointer-load/v1");
+        writer.Key("capture"); writer.String(loads.capture);
+        writer.Key("stateHash"); writer.String(loads.stateHash);
+        writer.Key("entryPc"); writer.Uint(loads.entryPc);
+        writer.Key("stopPc"); writer.Uint(loads.stopPc);
+        writer.Key("interval"); writer.StartObject();
+        writer.Key("mappingStart"); writer.Uint(loads.intervalStart);
+        writer.Key("bytes"); writer.Uint(loads.intervalBytes); writer.EndObject();
+        writer.Key("beginCycle"); writer.String(loads.beginCycle);
+        writer.Key("endCycle"); writer.String(loads.endCycle);
+        writer.Key("isr"); writer.Bool(loads.isr);
+        writer.Key("conditions"); writer.StartArray();
+        for (const auto& condition : loads.conditions) writer.String(condition);
+        writer.EndArray();
+        writer.Key("occurrences"); writer.StartArray();
+        for (const auto& occurrence : loads.occurrences) {
+            writer.StartObject();
+            writer.Key("sequence"); writer.Uint64(occurrence.sequence);
+            writer.Key("pc"); writer.Uint64(occurrence.pc);
+            writer.Key("word"); writer.Uint(occurrence.word);
+            writer.Key("branchDelaySlot"); writer.Bool(occurrence.branchDelaySlot);
+            writer.Key("path"); writer.StartObject();
+            writer.Key("firstSequence"); writer.Uint64(occurrence.firstSequence);
+            writer.Key("sequence"); writer.Uint64(occurrence.sequence);
+            writer.Key("lastSequence"); writer.Uint64(occurrence.lastSequence); writer.EndObject();
+            writer.Key("reaching"); writer.StartObject();
+            writer.Key("sequence"); writer.Uint64(occurrence.reachingSequence);
+            writer.Key("pc"); writer.Uint64(occurrence.reachingPc);
+            writer.Key("word"); writer.Uint(occurrence.reachingWord); writer.EndObject();
+            writer.Key("address"); writer.StartObject();
+            writer.Key("canonical"); writer.Uint(occurrence.address);
+            writer.Key("physical"); writer.Uint(occurrence.physical);
+            writer.Key("mapping"); writer.String("ordinary-ram-v1"); writer.EndObject();
+            writer.Key("value"); writer.StartArray();
+            for (uint8_t byte : occurrence.value) writer.Uint(byte);
+            writer.EndArray();
+            writer.Key("destination"); writer.Uint(occurrence.destination);
+            writer.Key("visibleFromPc"); writer.Uint64(occurrence.visibleFromPc);
+            writer.Key("visibleFromSequence"); writer.Uint64(occurrence.visibleFromSequence);
+            writer.Key("consumers"); writer.StartArray();
+            for (const auto& consumer : occurrence.consumers) {
+                writer.StartObject(); writer.Key("sequence"); writer.Uint64(consumer.sequence);
+                writer.Key("pc"); writer.Uint64(consumer.pc);
+                writer.Key("role"); writer.String("recorded-operand-use"); writer.EndObject();
+            }
+            writer.EndArray(); writer.EndObject();
+        }
+        writer.EndArray();
+        writer.Key("excluded"); writer.StartArray();
+        for (const auto& row : loads.excluded) {
+            writer.StartObject(); writer.Key("sequence"); writer.Uint64(row.sequence);
+            writer.Key("pc"); writer.Uint64(row.pc); writer.Key("word"); writer.Uint(row.word);
+            writer.Key("reason"); writer.String(row.reason); writer.EndObject();
         }
         writer.EndArray(); writer.EndObject();
     }

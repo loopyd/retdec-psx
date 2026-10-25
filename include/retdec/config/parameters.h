@@ -39,6 +39,8 @@ class Parameters
 		const std::optional<common::OriginalCallScope>& getOriginalCallScope() const { return _originalCallScope; }
 		void setOriginalEntryObservation(common::OriginalEntryObservation observation) { _originalEntryObservation = std::move(observation); }
 		const std::optional<common::OriginalEntryObservation>& getOriginalEntryObservation() const { return _originalEntryObservation; }
+		void setOriginalPointerLoad(common::OriginalPointerLoadCapture capture) { _originalPointerLoad = std::move(capture); }
+		const std::optional<common::OriginalPointerLoadCapture>& getOriginalPointerLoad() const { return _originalPointerLoad; }
 		void setOriginalSourceForm(common::OriginalSourceForm form);
 		const std::optional<common::OriginalSourceForm>& getOriginalSourceForm() const { return _originalSourceForm; }
 		bool isDetectStaticCode() const;
@@ -165,6 +167,7 @@ class Parameters
 		std::shared_ptr<const common::PsxMemoryContext> _psxMemoryContext;
 		std::optional<common::OriginalCallScope> _originalCallScope;
 		std::optional<common::OriginalEntryObservation> _originalEntryObservation;
+		std::optional<common::OriginalPointerLoadCapture> _originalPointerLoad;
 		std::optional<common::OriginalSourceForm> _originalSourceForm;
 
 		std::string _ordinalNumbersDirectory;

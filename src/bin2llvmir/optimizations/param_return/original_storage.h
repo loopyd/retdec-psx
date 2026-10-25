@@ -2,6 +2,7 @@
 #define RETDEC_BIN2LLVMIR_ORIGINAL_STORAGE_H
 
 #include <array>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -30,6 +31,9 @@ class OriginalMemoryState {
     std::array<std::optional<Word>, Disposition::GprCount> _pending;
     std::array<bool, Disposition::GprCount> _hasPending{};
     std::optional<Word> _sampledLink;
+    // Provisional per-call protected-word snapshots for calls whose written-memory absence is
+    // not proved. The completed-evidence census in summarize() decides whether they publish.
+    std::map<uint64_t, std::vector<common::OriginalObservedFrameCallAdmission::ProtectedWord>> _conditional;
     void invalidate();
     std::optional<uint32_t> physical(int32_t offset, unsigned bytes) const;
 public:
@@ -39,8 +43,16 @@ public:
     bool join(const OriginalMemoryState& incoming);
     void step(const Disposition::Instruction& row, const MipsOperation& operation, const RegisterState& state);
     void call(uint64_t pc, const common::OriginalCallContract* contract);
+    std::vector<common::OriginalObservedFrameCallAdmission::ProtectedWord> savedWords() const;
+    std::optional<uint32_t> frameBytes() const { return _frame; }
+    // The census runs against the completed caller evidence, so a call is only admitted once
+    // its outgoing, alias and write inventory can actually be established.
+    using FrameAdmissionCensus = std::function<std::optional<common::OriginalObservedFrameCallAdmission::Call>(
+        uint64_t, uint32_t, uint32_t,
+        const std::vector<common::OriginalObservedFrameCallAdmission::ProtectedWord>&)>;
     static void summarize(common::OriginalFunctionSummary& summary,
-        const std::map<uint64_t, RegisterState>& exits, const Disposition::Evidence& evidence);
+        const std::map<uint64_t, RegisterState>& exits, const Disposition::Evidence& evidence,
+        const FrameAdmissionCensus& census = FrameAdmissionCensus());
 };
 struct RegisterFact {
 	bool missing = true;
@@ -119,6 +131,10 @@ struct OriginalIdentityFlow {
 };
 class OriginalEntryAddressRegion {
 public:
+    static std::optional<common::OriginalMemoryFirstUse> recoverDomain(
+        const OriginalIdentityFlow& flow, const Disposition::Evidence& evidence,
+        const common::OriginalMemoryAccess& access,
+        std::multimap<uint64_t, const Disposition::Edge*>* prefixIncoming = nullptr);
     static std::optional<common::OriginalEntryRelativeMemoryAddress> recover(
         const OriginalIdentityFlow& flow, const Disposition::Evidence& evidence,
         const common::OriginalMemoryAccess& access);

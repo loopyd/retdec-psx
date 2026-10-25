@@ -1235,6 +1235,510 @@ bool originalEntryCoveredForResult(const Disposition::Evidence& evidence,
 
 using OriginalCalleePreservation = std::map<uint64_t, uint32_t>;
 
+// Observed-frame call admission census. It replays the caller and every reachable callee from
+// original words and admits one crossed call only when the complete instruction, call, access
+// and write inventory keeps every preserved saved word disjoint from every reachable write.
+struct FrameCensusValue {
+	enum class Kind { Unknown, Stack, Constant, Entry };
+	Kind kind = Kind::Unknown;
+	int32_t offset = 0;
+	uint32_t constant = 0;
+	unsigned entry = 0;
+	bool operator==(const FrameCensusValue& other) const {
+		return kind == other.kind && offset == other.offset
+			&& constant == other.constant && entry == other.entry;
+	}
+};
+using FrameCensusState = std::array<FrameCensusValue, Disposition::RegisterCount>;
+using FrameCensusNode = std::pair<uint64_t, uint64_t>;
+
+struct FrameCensusAccess {
+	uint64_t pc = 0;
+	bool write = false, stack = false;
+	int32_t offset = 0;
+	uint32_t physical = 0;
+	unsigned bytes = 0;
+	// Signed offset of the resolved interval from the captured call-time stack pointer.
+	// Every supported derivation resolves into this one coordinate.
+	int64_t frameOffset = 0;
+	// The stored value's own frame offset, when it resolves into the frame at all.
+	bool valueKnown = false;
+	int64_t valueFrameOffset = 0;
+};
+
+struct FrameCensusCall {
+	uint64_t pc = 0;
+	uint32_t target = 0;
+	int32_t entrySpOffset = 0;
+	std::string callee;
+	FrameCensusState entry{};
+};
+
+struct FrameCensusMember {
+	std::string function;
+	uint32_t start = 0, end = 0;
+	int32_t entrySpOffset = 0;
+	unsigned instructions = 0, calls = 0;
+	std::vector<FrameCensusAccess> rows;
+};
+
+bool frameCensusMemoryWord(uint32_t word) {
+	unsigned opcode = word >> 26;
+	return opcode == 32 || opcode == 33 || opcode == 35 || opcode == 36 || opcode == 37
+		|| opcode == 40 || opcode == 41 || opcode == 43;
+}
+
+bool frameCensusLoad(uint32_t word) {
+	unsigned opcode = word >> 26;
+	return opcode == 32 || opcode == 33 || opcode == 35 || opcode == 36 || opcode == 37;
+}
+
+FrameCensusValue frameCensusOffset(const FrameCensusValue& base, int64_t add) {
+	FrameCensusValue out;
+	int64_t offset = int64_t(base.offset) + add;
+	if (offset < INT32_MIN || offset > INT32_MAX) return out;
+	switch (base.kind) {
+		case FrameCensusValue::Kind::Stack:
+			out.kind = base.kind; out.offset = int32_t(offset); break;
+		case FrameCensusValue::Kind::Entry:
+			out.kind = base.kind; out.entry = base.entry; out.offset = int32_t(offset); break;
+		case FrameCensusValue::Kind::Constant:
+			out.kind = base.kind; out.constant = base.constant + uint32_t(add); break;
+		default: break;
+	}
+	return out;
+}
+
+// Register effects of one original word. Merge accesses, traps, unsupported operations and
+// indirect control are refused because they cannot be replayed from words alone.
+bool frameCensusStep(const Disposition::Instruction& row, FrameCensusState& state) {
+	uint32_t word = row.word;
+	unsigned opcode = word >> 26, rs = (word >> 21) & 31, rt = (word >> 16) & 31;
+	unsigned rd = (word >> 11) & 31, fn = word & 63, shift = (word >> 6) & 31;
+	int32_t immediate = int16_t(word & 0xffff);
+	if (opcode == 34 || opcode == 38 || opcode == 42 || opcode == 46) return false;
+	auto operation = originalOperation(row);
+	if (operation.kind == MipsOperation::Unsupported || operation.kind == MipsOperation::Trap
+		|| operation.name == "jr" || operation.name == "jalr") return false;
+	auto assign = [&](unsigned reg, const FrameCensusValue& value) {
+		if (reg) state[reg] = value;
+	};
+	if (opcode == 3) {
+		FrameCensusValue link; link.kind = FrameCensusValue::Kind::Constant;
+		link.constant = uint32_t(row.pc + 8); assign(31, link); return true;
+	}
+	if (opcode == 0) {
+		if (fn == 8) return true;
+		if (fn == 0 && shift == 0) { assign(rd, state[rt]); return true; }
+		if (fn == 33 || fn == 37) {
+			FrameCensusValue out;
+			if (rs == 0) out = state[rt];
+			else if (rt == 0) out = state[rs];
+			else if (state[rs].kind == FrameCensusValue::Kind::Constant
+				&& state[rt].kind == FrameCensusValue::Kind::Constant) {
+				out.kind = FrameCensusValue::Kind::Constant;
+				out.constant = fn == 33 ? state[rs].constant + state[rt].constant
+					: (state[rs].constant | state[rt].constant);
+			}
+			assign(rd, out); return true;
+		}
+		assign(rd, FrameCensusValue{}); return true;
+	}
+	if (opcode == 15) {
+		FrameCensusValue out; out.kind = FrameCensusValue::Kind::Constant;
+		out.constant = uint32_t(word & 0xffff) << 16; assign(rt, out); return true;
+	}
+	if (opcode == 8 || opcode == 9) { assign(rt, frameCensusOffset(state[rs], immediate)); return true; }
+	if (opcode == 13) {
+		FrameCensusValue out;
+		if (state[rs].kind == FrameCensusValue::Kind::Constant) {
+			out.kind = FrameCensusValue::Kind::Constant;
+			out.constant = state[rs].constant | uint32_t(word & 0xffff);
+		}
+		assign(rt, out); return true;
+	}
+	if (8 <= opcode && opcode <= 14) { assign(rt, FrameCensusValue{}); return true; }
+	if (frameCensusLoad(word)) { assign(rt, FrameCensusValue{}); return true; }
+	return true;
+}
+
+// Execute one census node. A call's delay slot produces two different states: the callee
+// receives the registers actually present after the delay slot, while the caller continuation
+// sees the return-side clobbers. Keeping them separate preserves incoming pointer arguments.
+bool frameCensusAdvance(const std::map<uint64_t, const Disposition::Instruction*>& instructions,
+	const FrameCensusNode& node, bool owner, uint32_t preserved, FrameCensusState& state,
+	FrameCensusState* calleeEntry = nullptr) {
+	if (!frameCensusStep(*instructions.at(node.first), state)) return false;
+	if (!owner) return true;
+	auto ownerOperation = originalOperation(*instructions.at(node.second));
+	if (ownerOperation.kind != MipsOperation::Call) return true;
+	if (instructions.at(node.second)->word >> 26 != 3
+		|| state[29].kind != FrameCensusValue::Kind::Stack) return false;
+	if (frameCensusLoad(instructions.at(node.first)->word)) return false;
+	if (calleeEntry) {
+		*calleeEntry = state;
+		(*calleeEntry)[31] = FrameCensusValue{};
+		(*calleeEntry)[31].kind = FrameCensusValue::Kind::Constant;
+		(*calleeEntry)[31].constant = uint32_t(node.second + 8);
+	}
+	state[31] = FrameCensusValue{};
+	state[31].kind = FrameCensusValue::Kind::Constant;
+	state[31].constant = uint32_t(node.second + 8);
+	// A register survives the call only when the callee proves it preserved; every other
+	// caller relation is invalidated, exactly as the restoration storage does.
+	for (unsigned reg = 1; reg < Disposition::GprCount; ++reg)
+		if (reg != 29 && reg != 31 && !(preserved & (1u << reg))) state[reg] = FrameCensusValue{};
+	return true;
+}
+
+// Registers whose call-transfer proof is a settled preservation, per call site.
+std::map<uint64_t, uint32_t> frameCensusPreserved(const Disposition::Evidence& evidence) {
+	std::map<uint64_t, uint32_t> preserved;
+	for (const auto& call : evidence.calls) {
+		uint32_t mask = 0;
+		if (call.contract) {
+			const common::OriginalPartialCall* proof =
+				std::get_if<common::OriginalPartialCall>(&*call.contract);
+			if (!proof) proof = &std::get<common::OriginalCompleteCall>(*call.contract).proof();
+			if (proof->registerTransfers.size() == Disposition::RegisterCount) {
+				for (unsigned reg = 1; reg < Disposition::GprCount; ++reg) {
+					const auto& transfer = proof->registerTransfers[reg];
+					if (transfer.reg == reg && transfer.proof.isComplete()
+						&& transfer.kind == "preserved" && !transfer.pending
+						&& transfer.mayNoPending && transfer.equalEntry == reg)
+						mask |= 1u << reg;
+				}
+			}
+		}
+		preserved.emplace(call.pc, mask);
+	}
+	return preserved;
+}
+
+bool frameCensusReplay(const common::OriginalEntryObservation& observation,
+	const std::string& function, const Disposition::Evidence& evidence,
+	const std::map<uint64_t, std::string>& identities, int32_t entrySpOffset,
+	int64_t callSpPhysical, const FrameCensusState& entry, FrameCensusMember& member,
+	std::vector<FrameCensusCall>& calls) {
+	member = FrameCensusMember{};
+	member.function = function; member.start = uint32_t(evidence.start);
+	member.end = uint32_t(evidence.end); member.entrySpOffset = entrySpOffset;
+	if (evidence.start % 4 || evidence.end % 4
+		|| evidence.start >= evidence.end || evidence.end > uint64_t(UINT32_MAX) + 1) return false;
+	std::map<uint64_t, const Disposition::Instruction*> instructions;
+	for (const auto& row : evidence.instructions) {
+		if (row.pc != evidence.start + 4 * instructions.size() || row.pc % 4
+			|| !row.mapped || row.undef || row.bytes != 4 || row.owner != evidence.symbol
+			|| !instructions.emplace(row.pc, &row).second) return false;
+	}
+	if (instructions.size() != (evidence.end - evidence.start) / 4) return false;
+	member.instructions = unsigned(instructions.size());
+	std::multimap<uint64_t, const Disposition::Edge*> outgoing;
+	for (const auto& edge : evidence.edges) {
+		if (!instructions.count(edge.from) || !instructions.count(edge.to)
+			|| (edge.delayOwner && !instructions.count(*edge.delayOwner))) return false;
+		outgoing.emplace(edge.from, &edge);
+	}
+	// Match the independent reader's acyclic census domain before state propagation.
+	// A node bound alone cannot bound repeated processing around a CFG cycle.
+	std::map<uint64_t, size_t> indegrees;
+	for (const auto& instruction : instructions) indegrees.emplace(instruction.first, 0);
+	for (const auto& edge : evidence.edges) ++indegrees.at(edge.to);
+	std::deque<uint64_t> ready;
+	for (const auto& node : indegrees) if (!node.second) ready.push_back(node.first);
+	if (ready.size() != 1 || ready.front() != evidence.start) return false;
+	size_t consumed = 0;
+	while (!ready.empty()) {
+		auto pc = ready.front(); ready.pop_front(); ++consumed;
+		auto range = outgoing.equal_range(pc);
+		for (auto edge = range.first; edge != range.second; ++edge)
+			if (!--indegrees.at(edge->second->to)) ready.push_back(edge->second->to);
+	}
+	if (consumed != instructions.size()) return false;
+	const auto preserved = frameCensusPreserved(evidence);
+	auto join = [](FrameCensusState& into, const FrameCensusState& incoming) {
+		bool changed = false;
+		for (size_t reg = 0; reg < into.size(); ++reg) {
+			if (into[reg] == incoming[reg] || into[reg] == FrameCensusValue{}) continue;
+			into[reg] = FrameCensusValue{}; changed = true;
+		}
+		return changed;
+	};
+	std::map<FrameCensusNode, FrameCensusState> states;
+	std::deque<FrameCensusNode> work;
+	FrameCensusNode start{evidence.start, 0};
+	states.emplace(start, entry); work.push_back(start);
+	while (!work.empty()) {
+		auto node = work.front(); work.pop_front();
+		auto post = states.at(node);
+		auto preservedMask = node.second ? preserved.find(node.second) : preserved.end();
+		uint32_t kept = preservedMask == preserved.end() ? 0 : preservedMask->second;
+		if (!frameCensusAdvance(instructions, node, node.second != 0, kept, post)) return false;
+		auto range = outgoing.equal_range(node.first);
+		for (auto edge = range.first; edge != range.second; ++edge) {
+			FrameCensusNode next{(*edge).second->to, (*edge).second->delayOwner.value_or(0)};
+			auto insertion = states.emplace(next, post);
+			if (states.size() > Disposition::RowLimit) return false;
+			if (insertion.second || join(insertion.first->second, post)) work.push_back(next);
+		}
+	}
+	if (states.size() != instructions.size()) return false;
+	for (const auto& pair : states) {
+		const auto& row = *instructions.at(pair.first.first);
+		auto operation = originalOperation(row);
+		if (operation.kind == MipsOperation::Load || operation.kind == MipsOperation::Store) {
+			unsigned opcode = row.word >> 26, rs = (row.word >> 21) & 31, rt = (row.word >> 16) & 31;
+			int32_t immediate = int16_t(row.word & 0xffff);
+			FrameCensusAccess access;
+			access.pc = row.pc; access.write = operation.kind == MipsOperation::Store;
+			access.bytes = opcode == 32 || opcode == 36 || opcode == 40 ? 1
+				: opcode == 33 || opcode == 37 || opcode == 41 ? 2 : 4;
+			const auto& base = pair.second[rs];
+			if (base.kind == FrameCensusValue::Kind::Stack) {
+				int64_t offset = int64_t(entrySpOffset) + base.offset + immediate;
+				if (offset < INT32_MIN || offset > INT32_MAX) return false;
+				access.stack = true; access.offset = int32_t(offset);
+				access.frameOffset = offset;
+			} else if (base.kind == FrameCensusValue::Kind::Constant
+				|| base.kind == FrameCensusValue::Kind::Entry) {
+				int64_t sum = base.kind == FrameCensusValue::Kind::Constant
+					? int64_t(base.constant) + immediate
+					: int64_t(observation.registers[base.entry]) + base.offset + immediate;
+				if (sum < 0 || sum > int64_t(UINT32_MAX)) return false;
+				auto ram = common::psxRamAddress(uint64_t(sum));
+				if (!ram || access.bytes > 0x80200000 - *ram) return false;
+				access.physical = uint32_t(*ram & 0x1fffffff);
+				// A constant or entry-derived address can still name the captured frame; the
+				// outgoing census must see it in the same coordinate as a stack access.
+				access.frameOffset = int64_t(access.physical) - callSpPhysical;
+			} else return false;
+			if (access.write) {
+				const auto& value = pair.second[rt];
+				if (value.kind == FrameCensusValue::Kind::Stack) {
+					access.valueKnown = true;
+					access.valueFrameOffset = int64_t(entrySpOffset) + value.offset;
+				} else if (value.kind == FrameCensusValue::Kind::Constant
+					|| value.kind == FrameCensusValue::Kind::Entry) {
+					int64_t sum = value.kind == FrameCensusValue::Kind::Constant
+						? int64_t(value.constant)
+						: int64_t(observation.registers[value.entry]) + value.offset;
+					auto ram = sum >= 0 && sum <= int64_t(UINT32_MAX)
+						? common::psxRamAddress(uint64_t(sum)) : std::nullopt;
+					if (ram) {
+						access.valueKnown = true;
+						access.valueFrameOffset = int64_t(*ram & 0x1fffffff) - callSpPhysical;
+					}
+				}
+			}
+			member.rows.push_back(access);
+		}
+		if (pair.first.second) {
+			auto ownerOperation = originalOperation(*instructions.at(pair.first.second));
+			if (ownerOperation.kind == MipsOperation::Call) {
+				FrameCensusCall call;
+				call.pc = pair.first.second;
+				call.target = uint32_t(*ownerOperation.target);
+				auto identity = identities.find(call.target);
+				if (identity != identities.end()) call.callee = identity->second;
+				FrameCensusState continuation = pair.second;
+				auto preservedMask = preserved.find(pair.first.second);
+				uint32_t kept = preservedMask == preserved.end() ? 0 : preservedMask->second;
+				if (!frameCensusAdvance(instructions, pair.first, true, kept, continuation, &call.entry)) return false;
+				if (call.entry[29].kind != FrameCensusValue::Kind::Stack) return false;
+				int32_t spOffset = call.entry[29].offset;
+				for (auto& value : call.entry)
+					if (value.kind == FrameCensusValue::Kind::Stack) value.offset -= spOffset;
+				call.entrySpOffset = entrySpOffset + spOffset;
+				calls.push_back(std::move(call));
+				++member.calls;
+			}
+		}
+	}
+	std::sort(member.rows.begin(), member.rows.end(), [](const auto& left, const auto& right) {
+		return left.pc < right.pc;
+	});
+	return true;
+}
+
+template<typename Graph>
+std::optional<common::OriginalObservedFrameCallAdmission::Call> observedFrameCallCensus(
+	const Graph& graph, const common::OriginalEntryObservation& observation,
+	const Disposition::Evidence& evidence,
+	const std::map<uint64_t, const Disposition::Instruction*>& instructions,
+	const Disposition::Call& call, uint32_t frame, uint32_t entrySp,
+	const std::vector<common::OriginalObservedFrameCallAdmission::ProtectedWord>& protectedWords) {
+	if (!evidence.decodeComplete || !evidence.analysisComplete) return {};
+	if (frame < 16 || frame % 4 || frame > 32768 || entrySp < frame
+		|| entrySp != observation.registers[29]) return {};
+	const int64_t callSpPhysical = int64_t((entrySp - frame) & 0x1fffffff);
+	auto crossed = instructions.find(call.pc);
+	auto slot = instructions.find(call.pc + 4);
+	if (crossed == instructions.end() || slot == instructions.end()
+		|| crossed->second->word >> 26 != 3 || !call.target
+		|| frameCensusLoad(slot->second->word)) return {};
+	std::map<uint64_t, std::string> identities;
+	for (const auto& pair : graph.identities) identities.emplace(pair.first, pair.second.key);
+	FrameCensusState entry;
+	entry[0].kind = FrameCensusValue::Kind::Constant; entry[0].constant = 0;
+	entry[29].kind = FrameCensusValue::Kind::Stack;
+	for (unsigned reg = 1; reg < Disposition::GprCount; ++reg) {
+		if (reg == 29) continue;
+		entry[reg].kind = FrameCensusValue::Kind::Entry; entry[reg].entry = reg;
+	}
+	FrameCensusMember caller;
+	std::vector<FrameCensusCall> callerCalls;
+	if (!frameCensusReplay(observation, evidence.symbol, evidence, identities, int32_t(frame),
+		callSpPhysical, entry, caller, callerCalls)) return {};
+	const FrameCensusCall* crossedCall = nullptr;
+	for (const auto& candidate : callerCalls)
+		if (candidate.pc == call.pc && candidate.target == *call.target) crossedCall = &candidate;
+	if (!crossedCall || crossedCall->callee.empty() || crossedCall->entrySpOffset != 0) return {};
+	// Every reachable direct call must resolve to an analyzed owner and the closure must be acyclic.
+	std::map<uint32_t, std::vector<uint32_t>> edges;
+	{
+		std::vector<uint32_t> pending{crossedCall->target};
+		std::set<uint32_t> seen;
+		while (!pending.empty()) {
+			auto start = pending.back(); pending.pop_back();
+			if (!seen.insert(start).second) continue;
+			auto function = graph.functions.find(start);
+			if (function == graph.functions.end() || !function->second || graph.unavailable.count(start)
+				|| !function->second->getReturnDisposition()) return {};
+			const auto& member = function->second->getReturnDisposition()->evidence;
+			if (member.start != start || !member.decodeComplete || !member.analysisComplete
+				|| member.exits.empty()) return {};
+			if (seen.size() > 32) return {};
+			for (const auto& row : member.instructions) {
+				unsigned opcode = row.word >> 26;
+				if (opcode == 0 && (row.word & 63) == 9) return {};
+				if (opcode != 3) continue;
+				uint64_t target = ((row.pc + 4) & 0xf0000000) | uint64_t(row.word & 0x03ffffff) << 2;
+				if (!identities.count(target) || !graph.functions.count(target)) return {};
+				edges[start].push_back(uint32_t(target));
+				pending.push_back(uint32_t(target));
+			}
+		}
+	}
+	{
+		std::map<uint32_t, unsigned> colors;
+		std::function<bool(uint32_t)> visit = [&](uint32_t start) {
+			if (colors[start] == 2) return true;
+			if (colors[start] == 1) return false;
+			colors[start] = 1;
+			for (auto target : edges[start]) if (!visit(target)) return false;
+			colors[start] = 2;
+			return true;
+		};
+		if (!visit(crossedCall->target)) return {};
+	}
+	// Replay each reachable callee with the register values it receives at its own call site.
+	std::map<uint32_t, FrameCensusState> known{{crossedCall->target, crossedCall->entry}};
+	std::map<uint32_t, int32_t> spOffsets{{crossedCall->target, crossedCall->entrySpOffset}};
+	std::deque<FrameCensusCall> pending{*crossedCall};
+	std::map<uint32_t, FrameCensusMember> members;
+	while (!pending.empty()) {
+		auto current = pending.front(); pending.pop_front();
+		if (members.count(current.target)) continue;
+		auto* function = graph.functions.at(current.target);
+		FrameCensusMember member;
+		std::vector<FrameCensusCall> nested;
+		if (!frameCensusReplay(observation, identities.at(current.target),
+			function->getReturnDisposition()->evidence, identities, current.entrySpOffset,
+			callSpPhysical, current.entry, member, nested)) return {};
+		for (const auto& item : nested) {
+			if (item.callee.empty()) return {};
+			auto inserted = known.emplace(item.target, item.entry);
+			if (!inserted.second) {
+				for (size_t reg = 0; reg < item.entry.size(); ++reg)
+					if (!(inserted.first->second[reg] == item.entry[reg])) return {};
+				if (spOffsets.at(item.target) != item.entrySpOffset) return {};
+				continue;
+			}
+			spOffsets.emplace(item.target, item.entrySpOffset);
+			pending.push_back(item);
+		}
+		members.emplace(current.target, std::move(member));
+	}
+	// Protected words must lie wholly inside the caller frame, outside the outgoing interval.
+	std::map<int32_t, uint32_t> physicalWords;
+	for (const auto& word : protectedWords) {
+		int64_t offset = int64_t(word.offset) + frame;
+		if (offset < 0 || offset + 4 > int64_t(frame)
+			|| !physicalWords.emplace(int32_t(offset), word.physicalWord).second) return {};
+	}
+	if (physicalWords.empty()) return {};
+	uint32_t outgoing = 16;
+	std::set<uint64_t> outgoingPcs;
+	std::vector<std::pair<const FrameCensusAccess*, bool>> rows;
+	for (const auto& access : caller.rows) rows.emplace_back(&access, true);
+	for (const auto& pair : members)
+		for (const auto& access : pair.second.rows) rows.emplace_back(&access, false);
+	for (const auto& item : rows) {
+		const auto& access = *item.first;
+		const bool owner = item.second;
+		// A stack-pointer access belongs to a frame by construction. An ordinary-RAM access
+		// belongs to the caller frame only when its resolved interval actually lies inside it;
+		// a disjoint object above or below S is neither a stack argument nor a frame access.
+		const bool insideFrame = access.frameOffset >= 0
+			&& access.frameOffset + access.bytes <= int64_t(frame);
+		if (owner && access.stack && !insideFrame) return {};
+		const bool savedWord = owner && access.bytes == 4 && insideFrame
+			&& physicalWords.count(int32_t(access.frameOffset)) != 0;
+		if (access.write && !savedWord) {
+			for (const auto& word : physicalWords) {
+				if (access.frameOffset < int64_t(word.first) + 4
+					&& int64_t(word.first) < access.frameOffset + access.bytes) return {};
+			}
+		}
+		if (savedWord || access.frameOffset < 0) continue;
+		if (!access.stack && !insideFrame) continue;
+		outgoingPcs.insert(access.pc);
+		outgoing = std::max(outgoing, uint32_t(access.frameOffset + access.bytes));
+	}
+	outgoing = (outgoing + 3u) & ~3u;
+	if (outgoing > frame || outgoingPcs.size() > Disposition::ReferenceLimit) return {};
+	for (const auto& word : physicalWords) {
+		if (int64_t(word.first) < int64_t(outgoing)) return {};
+		if (((observation.registers[29] - frame) + uint64_t(word.first)) % 4
+			|| uint32_t((uint64_t(observation.registers[29]) - frame + uint64_t(word.first)) & 0x1fffffff) != word.second) return {};
+	}
+	// No caller instruction may expose a preserved frame address before the crossed call.
+	for (const auto& access : caller.rows) {
+		if (!access.write || !access.valueKnown || access.pc >= call.pc) continue;
+		if (access.valueFrameOffset >= 0 && access.valueFrameOffset < int64_t(frame)
+			&& physicalWords.count(int32_t(access.valueFrameOffset))) return {};
+	}
+	for (unsigned reg = 1; reg < Disposition::GprCount; ++reg) {
+		if (reg == 29) continue;
+		const auto& value = crossedCall->entry[reg];
+		if (value.kind != FrameCensusValue::Kind::Stack) continue;
+		if (physicalWords.count(value.offset)) return {};
+	}
+	common::OriginalObservedFrameCallAdmission::Call result;
+	result.pc = call.pc; result.delay = call.pc + 4; result.continuation = call.pc + 8;
+	result.target = crossedCall->target; result.callee = crossedCall->callee;
+	result.outgoingBytes = outgoing;
+	result.outgoingPcs.assign(outgoingPcs.begin(), outgoingPcs.end());
+	result.protectedWords = protectedWords;
+	std::sort(result.protectedWords.begin(), result.protectedWords.end(),
+		[](const auto& left, const auto& right) { return left.physicalWord < right.physicalWord; });
+	for (const auto& pair : members) {
+		common::OriginalObservedFrameCallAdmission::Function row;
+		row.function = pair.second.function;
+		row.start = pair.second.start; row.end = pair.second.end;
+		row.entrySpOffset = pair.second.entrySpOffset;
+		row.instructions = pair.second.instructions; row.calls = pair.second.calls;
+		row.accesses = unsigned(pair.second.rows.size());
+		row.writes = unsigned(std::count_if(pair.second.rows.begin(), pair.second.rows.end(),
+			[](const auto& access) { return access.write; }));
+		result.closure.push_back(std::move(row));
+	}
+	std::sort(result.closure.begin(), result.closure.end(),
+		[](const auto& left, const auto& right) { return left.start < right.start; });
+	if (result.closure.empty()) return {};
+	return result;
+}
+
 OriginalCalleePreservation originalCalleePreservation(
     const std::optional<common::OriginalCalleeContexts>& contexts,
     const config::Parameters& parameters, const Disposition::Evidence& evidence,
@@ -1484,9 +1988,15 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
     for (auto& access : summary.accesses) {
         const auto* flow = std::get_if<common::OriginalEntryRelativeMemoryAddress>(&access.address);
         const auto* fixed = std::get_if<common::OriginalFixedMemoryAddress>(&access.address);
+        if (fixed && fixed->derivation == common::OriginalFixedMemoryAddress::Derivation::EntryFirstUse
+            && (summary.declaration.isComplete() || summary.effects.isComplete())) {
+            access.address = common::OriginalFact::partial("original-address-proof-unresolved");
+            continue;
+        }
         if ((!flow || (flow->derivation != common::OriginalEntryRelativeMemoryAddress::Derivation::Flow
             && flow->derivation != common::OriginalEntryRelativeMemoryAddress::Derivation::EntryFirstUse))
-            && (!fixed || fixed->derivation != common::OriginalFixedMemoryAddress::Derivation::Flow))
+            && (!fixed || (fixed->derivation != common::OriginalFixedMemoryAddress::Derivation::Flow
+                && fixed->derivation != common::OriginalFixedMemoryAddress::Derivation::EntryFirstUse)))
             access.address = common::OriginalFact::partial("original-address-proof-unresolved");
     }
     const auto& evidence = disposition.evidence;
@@ -1556,7 +2066,7 @@ void recoverOriginalMemory(common::OriginalFunctionSummary& summary, const Dispo
     auto* loaded = image->getImage();
     for (auto& access : summary.accesses) {
         auto* address = std::get_if<common::OriginalFixedMemoryAddress>(&access.address);
-        if (!address) continue;
+        if (!address || address->derivation == common::OriginalFixedMemoryAddress::Derivation::EntryFirstUse) continue;
         uint64_t count = access.width / 8, value = address->value;
         if (view->context && address->alignment.isComplete() && value + count <= (uint64_t(1) << 32)) {
             auto span = view->context->resolve(value, count);
@@ -2048,6 +2558,208 @@ void ParamReturn::retainSelectedDefinitionOnly()
     }
 }
 
+namespace {
+
+bool pointerLoadTransfer(uint32_t word)
+{
+	unsigned op = word >> 26, fn = word & 63;
+	return op == 1 || op == 2 || op == 3 || (4 <= op && op <= 7)
+		|| (op == 0 && (fn == 8 || fn == 9));
+}
+
+std::optional<uint64_t> pointerLoadTarget(uint64_t pc, uint32_t word)
+{
+	unsigned op = word >> 26, rt = (word >> 16) & 31;
+	if (op == 2 || op == 3) return ((pc + 4) & 0xf0000000) | uint64_t(word & 0x03ffffff) << 2;
+	if ((4 <= op && op <= 7) || (op == 1 && (rt == 0 || rt == 1)))
+		return uint64_t(int64_t(pc + 4) + int64_t(int16_t(word & 0xffff)) * 4);
+	return {};
+}
+
+// One recorded word's GPR effects. The words come from the original image and the
+// table is the owner's own closed rule, so nothing is taken from the capture's claims.
+// A word the table does not classify leaves both operand sets unknown: an occurrence or
+// consumer cannot be attributed through it. ``delayed`` marks the words whose own
+// destination write the recorded CPU defers to the following instruction.
+struct PointerLoadReading {
+	unsigned reads = 0, writes = 0;
+	bool known = false, delayed = false;
+	static PointerLoadReading of(uint64_t pc, uint32_t word)
+	{
+		Disposition::Instruction row;
+		row.pc = pc; row.word = word;
+		const auto operation = originalOperation(row);
+		PointerLoadReading result;
+		if ((word >> 26) == 0 && (word & 63) == 9
+			&& (((word >> 16) & 31) != 0 || ((word >> 6) & 31) != 0
+				|| ((word >> 11) & 31) != 31 || ((word >> 21) & 31) == 31)) return result;
+		if (operation.kind == MipsOperation::Unsupported || operation.kind == MipsOperation::Trap)
+			return result;
+		result.known = true;
+		result.delayed = operation.kind == MipsOperation::Load;
+		for (auto reg : operation.inputs) if (reg < 32) result.reads |= 1u << reg;
+		for (auto reg : operation.destinations) if (reg < 32) result.writes |= 1u << reg;
+		return result;
+	}
+	bool readsRegister(unsigned reg) const { return (reads >> reg) & 1; }
+	bool writesRegister(unsigned reg) const { return (writes >> reg) & 1; }
+};
+
+std::vector<std::string> pointerLoadConditions(bool isr)
+{
+	std::vector<std::string> conditions{"authenticated-original-media-and-emulator-identity",
+		"authenticated-state-boundary-at-recording-start", "complete-ordered-recorded-dispatch-slice",
+		"interval-initial-image-equals-boundary-ram",
+		"ordered-committed-writes-replayed-and-endpoints-reconciled",
+		"no-selected-cell-write-in-the-recorded-interval",
+		"address-and-backing-word-inside-the-captured-ordinary-ram-interval",
+		"original-instruction-words-remain-active",
+		"supported-load-completes-normally-without-exception",
+		"loaded-value-advances-after-the-next-recorded-instruction",
+		"audited-recorder-and-host-exclusions-hold"};
+	if (isr) conditions.push_back("recorded-isr-context-preserved");
+	return conditions;
+}
+
+std::optional<common::OriginalObservedPointerLoad> observedPointerLoad(
+	const common::OriginalEntryObservation* observation,
+	const common::OriginalPointerLoadCapture* capture,
+	const std::string& function, const std::string& imageId, const std::string& imageHash,
+	const Disposition::Evidence& evidence)
+{
+	if (!observation || !capture) return {};
+	if (capture->function != function || capture->stateHash != observation->stateHash
+		|| capture->entryPc != observation->pc || capture->imageId != imageId
+		|| capture->imageHash != imageHash) return {};
+	const uint32_t start = capture->intervalStart, length = capture->intervalBytes;
+	if (capture->initialImage.size() != length || length < 4 || start + length > 0x200000
+		|| observation->ram.size() != 0x200000 || evidence.start != capture->entryPc
+		|| (*common::psxRamAddress(evidence.start) & 0x1fffffff) != start)
+		throw std::runtime_error("observed-pointer-load-interval-differs");
+	if ((*common::psxRamAddress(evidence.end) & 0x1fffffff) > start + length)
+		throw std::runtime_error("observed-pointer-load-range-escapes-interval");
+	if (!std::equal(capture->initialImage.begin(), capture->initialImage.end(),
+		observation->ram.begin() + start))
+		throw std::runtime_error("observed-pointer-load-boundary-image-differs");
+	std::map<uint64_t, const Disposition::Instruction*> rows;
+	for (const auto& row : evidence.instructions) rows.emplace(row.pc, &row);
+	std::map<uint64_t, uint32_t> words;
+	for (const auto& occurrence : capture->occurrences) {
+		auto found = rows.find(occurrence.pc);
+		if (found == rows.end() || !found->second->mapped || found->second->undef
+			|| found->second->bytes != 4 || found->second->owner != evidence.symbol
+			|| found->second->word != occurrence.word)
+			throw std::runtime_error("observed-pointer-load-occurrence-word-differs");
+		auto physical = occurrence.pc & 0x1fffffff;
+		if (physical < start || physical + 4 > start + length)
+			throw std::runtime_error("observed-pointer-load-occurrence-escapes-interval");
+		uint32_t recorded = 0;
+		for (unsigned byte = 0; byte < 4; ++byte)
+			recorded |= uint32_t(capture->initialImage[physical - start + byte]) << (8 * byte);
+		if (recorded != occurrence.word)
+			throw std::runtime_error("observed-pointer-load-boundary-word-differs");
+		words.emplace(occurrence.pc, occurrence.word);
+	}
+	for (size_t index = 1; index < capture->occurrences.size(); ++index) {
+		const auto& previous = capture->occurrences[index - 1];
+		const auto& following = capture->occurrences[index];
+		if (following.pc == previous.pc + 4) continue;
+		auto owner = words.find(previous.pc - 4);
+		auto target = owner == words.end() ? std::optional<uint64_t>{}
+			: pointerLoadTarget(previous.pc - 4, owner->second);
+		if (!previous.branchDelaySlot || target != std::optional<uint64_t>{following.pc})
+			throw std::runtime_error("observed-pointer-load-recorded-slice-gap");
+	}
+	for (const auto& occurrence : capture->occurrences) {
+		auto previous = words.find(occurrence.pc - 4);
+		bool delay = previous != words.end() && pointerLoadTransfer(previous->second);
+		if (delay != occurrence.branchDelaySlot)
+			throw std::runtime_error("observed-pointer-load-delay-marker-differs");
+	}
+	common::OriginalObservedPointerLoad record;
+	record.capture = capture->identity; record.stateHash = observation->stateHash;
+	record.entryPc = observation->pc; record.stopPc = capture->stopPc;
+	record.intervalStart = start; record.intervalBytes = length;
+	record.beginCycle = capture->beginCycle; record.endCycle = capture->endCycle;
+	record.isr = observation->cpu.inIsr;
+	record.conditions = pointerLoadConditions(record.isr);
+	const auto& occurrences = capture->occurrences;
+	for (size_t index = 0; index < occurrences.size(); ++index) {
+		const auto& row = occurrences[index];
+		unsigned op = row.word >> 26, base = (row.word >> 21) & 31, loaded = (row.word >> 16) & 31;
+		std::optional<uint32_t> address;
+		std::string reason;
+		if (op != 0x20 && op != 0x21 && op != 0x22 && op != 0x23 && op != 0x24
+			&& op != 0x25 && op != 0x26 && op != 0x32) continue;
+		if (op != 0x23) reason = "not-full-word-load";
+		else if (!loaded) reason = "zero-register-destination";
+		else if (!base || index == 0 || (occurrences[index - 1].word >> 26) != 15
+			|| ((occurrences[index - 1].word >> 16) & 31) != base)
+			reason = "base-value-not-locally-defined";
+		else {
+			address = ((occurrences[index - 1].word & 0xffff) << 16)
+				+ uint32_t(int32_t(int16_t(row.word & 0xffff)));
+			auto physical = common::psxRamAddress(*address);
+			if (*address % 4) reason = "unaligned-address";
+			else if (!physical) reason = "address-not-ordinary-ram";
+			else if ((*physical & 0x1fffffff) < start
+				|| (*physical & 0x1fffffff) > start + length - 4)
+				reason = "address-outside-captured-interval";
+		}
+		if (reason.empty() && index + 2 >= occurrences.size())
+			reason = "destination-visibility-unrecorded";
+		std::vector<common::OriginalObservedPointerLoad::Consumer> consumers;
+		if (reason.empty()) {
+			const auto& following = occurrences[index + 1];
+			const auto reading = PointerLoadReading::of(following.pc, following.word);
+			if (!reading.known) reason = "unknown-effect-in-delay-window";
+			else if (reading.readsRegister(loaded)) reason = "load-delay-consumer-needs-new-value";
+			else if (reading.writesRegister(loaded)) reason = reading.delayed
+				? "load-destination-replaced-by-delayed-next-instruction"
+				: "load-destination-cancelled-by-next-instruction";
+		}
+		if (reason.empty()) {
+			for (size_t later = index + 2; later < occurrences.size(); ++later) {
+				const auto reading = PointerLoadReading::of(occurrences[later].pc, occurrences[later].word);
+				if (!reading.known) { reason = "unknown-effect-in-consumer-slice"; break; }
+				if (reading.readsRegister(loaded)) {
+					common::OriginalObservedPointerLoad::Consumer consumer;
+					consumer.sequence = occurrences[later].sequence; consumer.pc = occurrences[later].pc;
+					consumers.push_back(std::move(consumer));
+				}
+				if (reading.writesRegister(loaded)) break;
+			}
+		}
+		if (!reason.empty()) {
+			common::OriginalObservedPointerLoad::Excluded excluded;
+			excluded.sequence = row.sequence; excluded.pc = row.pc; excluded.word = row.word;
+			excluded.reason = reason;
+			record.excluded.push_back(std::move(excluded));
+			continue;
+		}
+		common::OriginalObservedPointerLoad::Occurrence admitted;
+		admitted.sequence = row.sequence; admitted.pc = row.pc; admitted.word = row.word;
+		admitted.branchDelaySlot = row.branchDelaySlot;
+		admitted.firstSequence = occurrences.front().sequence;
+		admitted.lastSequence = occurrences.back().sequence;
+		admitted.reachingSequence = occurrences[index - 1].sequence;
+		admitted.reachingPc = occurrences[index - 1].pc;
+		admitted.reachingWord = occurrences[index - 1].word;
+		admitted.address = *common::psxRamAddress(*address);
+		admitted.physical = *common::psxRamAddress(*address) & 0x1fffffff;
+		admitted.destination = loaded;
+		for (unsigned byte = 0; byte < 4; ++byte)
+			admitted.value.push_back(capture->initialImage[admitted.physical - start + byte]);
+		admitted.visibleFromPc = occurrences[index + 2].pc;
+		admitted.visibleFromSequence = occurrences[index + 2].sequence;
+		admitted.consumers = std::move(consumers);
+		record.occurrences.push_back(std::move(admitted));
+	}
+	return record;
+}
+
+}
+
 void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGraph& graph)
 {
 	const auto& selected = *_config->getConfig().parameters.selectedRanges.begin();
@@ -2103,6 +2815,11 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
             std::map<uint64_t, OriginalFrameContract> frameUses;
             entry.storage = OriginalMemoryState::bind(observation,
                 summary.function, extent.imageId, imageView && imageView->owner ? imageView->owner->fileHash : "", evidence);
+            summary.observedPointerLoad = observedPointerLoad(observation,
+                _config->getConfig().parameters.getOriginalPointerLoad()
+                    ? &*_config->getConfig().parameters.getOriginalPointerLoad() : nullptr,
+                summary.function, extent.imageId,
+                imageView && imageView->owner ? imageView->owner->fileHash : "", evidence);
             entry.mayNoPending.fill(true);
 			for (unsigned reg = 0; reg < Disposition::RegisterCount; ++reg)
 				entry[reg].bad.insert(reg == 2 ? "incoming-v0"
@@ -2471,12 +3188,34 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
                     for (auto& pair : accesses) {
                         if (!std::holds_alternative<common::OriginalFact>(pair.second.address)) continue;
                         auto address = OriginalEntryAddressRegion::recover(flow, evidence, pair.second);
-                        if (address) pair.second.address = std::move(*address);
+                        if (address) { pair.second.address = std::move(*address); continue; }
+                        std::multimap<uint64_t, const Disposition::Edge*> prefixIncoming;
+                        auto domain = OriginalEntryAddressRegion::recoverDomain(flow, evidence, pair.second, &prefixIncoming);
+                        if (!domain || !domain->callPcs.empty()) continue;
+                        std::set<uint64_t> crossed(domain->callPcs.begin(), domain->callPcs.end());
+                        OriginalIdentityFlow prefix{flow.start, flow.symbol, flow.instructions, flow.definitions,
+                            flow.states, prefixIncoming, flow.calls, flow.operation, flow.frameUses, &crossed};
+                        auto fixed = originalFlowFixedMemoryAddress(pair.second, prefix);
+                        if (!fixed) continue;
+                        fixed->derivation = common::OriginalFixedMemoryAddress::Derivation::EntryFirstUse;
+                        fixed->firstUse = std::move(domain);
+                        pair.second.address = std::move(*fixed);
                     }
                 }
                 summarizeOriginal(summary, disposition, exitStates, sampledTargets, demands, accesses, graph.unavailable.count(evidence.start));
                 if (flowComplete && summary.entry.isComplete()) {
-                    OriginalMemoryState::summarize(summary, exitStates, evidence);
+                    // The admission census is evaluated here because it needs the completed,
+                    // authenticated caller CFG, which is only available after the flow closes.
+                    OriginalMemoryState::summarize(summary, exitStates, evidence,
+                        [&](uint64_t callPc, uint32_t frame, uint32_t entrySp,
+                            const std::vector<common::OriginalObservedFrameCallAdmission::ProtectedWord>& words) {
+                            std::optional<common::OriginalObservedFrameCallAdmission::Call> denied;
+                            if (!observation) return denied;
+                            auto found = calls.find(callPc);
+                            if (found == calls.end()) return denied;
+                            return observedFrameCallCensus(graph, *observation, evidence, instructions,
+                                found->second, frame, entrySp, words);
+                        });
                     if (!observation) {
                         std::multimap<uint64_t, const Disposition::Edge*> incoming;
                         for (const auto& edge : evidence.edges) incoming.emplace(edge.to, &edge);
@@ -2558,11 +3297,17 @@ void ParamReturn::qualifyOriginalFunction(DataFlowEntry& de, OriginalContractGra
 					stackWordBody = proposeIncomingStackWordBody(disposition, summary, states);
             }
 		} catch (const std::exception& error) {
+            // An authenticated capture that cannot be derived from the original bytes is a
+            // refusal of the invocation, not an unresolved analysis gap: nothing downstream
+            // may treat the withheld occurrence as absent evidence.
+            if (std::string(error.what()).rfind("observed-pointer-load-", 0) == 0) throw;
 			disposition.kind = Disposition::Kind::Unknown;
             evidence.decodeComplete = false; evidence.analysisComplete = false;
             evidence.definitions.clear(); evidence.edges.clear(); evidence.exits.clear(); evidence.calls.clear();
             cf->originalJumpTables.clear();
             summary.scopedRestoration.reset();
+            summary.observedPointerLoad.reset();
+            summary.observedFrameCallAdmission.reset();
             summary.symbolicFrame.reset();
             summary.noMemoryWrites = common::OriginalFact::partial("native-analysis-failed");
             for (auto& access : summary.accesses) access.address = common::OriginalFact::partial("native-analysis-failed");

@@ -52,9 +52,54 @@ struct OriginalObservedEntryContext {
 struct OriginalEntryObservation {
 	std::string identity, function, imageId, imageHash, stateHash;
 	uint32_t pc = 0;
+	uint64_t cycle = 0;
 	std::array<uint32_t, 32> registers{};
 	OriginalEntryCpuContext cpu;
 	std::vector<uint8_t> ram;
+};
+// One authenticated RAM history bound to the observed entry boundary. The initial
+// interval image is the recorder's own copy of the captured RAM, so nothing here
+// carries a derived pointer value or a claimed read result.
+struct OriginalPointerLoadCapture {
+	struct Occurrence {
+		uint64_t sequence = 0, pc = 0;
+		uint32_t word = 0;
+		bool branchDelaySlot = false;
+	};
+	std::string identity, function, imageId, imageHash, stateHash;
+	uint32_t entryPc = 0, stopPc = 0, intervalStart = 0, intervalBytes = 0;
+	std::string beginCycle, endCycle;
+	std::vector<uint8_t> initialImage;
+	std::vector<Occurrence> occurrences;
+};
+// Occurrence-scoped pointer-load evidence. Every fact is keyed by capture, recorded
+// path and RAM interval; no member is a register fact, a retirement claim or a
+// device-read result.
+struct OriginalObservedPointerLoad {
+	struct Consumer {
+		uint64_t sequence = 0, pc = 0;
+	};
+	struct Occurrence {
+		uint64_t sequence = 0, pc = 0, firstSequence = 0, lastSequence = 0;
+		uint64_t reachingSequence = 0, reachingPc = 0;
+		uint64_t visibleFromPc = 0, visibleFromSequence = 0;
+		uint32_t word = 0, reachingWord = 0, address = 0, physical = 0;
+		unsigned destination = 0;
+		bool branchDelaySlot = false;
+		std::vector<uint8_t> value;
+		std::vector<Consumer> consumers;
+	};
+	struct Excluded {
+		uint64_t sequence = 0, pc = 0;
+		uint32_t word = 0;
+		std::string reason;
+	};
+	std::string capture, stateHash, beginCycle, endCycle;
+	uint32_t entryPc = 0, stopPc = 0, intervalStart = 0, intervalBytes = 0;
+	bool isr = false;
+	std::vector<std::string> conditions;
+	std::vector<Occurrence> occurrences;
+	std::vector<Excluded> excluded;
 };
 struct OriginalScopedRestoration {
 	std::string observation, stateHash;
@@ -72,6 +117,31 @@ struct OriginalScopedRestoration {
 		std::vector<uint64_t> loadPcs, callPcs, exitPcs;
 	};
 	std::vector<Register> registers;
+};
+struct OriginalObservedFrameCallAdmission {
+	struct Function {
+		std::string function;
+		uint32_t start = 0, end = 0;
+		int32_t entrySpOffset = 0;
+		unsigned instructions = 0, calls = 0, accesses = 0, writes = 0;
+	};
+	struct ProtectedWord {
+		uint32_t physicalWord = 0;
+		int32_t offset = 0;
+		unsigned entry = 0;
+		uint64_t storePc = 0;
+	};
+	struct Call {
+		uint64_t pc = 0, delay = 0, continuation = 0;
+		uint32_t target = 0, outgoingBytes = 0;
+		std::string callee;
+		std::vector<uint64_t> outgoingPcs;
+		std::vector<ProtectedWord> protectedWords;
+		std::vector<Function> closure;
+	};
+	std::string observation, stateHash;
+	uint32_t entryPc = 0, entrySp = 0, frameBytes = 0;
+	std::vector<Call> calls;
 };
 struct OriginalSymbolicFrame {
     uint32_t entryPc = 0, allocationPc = 0, frameBytes = 0;
@@ -157,25 +227,26 @@ struct OriginalJumpTableContext {
 	OriginalFact currentContents = OriginalFact::partial("jump-table-runtime-contents-unresolved");
 	std::vector<std::string> conditions;
 };
+struct OriginalMemoryFirstUse {
+	uint64_t entryPc = 0, usePc = 0;
+	std::vector<uint64_t> callPcs;
+};
 struct OriginalFixedMemoryAddress {
-	enum class Derivation { Prefix, Flow };
+	enum class Derivation { Prefix, Flow, EntryFirstUse };
 	uint32_t base = 0, value = 0;
 	std::vector<uint64_t> equalityEvidence;
 	Derivation derivation = Derivation::Prefix;
+	std::optional<OriginalMemoryFirstUse> firstUse;
 	OriginalFact alignment = OriginalFact::partial("access-alignment-unresolved");
 	std::variant<OriginalFact, OriginalFileBytes> fileBytes = OriginalFact::partial("physical-file-backing-unresolved");
 };
 struct OriginalEntryRelativeMemoryAddress {
 	enum class Derivation { Prefix, Flow, EntryFirstUse };
-	struct FirstUse {
-		uint64_t entryPc = 0, usePc = 0;
-		std::vector<uint64_t> callPcs;
-	};
 	unsigned entryRegister = 0;
 	uint32_t offset = 0;
 	std::vector<uint64_t> equalityEvidence;
 	Derivation derivation = Derivation::Prefix;
-	std::optional<FirstUse> firstUse;
+	std::optional<OriginalMemoryFirstUse> firstUse;
 };
 struct OriginalBoundedEntryMemoryAddress {
 	unsigned entryRegister = 0;
@@ -220,6 +291,8 @@ struct OriginalFunctionSummary {
 	std::string pendingEntry = "requires-no-pending-gpr-loads";
 	std::optional<OriginalObservedEntryContext> entryContext;
 	std::optional<OriginalScopedRestoration> scopedRestoration;
+	std::optional<OriginalObservedFrameCallAdmission> observedFrameCallAdmission;
+	std::optional<OriginalObservedPointerLoad> observedPointerLoad;
 	std::optional<OriginalSymbolicFrame> symbolicFrame;
 };
 struct OriginalInputBinding {

@@ -7,6 +7,32 @@
 #include "retdec/common/psx_memory.h"
 
 namespace retdec { namespace bin2llvmir {
+
+namespace {
+// Only whole four-byte saves of entry gp, fp, s0-s7 or the incoming link are admitted
+// protected words; saving the stack pointer or an argument is not an admitted save.
+bool originalProtectedEntry(unsigned entry)
+{
+    return entry == 28 || entry == 30 || (16 <= entry && entry <= 23) || entry == 31;
+}
+
+// Complete equality of a call's protected-word snapshot: a join may not keep the first
+// payload when two paths disagree on any field, so every element is compared.
+bool sameProtectedWords(
+    const std::vector<common::OriginalObservedFrameCallAdmission::ProtectedWord>& left,
+    const std::vector<common::OriginalObservedFrameCallAdmission::ProtectedWord>& right)
+{
+    if (left.size() != right.size()) return false;
+    for (size_t index = 0; index < left.size(); ++index) {
+        const auto& first = left[index];
+        const auto& second = right[index];
+        if (first.physicalWord != second.physicalWord || first.offset != second.offset
+            || first.entry != second.entry || first.storePc != second.storePc) return false;
+    }
+    return true;
+}
+}
+
 bool originalIdentityCall(const OriginalIdentityFlow& flow, uint64_t pc, unsigned reg)
 {
     auto call = flow.calls.find(pc);
@@ -211,9 +237,10 @@ std::optional<common::OriginalEntryRelativeMemoryAddress> originalFlowMemoryAddr
     return address;
 }
 
-std::optional<common::OriginalEntryRelativeMemoryAddress> OriginalEntryAddressRegion::recover(
+std::optional<common::OriginalMemoryFirstUse> OriginalEntryAddressRegion::recoverDomain(
     const OriginalIdentityFlow& flow, const Disposition::Evidence& evidence,
-    const common::OriginalMemoryAccess& access)
+    const common::OriginalMemoryAccess& access,
+    std::multimap<uint64_t, const Disposition::Edge*>* prefixIncoming)
 {
     using Edge = std::tuple<uint64_t, uint64_t, std::optional<uint64_t>, std::string>;
     if (!evidence.analysisComplete || evidence.start != flow.start || evidence.symbol != flow.symbol
@@ -302,14 +329,27 @@ std::optional<common::OriginalEntryRelativeMemoryAddress> OriginalEntryAddressRe
         for (auto target : successors.at(pc)) if (!--indegrees.at(target)) ready.push_back(target);
     }
     if (consumed != owners.size()) return {};
+    common::OriginalMemoryFirstUse domain;
+    domain.entryPc = flow.start; domain.usePc = access.pc;
+    domain.callPcs.assign(crossed.begin(), crossed.end());
+    if (prefixIncoming) *prefixIncoming = std::move(incoming);
+    return domain;
+}
+
+std::optional<common::OriginalEntryRelativeMemoryAddress> OriginalEntryAddressRegion::recover(
+    const OriginalIdentityFlow& flow, const Disposition::Evidence& evidence,
+    const common::OriginalMemoryAccess& access)
+{
+    std::multimap<uint64_t, const Disposition::Edge*> incoming;
+    auto domain = recoverDomain(flow, evidence, access, &incoming);
+    if (!domain) return {};
+    std::set<uint64_t> crossed(domain->callPcs.begin(), domain->callPcs.end());
     OriginalIdentityFlow prefix{flow.start, flow.symbol, flow.instructions, flow.definitions,
         flow.states, incoming, flow.calls, flow.operation, flow.frameUses, &crossed};
     auto address = originalFlowMemoryAddress(access, prefix);
     if (!address) return {};
     address->derivation = common::OriginalEntryRelativeMemoryAddress::Derivation::EntryFirstUse;
-    common::OriginalEntryRelativeMemoryAddress::FirstUse domain;
-    domain.entryPc = flow.start; domain.usePc = access.pc;
-    domain.callPcs.assign(crossed.begin(), crossed.end()); address->firstUse = std::move(domain);
+    address->firstUse = std::move(domain);
     return address;
 }
 
@@ -603,7 +643,7 @@ bool OriginalMemoryState::Word::operator==(const Word& other) const {
 }
 void OriginalMemoryState::invalidate() {
     _eligible = false; _words.clear(); _relations.fill({}); _pending.fill({});
-    _hasPending.fill(false); _sampledLink.reset();
+    _hasPending.fill(false); _sampledLink.reset(); _conditional.clear();
 }
 std::optional<uint32_t> OriginalMemoryState::physical(int32_t offset, unsigned bytes) const {
     if (!_observation) return {};
@@ -643,6 +683,14 @@ bool OriginalMemoryState::join(const OriginalMemoryState& incoming) {
         invalidate(); return true;
     }
     bool changed = false;
+    if (_conditional.size() != incoming._conditional.size()) { invalidate(); return true; }
+    for (const auto& pair : _conditional) {
+        auto other = incoming._conditional.find(pair.first);
+        if (other == incoming._conditional.end()
+            || !sameProtectedWords(pair.second, other->second)) {
+            invalidate(); return true;
+        }
+    }
     auto usedEntries = _usedEntries.size();
     _usedEntries.insert(incoming._usedEntries.begin(), incoming._usedEntries.end());
     changed |= _usedEntries.size() != usedEntries;
@@ -787,28 +835,75 @@ void OriginalMemoryState::call(uint64_t pc, const common::OriginalCallContract* 
     if (!_observation || !_eligible) return;
     const common::OriginalPartialCall* proof = contract ? std::get_if<common::OriginalPartialCall>(contract) : nullptr;
     if (!proof && contract) proof = &std::get<common::OriginalCompleteCall>(*contract).proof();
-    if (!proof || !proof->noMemoryWrites.isComplete() || !proof->identity.isComplete()
-        || !proof->inputs.isComplete() || !proof->control.isComplete()
+    const bool writes = proof && proof->noMemoryWrites.isComplete();
+    if (!proof || !proof->identity.isComplete() || !proof->inputs.isComplete()
+        || (writes && (!proof->control.isComplete() || !proof->transfers.isComplete()))
         || proof->registerTransfers.size() != Disposition::RegisterCount
         || std::any_of(_hasPending.begin(), _hasPending.end(), [](bool value) { return value; })) {
         invalidate(); return;
     }
+    // Conditional eligibility never reads aggregate control/transfers: partial call control
+    // still admits when the saved-word census holds. Only settled facts are used, a settled
+    // contrary transfer refuses, and every unsettled relation is cleared instead of being
+    // promoted to an unconditional fact.
     for (unsigned reg = 1; reg < Disposition::RegisterCount; ++reg) {
         const auto& transfer = proof->registerTransfers[reg];
-        bool preserved = transfer.reg == reg && transfer.proof.isComplete()
-            && transfer.kind == "preserved" && !transfer.pending;
-        if (reg == 29 && !preserved) { invalidate(); return; }
-        if (!preserved && (transfer.reg != reg || !transfer.proof.isComplete() || transfer.pending
-            || transfer.equalEntry == 29 || std::find(transfer.entries.begin(), transfer.entries.end(), 29) != transfer.entries.end())) {
-            invalidate(); return;
+        const bool settled = transfer.reg == reg && transfer.proof.isComplete() && !transfer.pending;
+        const bool preserved = settled && transfer.kind == "preserved" && transfer.equalEntry == reg;
+        const bool exposesStack = settled && !preserved
+            && (transfer.equalEntry == 29
+                || std::find(transfer.entries.begin(), transfer.entries.end(), 29) != transfer.entries.end());
+        if (settled && reg == 29 && !preserved) { invalidate(); return; }
+        if (exposesStack) { invalidate(); return; }
+        if (writes && !settled && !preserved) { invalidate(); return; }
+        if (!preserved) {
+            _relations[reg].reset();
+            // An unproved stack pointer is retained as the conditional frame base only.
+            if (reg != 29 || writes) _offsets[reg].reset();
         }
-        if (!preserved) { _relations[reg].reset(); _offsets[reg].reset(); }
+    }
+    if (!writes) {
+        // An unproved call can only retain the approved preserved words; every other saved
+        // value loses its relation here instead of being published unconditionally.
+        for (auto current = _words.begin(); current != _words.end();) {
+            if (originalProtectedEntry(current->second.entry)) { ++current; continue; }
+            current = _words.erase(current);
+        }
+        for (unsigned reg = 1; reg < Disposition::GprCount; ++reg)
+            if (_relations[reg] && !originalProtectedEntry(_relations[reg]->entry)) _relations[reg].reset();
     }
     for (auto& word : _words) word.second.calls.insert(pc);
+    if (writes) return;
+    // A call without proved write absence keeps the saved words and the frame base only
+    // provisionally, under the return-to-continuation condition. It never establishes call
+    // writes, control or results, and nothing publishes unless summarize() admits it.
+    // A call that crosses no preserved word needs no condition and preserves nothing.
+    auto crossing = savedWords();
+    if (crossing.empty()) return;
+    auto inserted = _conditional.emplace(pc, std::move(crossing));
+    if (!inserted.second && !sameProtectedWords(inserted.first->second, savedWords())) {
+        invalidate(); return;
+    }
+}
+std::vector<common::OriginalObservedFrameCallAdmission::ProtectedWord> OriginalMemoryState::savedWords() const {
+    std::vector<common::OriginalObservedFrameCallAdmission::ProtectedWord> result;
+    for (const auto& pair : _words) {
+        const auto& word = pair.second;
+        if (!originalProtectedEntry(word.entry) || word.offset > -4) continue;
+        common::OriginalObservedFrameCallAdmission::ProtectedWord protectedWord;
+        protectedWord.physicalWord = pair.first;
+        protectedWord.offset = word.offset;
+        protectedWord.entry = word.entry;
+        protectedWord.storePc = word.store;
+        result.push_back(std::move(protectedWord));
+    }
+    return result;
 }
 void OriginalMemoryState::summarize(common::OriginalFunctionSummary& summary,
-    const std::map<uint64_t, RegisterState>& exits, const Disposition::Evidence& evidence) {
+    const std::map<uint64_t, RegisterState>& exits, const Disposition::Evidence& evidence,
+    const FrameAdmissionCensus& census) {
     summary.scopedRestoration.reset();
+    summary.observedFrameCallAdmission.reset();
     if (exits.empty() || !evidence.analysisComplete) return;
     for (const auto& exit : exits) {
         const auto& storage = exit.second.storage;
@@ -857,6 +952,39 @@ void OriginalMemoryState::summarize(common::OriginalFunctionSummary& summary,
         for (const auto& exit : exits) restored.exitPcs.push_back(exit.first);
         report.registers.push_back(std::move(restored));
     }
-    if (!report.registers.empty()) summary.scopedRestoration = std::move(report);
+    if (report.registers.empty()) return;
+    // Assemble restoration and its required admission companion in locals. Nothing is
+    // published unless every crossed call is either proved or admitted, so a stronger
+    // restoration record can never appear without the condition it depends on.
+    if (joined._conditional.empty()) {
+        summary.scopedRestoration = std::move(report);
+        return;
+    }
+    if (!census) return;
+    common::OriginalObservedFrameCallAdmission admission;
+    admission.observation = observation.identity; admission.stateHash = observation.stateHash;
+    admission.entryPc = observation.pc; admission.entrySp = observation.registers[29];
+    admission.frameBytes = *joined._frame;
+    for (const auto& pair : joined._conditional) {
+        auto call = census(pair.first, *joined._frame, observation.registers[29], pair.second);
+        if (!call || call->pc != pair.first || call->protectedWords.empty()
+            || call->closure.empty()) return;
+        admission.calls.push_back(std::move(*call));
+    }
+    std::map<uint64_t, size_t> admitted;
+    for (size_t index = 0; index < admission.calls.size(); ++index)
+        admitted.emplace(admission.calls[index].pc, index);
+    for (const auto& restored : report.registers) {
+        for (auto pc : restored.callPcs) {
+            auto call = admitted.find(pc);
+            if (call == admitted.end()) continue;
+            const auto& words = admission.calls[call->second].protectedWords;
+            bool found = std::any_of(words.begin(), words.end(),
+                [&](const auto& word) { return word.physicalWord == restored.physicalWord; });
+            if (!found) return;
+        }
+    }
+    summary.observedFrameCallAdmission = std::move(admission);
+    summary.scopedRestoration = std::move(report);
 }
 } }
